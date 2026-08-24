@@ -19,6 +19,10 @@ pub struct BootstrapResult {
     pub detail: String,
 }
 
+fn is_safe_ssh_identifier(s: &str) -> bool {
+    !s.is_empty() && !s.starts_with('-')
+}
+
 pub fn build_ssh_target_args(
     host: &Host,
     bastion: Option<&Bastion>,
@@ -50,6 +54,7 @@ pub fn build_ssh_target_args(
         args.push(bastion_target);
     }
 
+    args.push("--".to_string());
     args.push(format!("{}@{}", host.user, host.address));
 
     for arg in extra {
@@ -64,6 +69,19 @@ pub async fn probe_key_auth(
     host: &Host,
     bastion: Option<&Bastion>,
 ) -> ProbeResult {
+    if !is_safe_ssh_identifier(&host.user)
+        || !is_safe_ssh_identifier(&host.address)
+        || bastion.is_some_and(|b| {
+            !is_safe_ssh_identifier(&b.user) || !is_safe_ssh_identifier(&b.address)
+        })
+    {
+        return ProbeResult {
+            host: host.name.clone(),
+            reachable: false,
+            detail: "unsafe SSH identifier".to_string(),
+        };
+    }
+
     let args = build_ssh_target_args(host, bastion, &["true"]);
     match runner.run("ssh", &args).await {
         Ok(output) => ProbeResult {
@@ -95,6 +113,19 @@ pub async fn probe_password_auth(
     bastion: Option<&Bastion>,
     password: &str,
 ) -> ProbeResult {
+    if !is_safe_ssh_identifier(&host.user)
+        || !is_safe_ssh_identifier(&host.address)
+        || bastion.is_some_and(|b| {
+            !is_safe_ssh_identifier(&b.user) || !is_safe_ssh_identifier(&b.address)
+        })
+    {
+        return ProbeResult {
+            host: host.name.clone(),
+            reachable: false,
+            detail: "unsafe SSH identifier".to_string(),
+        };
+    }
+
     let mut args = vec![
         "-p".to_string(),
         password.to_string(),
@@ -102,7 +133,7 @@ pub async fn probe_password_auth(
         "-o".to_string(),
         "ConnectTimeout=5".to_string(),
         "-o".to_string(),
-        "StrictHostKeyChecking=no".to_string(),
+        "StrictHostKeyChecking=accept-new".to_string(),
         "-p".to_string(),
         host.port.to_string(),
     ];
@@ -124,6 +155,7 @@ pub async fn probe_password_auth(
         args.push(bastion_target);
     }
 
+    args.push("--".to_string());
     args.push(format!("{}@{}", host.user, host.address));
     args.push("true".to_string());
 
@@ -157,6 +189,15 @@ pub async fn deploy_public_key(
     bastion: Option<&Bastion>,
     password: &str,
 ) -> Result<(), String> {
+    if !is_safe_ssh_identifier(&host.user)
+        || !is_safe_ssh_identifier(&host.address)
+        || bastion.is_some_and(|b| {
+            !is_safe_ssh_identifier(&b.user) || !is_safe_ssh_identifier(&b.address)
+        })
+    {
+        return Err("unsafe SSH identifier".to_string());
+    }
+
     let mut args = vec![
         "-p".to_string(),
         password.to_string(),
@@ -164,7 +205,7 @@ pub async fn deploy_public_key(
         "-o".to_string(),
         "ConnectTimeout=5".to_string(),
         "-o".to_string(),
-        "StrictHostKeyChecking=no".to_string(),
+        "StrictHostKeyChecking=accept-new".to_string(),
         "-p".to_string(),
         host.port.to_string(),
     ];
@@ -186,6 +227,7 @@ pub async fn deploy_public_key(
         args.push(format!("ProxyJump={bastion_target}"));
     }
 
+    args.push("--".to_string());
     args.push(format!("{}@{}", host.user, host.address));
 
     let output = runner.run("sshpass", &args).await?;
@@ -351,5 +393,23 @@ mod tests {
         let args = build_ssh_target_args(&host(), Some(&bastion), &[]);
         assert!(args.iter().any(|a| a == "-J"));
         assert!(args.iter().any(|a| a.contains("ubuntu@10.0.0.10")));
+    }
+
+    #[test]
+    fn rejects_ssh_identifier_starting_with_dash() {
+        assert!(!is_safe_ssh_identifier("-oProxyCommand=evil"));
+        assert!(is_safe_ssh_identifier("root"));
+    }
+
+    #[tokio::test]
+    async fn probe_key_auth_refuses_unsafe_user() {
+        let runner = FakeRunner {
+            succeed_on_call: 1,
+            calls: AtomicUsize::new(0),
+        };
+        let mut h = host();
+        h.user = "-oProxyCommand=evil".into();
+        let result = probe_key_auth(&runner, &h, None).await;
+        assert!(!result.reachable);
     }
 }
