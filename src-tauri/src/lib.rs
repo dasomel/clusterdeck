@@ -10,7 +10,13 @@ pub fn run() {
             commands::profiles::save_profile,
             commands::profiles::delete_profile_cmd,
             commands::discovery::discover_hosts,
-            commands::connection::test_connection,
+            commands::connection::probe_profile_hosts,
+            commands::connection::bootstrap_profile,
+            commands::connection::generate_aliases,
+            commands::connection::fetch_kubeconfig,
+            commands::connection::verify_profile,
+            commands::connection::get_profile_status,
+            commands::connection::connect_profile,
         ])
         .run(tauri::generate_context!())
         .expect("error while running ClusterDeck");
