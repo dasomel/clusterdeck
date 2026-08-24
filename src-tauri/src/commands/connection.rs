@@ -34,8 +34,7 @@ pub async fn probe_profile_hosts(profile_id: String) -> Result<Vec<HostStageResu
     let profile = store::get_profile(&paths, &profile_id)?;
     let runner = SystemRunner;
 
-    let mut results = Vec::new();
-    for host in &profile.hosts {
+    let host_futures = profile.hosts.iter().map(|host| async {
         let probe = ssh::probe_with_retry(
             &runner,
             host,
@@ -44,12 +43,14 @@ pub async fn probe_profile_hosts(profile_id: String) -> Result<Vec<HostStageResu
             Duration::from_secs(1),
         )
         .await;
-        results.push(HostStageResult {
+        HostStageResult {
             host: host.name.clone(),
             reachable: probe.reachable,
             detail: probe.detail,
-        });
-    }
+        }
+    });
+
+    let results = futures::future::join_all(host_futures).await;
     Ok(results)
 }
 
@@ -157,8 +158,7 @@ pub async fn connect_profile(
     let profile = store::get_profile(&paths, &profile_id)?;
     let runner = SystemRunner;
 
-    let mut host_stage_results = Vec::new();
-    for host in &profile.hosts {
+    let host_futures = profile.hosts.iter().map(|host| async {
         let mut probe = ssh::probe_with_retry(
             &runner,
             host,
@@ -169,7 +169,7 @@ pub async fn connect_profile(
         .await;
 
         if !probe.reachable && profile.bootstrap.enabled {
-            if let Some(pwd) = &bootstrap_password {
+            if let Some(pwd) = bootstrap_password.as_ref() {
                 let boot_res = ssh::bootstrap_host(
                     &runner,
                     host,
@@ -189,12 +189,14 @@ pub async fn connect_profile(
             }
         }
 
-        host_stage_results.push(HostStageResult {
+        HostStageResult {
             host: host.name.clone(),
             reachable: probe.reachable,
             detail: probe.detail,
-        });
-    }
+        }
+    });
+
+    let host_stage_results = futures::future::join_all(host_futures).await;
 
     let mut errors = Vec::new();
 
