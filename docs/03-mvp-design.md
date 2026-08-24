@@ -207,13 +207,14 @@ ClusterDeck should not copy KubeMetal-specific infrastructure logic, commands, o
 
 ## 11. First implementation sequence
 
-1. Make the Tauri app build and launch on Apple Silicon macOS.
-2. Replace sample profile data with `~/.clusterdeck/profiles.yaml`.
-3. Implement SSH host probe and retry.
-4. Implement optional password bootstrap and key verification.
-5. Generate ClusterDeck-owned SSH aliases.
-6. Implement control-plane kubeconfig fetch and normalization.
-7. Implement local kubeconfig storage.
-8. Implement Kubernetes verification.
-9. Add Bastion/ProxyJump workflow.
+1. Make the Tauri app build and launch on Apple Silicon macOS. — implemented
+2. Replace sample profile data with `~/.clusterdeck/profiles.yaml`. — implemented
+3. Implement SSH host probe and retry. — implemented
+4. Implement optional password bootstrap and key verification. — implemented
+5. Generate ClusterDeck-owned SSH aliases. — implemented
+6. Implement control-plane kubeconfig fetch and normalization. — implemented
+7. Implement local kubeconfig storage. — implemented
+8. Implement Kubernetes verification. — implemented
+9. Add Bastion/ProxyJump workflow. — implemented
 10. Add IP discovery and richer status refresh.
+
