@@ -1,0 +1,30 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "ClusterDeck",
+  "version": "0.1.0",
+  "identifier": "com.dasomel.clusterdeck",
+  "build": {
+    "beforeDevCommand": "pnpm dev",
+    "beforeBuildCommand": "pnpm build",
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:5173"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "ClusterDeck",
+        "width": 1120,
+        "height": 760,
+        "minWidth": 960,
+        "minHeight": 680,
+        "resizable": true
+      }
+    ]
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["app", "dmg"],
+    "category": "DeveloperTool",
+    "shortDescription": "Switch, bootstrap, and verify Kubernetes environments on macOS"
+  }
+}
