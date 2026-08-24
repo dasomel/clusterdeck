@@ -1,0 +1,156 @@
+#![allow(dead_code)]
+
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+
+use crate::services::config::{Bastion, BootstrapPolicy, Host, KubeconfigSource, Profile};
+use crate::services::paths::ClusterDeckPaths;
+
+#[derive(Serialize, Deserialize, Default)]
+struct ProfilesFile {
+    #[serde(default)]
+    profiles: BTreeMap<String, ProfileBody>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ProfileBody {
+    name: String,
+    #[serde(default)]
+    hosts: Vec<Host>,
+    #[serde(default)]
+    bastion: Option<Bastion>,
+    #[serde(default)]
+    bootstrap: BootstrapPolicy,
+    #[serde(default)]
+    kubeconfig: Option<KubeconfigSource>,
+}
+
+pub fn load_profiles(paths: &ClusterDeckPaths) -> Result<Vec<Profile>, String> {
+    let file_path = paths.profiles_file();
+    if !file_path.exists() {
+        return Ok(Vec::new());
+    }
+    let content = std::fs::read_to_string(&file_path).map_err(|e| e.to_string())?;
+    let parsed: ProfilesFile = serde_yaml::from_str(&content).map_err(|e| e.to_string())?;
+    let profiles = parsed
+        .profiles
+        .into_iter()
+        .map(|(id, body)| Profile {
+            id,
+            name: body.name,
+            hosts: body.hosts,
+            bastion: body.bastion,
+            bootstrap: body.bootstrap,
+            kubeconfig: body.kubeconfig,
+        })
+        .collect();
+    Ok(profiles)
+}
+
+pub fn save_profiles(paths: &ClusterDeckPaths, profiles: &[Profile]) -> Result<(), String> {
+    let file_path = paths.profiles_file();
+    if let Some(parent) = file_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let mut map = BTreeMap::new();
+    for p in profiles {
+        map.insert(
+            p.id.clone(),
+            ProfileBody {
+                name: p.name.clone(),
+                hosts: p.hosts.clone(),
+                bastion: p.bastion.clone(),
+                bootstrap: p.bootstrap.clone(),
+                kubeconfig: p.kubeconfig.clone(),
+            },
+        );
+    }
+    let file = ProfilesFile { profiles: map };
+    let yaml = serde_yaml::to_string(&file).map_err(|e| e.to_string())?;
+    std::fs::write(&file_path, yaml).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+pub fn upsert_profile(paths: &ClusterDeckPaths, profile: Profile) -> Result<(), String> {
+    let mut profiles = load_profiles(paths)?;
+    if let Some(pos) = profiles.iter().position(|p| p.id == profile.id) {
+        profiles[pos] = profile;
+    } else {
+        profiles.push(profile);
+    }
+    save_profiles(paths, &profiles)
+}
+
+pub fn delete_profile(paths: &ClusterDeckPaths, profile_id: &str) -> Result<(), String> {
+    let mut profiles = load_profiles(paths)?;
+    profiles.retain(|p| p.id != profile_id);
+    save_profiles(paths, &profiles)
+}
+
+pub fn get_profile(paths: &ClusterDeckPaths, profile_id: &str) -> Result<Profile, String> {
+    let profiles = load_profiles(paths)?;
+    profiles
+        .into_iter()
+        .find(|p| p.id == profile_id)
+        .ok_or_else(|| format!("Profile not found: {profile_id}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::services::config::{BootstrapPolicy, Host, Profile};
+
+    fn temp_paths(tag: &str) -> ClusterDeckPaths {
+        let dir = std::env::temp_dir().join(format!(
+            "clusterdeck-store-test-{tag}-{}",
+            std::process::id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        ClusterDeckPaths::at(dir)
+    }
+
+    #[test]
+    fn load_profiles_returns_empty_when_file_missing() {
+        let paths = temp_paths("missing");
+        assert_eq!(load_profiles(&paths).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn upsert_then_load_roundtrips() {
+        let paths = temp_paths("roundtrip");
+        let profile = Profile {
+            id: "cka".into(),
+            name: "CKA Lab".into(),
+            hosts: vec![Host {
+                name: "cka-m1".into(),
+                address: "192.0.2.10".into(),
+                port: 22,
+                user: "root".into(),
+                identity_file: None,
+            }],
+            bastion: None,
+            bootstrap: BootstrapPolicy::default(),
+            kubeconfig: None,
+        };
+        upsert_profile(&paths, profile.clone()).unwrap();
+        let loaded = get_profile(&paths, "cka").unwrap();
+        assert_eq!(loaded.name, "CKA Lab");
+        assert_eq!(loaded.hosts.len(), 1);
+    }
+
+    #[test]
+    fn delete_profile_removes_entry() {
+        let paths = temp_paths("delete");
+        let profile = Profile {
+            id: "x".into(),
+            name: "X".into(),
+            hosts: vec![],
+            bastion: None,
+            bootstrap: BootstrapPolicy::default(),
+            kubeconfig: None,
+        };
+        upsert_profile(&paths, profile).unwrap();
+        delete_profile(&paths, "x").unwrap();
+        assert!(get_profile(&paths, "x").is_err());
+    }
+}
