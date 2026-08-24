@@ -144,6 +144,35 @@ ClusterDeck owns only its generated configuration files under `~/.clusterdeck/ss
 
 This allows the user to keep unrelated SSH settings untouched.
 
+### 7.1 Optional `/etc/hosts` Managed Block
+
+For profiles that opt in via `manage_hosts_file: true`, ClusterDeck also maps each host and
+bastion to a stable, namespaced hostname in `/etc/hosts`:
+
+```text
+<host-or-bastion-name>.<profile-id>.clusterdeck.local
+```
+
+The namespacing by profile id avoids collisions when two profiles happen to name a host the
+same thing. As with SSH configuration, ClusterDeck owns only its own marker block per profile
+and never touches any other line in the file:
+
+```text
+# >>> ClusterDeck BEGIN (profile: <profile-id>) >>>
+<address> <name>.<profile-id>.clusterdeck.local
+# <<< ClusterDeck END (profile: <profile-id>) <<<
+```
+
+Writing `/etc/hosts` requires root, so ClusterDeck performs a single
+`osascript ... with administrator privileges` call per `connect_profile` invocation (never more
+than one password prompt per action) rather than running the whole app elevated. The block is
+written as part of `connect_profile` when the flag is set, and removed when the profile is
+deleted. A cancelled password prompt is treated as a non-fatal stage failure, the same way a
+failed kubeconfig fetch or alias write is: it is recorded in `ConnectionResult.errors` and does
+not abort the rest of the pipeline. This flag defaults to `false` and currently has no UI
+toggle — it is set by editing `profiles.yaml` directly, matching the deferred Profile-creation
+UI elsewhere in this MVP.
+
 ## 8. Bastion / Relay
 
 Profiles may define a Bastion host when targets are not directly reachable.
