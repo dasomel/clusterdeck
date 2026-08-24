@@ -1,61 +1,48 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Boxes, CheckCircle2, CircleAlert, Plus, RefreshCw, Server, Terminal } from 'lucide-react';
-
-type Host = {
-  name: string;
-  address: string;
-  reachable: boolean;
-};
-
-type Profile = {
-  id: string;
-  name: string;
-  hosts: Host[];
-  bastion?: string;
-  kubeContext: string;
-};
-
-const initialProfiles: Profile[] = [
-  {
-    id: 'cka-lab',
-    name: 'CKA Lab',
-    hosts: [
-      { name: 'cka-m1', address: '192.0.2.10', reachable: true },
-      { name: 'cka-w1', address: '192.0.2.11', reachable: true },
-      { name: 'cka-w2', address: '192.0.2.12', reachable: false },
-    ],
-    kubeContext: 'cka-lab',
-  },
-  {
-    id: 'dev-cluster',
-    name: 'Dev Cluster',
-    hosts: [{ name: 'dev-m1', address: '198.51.100.20', reachable: true }],
-    bastion: 'bastion.dev',
-    kubeContext: 'dev',
-  },
-];
+import { api, type ConnectionResult, type Profile } from './api/tauri';
 
 export default function App() {
-  const [profiles, setProfiles] = useState(initialProfiles);
-  const [selectedId, setSelectedId] = useState(initialProfiles[0].id);
+  const [profiles, setProfiles] = useState<Profile[]>([]);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
   const [connecting, setConnecting] = useState(false);
+  const [lastResult, setLastResult] = useState<ConnectionResult | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
+
+  const loadProfiles = async () => {
+    try {
+      const loaded = await api.listProfiles();
+      setProfiles(loaded);
+      setSelectedId((current) => current ?? loaded[0]?.id ?? null);
+      setLoadError(null);
+    } catch (err) {
+      setLoadError(String(err));
+    }
+  };
+
+  useEffect(() => {
+    loadProfiles();
+  }, []);
 
   const selected = useMemo(
-    () => profiles.find((profile) => profile.id === selectedId) ?? profiles[0],
+    () => profiles.find((profile) => profile.id === selectedId) ?? null,
     [profiles, selectedId],
   );
 
   const connect = async () => {
+    if (!selected) return;
     setConnecting(true);
-    // TODO: Replace with Tauri invoke("connect_profile", { profileId: selected.id }) once the Rust command exists.
-    await new Promise((resolve) => setTimeout(resolve, 700));
-    setConnecting(false);
+    try {
+      const result = await api.connectProfile(selected.id);
+      setLastResult(result);
+    } catch (err) {
+      setLoadError(String(err));
+    } finally {
+      setConnecting(false);
+    }
   };
 
-  const refresh = async () => {
-    // TODO: invoke discovery/health commands from Rust backend.
-    setProfiles((current) => current.map((profile) => ({ ...profile })));
-  };
+  const refresh = () => loadProfiles();
 
   return (
     <div className="app-shell">
@@ -69,31 +56,42 @@ export default function App() {
         </div>
 
         <div className="section-label">PROFILES</div>
-        <div className="profile-list">
-          {profiles.map((profile) => {
-            const healthyHosts = profile.hosts.filter((host) => host.reachable).length;
-            const isSelected = profile.id === selectedId;
-            return (
-              <button
-                key={profile.id}
-                className={`profile-card ${isSelected ? 'selected' : ''}`}
-                onClick={() => setSelectedId(profile.id)}
-              >
-                <div className="profile-card-top">
-                  <span className="profile-name">{profile.name}</span>
-                  {healthyHosts === profile.hosts.length ? (
-                    <CheckCircle2 className="status-ok" size={16} />
-                  ) : (
-                    <CircleAlert className="status-warn" size={16} />
-                  )}
-                </div>
-                <div className="profile-meta">
-                  {profile.hosts.length} hosts · {profile.bastion ? 'Bastion' : 'Direct'}
-                </div>
-              </button>
-            );
-          })}
-        </div>
+        {profiles.length === 0 && !loadError ? (
+          <p className="profile-meta" style={{ padding: '0 8px' }}>
+            No profiles yet. Add one to ~/.clusterdeck/profiles.yaml.
+          </p>
+        ) : (
+          <div className="profile-list">
+            {profiles.map((profile) => {
+              const isSelected = profile.id === selectedId;
+              const healthyHosts = isSelected && lastResult
+                ? profile.hosts.filter((host) => lastResult.hosts.find((h) => h.host === host.name)?.reachable).length
+                : 0;
+              return (
+                <button
+                  key={profile.id}
+                  className={`profile-card ${isSelected ? 'selected' : ''}`}
+                  onClick={() => {
+                    setSelectedId(profile.id);
+                    setLastResult(null);
+                  }}
+                >
+                  <div className="profile-card-top">
+                    <span className="profile-name">{profile.name}</span>
+                    {healthyHosts === profile.hosts.length ? (
+                      <CheckCircle2 className="status-ok" size={16} />
+                    ) : (
+                      <CircleAlert className="status-warn" size={16} />
+                    )}
+                  </div>
+                  <div className="profile-meta">
+                    {profile.hosts.length} hosts · {profile.bastion ? 'Bastion' : 'Direct'}
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+        )}
 
         <button className="secondary-button">
           <Plus size={16} /> Add profile
@@ -101,6 +99,7 @@ export default function App() {
       </aside>
 
       <main className="main-panel">
+        {loadError && <div className="pill warning" style={{ marginBottom: '16px' }}>{loadError}</div>}
         <header className="header">
           <div>
             <div className="eyebrow">ENVIRONMENT</div>
@@ -117,7 +116,7 @@ export default function App() {
             <h2>Bring the cluster to your local workstation.</h2>
             <p>Discover hosts, bootstrap SSH, fetch kubeconfig, and verify Kubernetes access from one profile.</p>
           </div>
-          <button className="primary-button" onClick={connect} disabled={connecting}>
+          <button className="primary-button" onClick={connect} disabled={connecting || !selected}>
             {connecting ? <RefreshCw size={16} className="spin" /> : <Terminal size={16} />}
             {connecting ? 'Connecting…' : 'Connect / Sync'}
           </button>
@@ -127,27 +126,30 @@ export default function App() {
           <div className="panel-card">
             <div className="panel-title"><Server size={16} /> Hosts</div>
             <div className="host-list">
-              {selected?.hosts.map((host) => (
-                <div className="host-row" key={host.name}>
-                  <div>
-                    <div className="host-name">{host.name}</div>
-                    <div className="host-address">{host.address}</div>
+              {selected?.hosts.map((host) => {
+                const reachable = lastResult?.hosts.find((h) => h.host === host.name)?.reachable ?? false;
+                return (
+                  <div className="host-row" key={host.name}>
+                    <div>
+                      <div className="host-name">{host.name}</div>
+                      <div className="host-address">{host.address}</div>
+                    </div>
+                    <span className={`pill ${reachable ? 'success' : 'warning'}`}>
+                      {reachable ? 'SSH reachable' : 'Needs retry'}
+                    </span>
                   </div>
-                  <span className={`pill ${host.reachable ? 'success' : 'warning'}`}>
-                    {host.reachable ? 'SSH reachable' : 'Needs retry'}
-                  </span>
-                </div>
-              ))}
+                );
+              })}
             </div>
           </div>
 
           <div className="panel-card">
             <div className="panel-title"><Boxes size={16} /> Kubernetes</div>
             <div className="status-stack">
-              <div className="status-row"><span>SSH</span><strong>Ready</strong></div>
-              <div className="status-row"><span>Kubeconfig</span><strong>Synced</strong></div>
-              <div className="status-row"><span>Context</span><strong>{selected?.kubeContext}</strong></div>
-              <div className="status-row"><span>API</span><strong>Verified</strong></div>
+              <div className="status-row"><span>SSH</span><strong>{lastResult?.verification.ssh ? 'Ready' : '—'}</strong></div>
+              <div className="status-row"><span>Kubeconfig</span><strong>{lastResult?.verification.kubeconfig ? 'Synced' : '—'}</strong></div>
+              <div className="status-row"><span>Context</span><strong>{selected?.kubeconfig?.context ?? '—'}</strong></div>
+              <div className="status-row"><span>API</span><strong>{lastResult?.verification.kubernetes ? 'Verified' : '—'}</strong></div>
             </div>
           </div>
         </section>
