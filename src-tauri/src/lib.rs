@@ -9,6 +9,7 @@ pub fn run() {
             commands::profiles::get_profile_cmd,
             commands::profiles::save_profile,
             commands::profiles::delete_profile_cmd,
+            commands::discovery::discover_hosts,
             commands::connection::test_connection,
         ])
         .run(tauri::generate_context!())
