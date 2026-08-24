@@ -85,5 +85,6 @@ export const api = {
   getProfileStatus: (profileId: string) => invoke<VerificationResult | null>('get_profile_status', { profileId }),
   connectProfile: (profileId: string, bootstrapPassword?: string) =>
     invoke<ConnectionResult>('connect_profile', { profileId, bootstrapPassword }),
+  openSshSession: (profileId: string, hostName: string) => invoke<void>('open_ssh_session', { profileId, hostName }),
   listLocalKubeContexts: () => invoke<LocalKubeContext[]>('list_local_kube_contexts_cmd'),
 };

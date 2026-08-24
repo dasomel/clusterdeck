@@ -17,6 +17,7 @@ pub fn run() {
             commands::connection::verify_profile,
             commands::connection::get_profile_status,
             commands::connection::connect_profile,
+            commands::connection::open_ssh_session,
             commands::kube_import::list_local_kube_contexts_cmd,
         ])
         .run(tauri::generate_context!())

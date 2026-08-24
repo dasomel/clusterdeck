@@ -5,7 +5,7 @@ use serde::Serialize;
 
 use crate::services::kubeconfig::KubeconfigSummary;
 use crate::services::paths::ClusterDeckPaths;
-use crate::services::process::SystemRunner;
+use crate::services::process::{CommandRunner, SystemRunner};
 use crate::services::ssh::{self, BootstrapResult};
 use crate::services::ssh_config;
 use crate::services::state;
@@ -271,4 +271,31 @@ pub async fn connect_profile(
         verification,
         errors,
     })
+}
+
+#[tauri::command]
+pub async fn open_ssh_session(profile_id: String, host_name: String) -> Result<(), String> {
+    let paths = ClusterDeckPaths::resolve()?;
+    let profile = store::get_profile(&paths, &profile_id)?;
+
+    if !profile.hosts.iter().any(|h| h.name == host_name) {
+        return Err(format!("host not found: {host_name}"));
+    }
+
+    ssh_config::write_profile_config(&paths, &profile)?;
+    let home = std::env::var("HOME").map_err(|e| e.to_string())?;
+    let home_ssh_config = PathBuf::from(home).join(".ssh").join("config");
+    ssh_config::ensure_ssh_include(&home_ssh_config, &paths)?;
+
+    let alias = ssh_config::ssh_alias(&profile.id, &host_name);
+    let runner = SystemRunner;
+    let output = runner.run("open", &[format!("ssh://{alias}")]).await?;
+
+    if output.success {
+        Ok(())
+    } else if output.stderr.is_empty() {
+        Err("failed to open ssh session".to_string())
+    } else {
+        Err(output.stderr)
+    }
 }
