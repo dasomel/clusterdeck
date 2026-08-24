@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
-import { Boxes, CheckCircle2, CircleAlert, Moon, Plus, RefreshCw, Server, Sun, Terminal } from 'lucide-react';
+import { Boxes, CheckCircle2, CircleAlert, Moon, Pencil, Plus, RefreshCw, Server, Sun, Terminal } from 'lucide-react';
 import { api, type ConnectionResult, type Profile } from './api/tauri';
+import ProfileEditor from './components/ProfileEditor';
 
 export default function App() {
   const [profiles, setProfiles] = useState<Profile[]>([]);
@@ -8,6 +9,12 @@ export default function App() {
   const [connecting, setConnecting] = useState(false);
   const [lastResult, setLastResult] = useState<ConnectionResult | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
+
+  const [editorState, setEditorState] = useState<{ open: boolean; profile: Profile | null }>({
+    open: false,
+    profile: null,
+  });
+  const [bootstrapPassword, setBootstrapPassword] = useState('');
 
   const [theme, setTheme] = useState<'light' | 'dark' | null>(() => {
     try {
@@ -67,12 +74,13 @@ export default function App() {
     if (!selected) return;
     setConnecting(true);
     try {
-      const result = await api.connectProfile(selected.id);
+      const result = await api.connectProfile(selected.id, bootstrapPassword || undefined);
       setLastResult(result);
     } catch (err) {
       setLoadError(String(err));
     } finally {
       setConnecting(false);
+      setBootstrapPassword('');
     }
   };
 
@@ -102,26 +110,48 @@ export default function App() {
                 ? profile.hosts.filter((host) => lastResult.hosts.find((h) => h.host === host.name)?.reachable).length
                 : 0;
               return (
-                <button
+                <div
                   key={profile.id}
+                  role="button"
+                  tabIndex={0}
                   className={`profile-card ${isSelected ? 'selected' : ''}`}
                   onClick={() => {
                     setSelectedId(profile.id);
                     setLastResult(null);
                   }}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' || e.key === ' ') {
+                      setSelectedId(profile.id);
+                      setLastResult(null);
+                    }
+                  }}
                 >
                   <div className="profile-card-top">
                     <span className="profile-name">{profile.name}</span>
-                    {healthyHosts === profile.hosts.length ? (
-                      <CheckCircle2 className="status-ok" size={16} />
-                    ) : (
-                      <CircleAlert className="status-warn" size={16} />
-                    )}
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                      <button
+                        type="button"
+                        className="icon-button"
+                        style={{ width: '22px', height: '22px', padding: 0 }}
+                        title="Edit profile"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setEditorState({ open: true, profile });
+                        }}
+                      >
+                        <Pencil size={14} />
+                      </button>
+                      {healthyHosts === profile.hosts.length ? (
+                        <CheckCircle2 className="status-ok" size={16} />
+                      ) : (
+                        <CircleAlert className="status-warn" size={16} />
+                      )}
+                    </div>
                   </div>
                   <div className="profile-meta">
                     {profile.hosts.length} hosts · {profile.bastion ? 'Bastion' : 'Direct'}
                   </div>
-                </button>
+                </div>
               );
             })}
           </div>
@@ -129,8 +159,7 @@ export default function App() {
 
         <button
           className="secondary-button"
-          disabled
-          title="Create profiles by editing ~/.clusterdeck/profiles.yaml (UI coming later)"
+          onClick={() => setEditorState({ open: true, profile: null })}
         >
           <Plus size={16} /> Add profile
         </button>
@@ -163,10 +192,26 @@ export default function App() {
             <h2>Bring the cluster to your local workstation.</h2>
             <p>Discover hosts, bootstrap SSH, fetch kubeconfig, and verify Kubernetes access from one profile.</p>
           </div>
-          <button className="primary-button" onClick={connect} disabled={connecting || !selected}>
-            {connecting ? <RefreshCw size={16} className="spin" /> : <Terminal size={16} />}
-            {connecting ? 'Connecting…' : 'Connect / Sync'}
-          </button>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', alignItems: 'flex-end' }}>
+            {selected?.bootstrap.enabled && (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', width: '200px' }}>
+                <label className="form-label" style={{ fontSize: '11px' }}>
+                  SSH Bootstrap Password
+                </label>
+                <input
+                  type="password"
+                  placeholder="Enter SSH password"
+                  value={bootstrapPassword}
+                  onChange={(e) => setBootstrapPassword(e.target.value)}
+                  className="form-input mono"
+                />
+              </div>
+            )}
+            <button className="primary-button" onClick={connect} disabled={connecting || !selected}>
+              {connecting ? <RefreshCw size={16} className="spin" /> : <Terminal size={16} />}
+              {connecting ? 'Connecting…' : 'Connect / Sync'}
+            </button>
+          </div>
         </section>
 
         <section className="grid-two">
@@ -214,6 +259,15 @@ export default function App() {
           </div>
         </section>
       </main>
+
+      {editorState.open && (
+        <ProfileEditor
+          initial={editorState.profile}
+          onClose={() => setEditorState({ open: false, profile: null })}
+          onSaved={() => loadProfiles()}
+        />
+      )}
     </div>
   );
 }
+
