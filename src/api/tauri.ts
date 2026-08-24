@@ -58,6 +58,7 @@ export type ConnectionResult = {
   aliases_written: boolean;
   kubeconfig: KubeconfigSummary | null;
   verification: VerificationResult;
+  errors: string[];
 };
 
 export type DiscoveredHost = { address: string; ssh_open: boolean };

@@ -93,7 +93,11 @@ export default function App() {
           </div>
         )}
 
-        <button className="secondary-button">
+        <button
+          className="secondary-button"
+          disabled
+          title="Create profiles by editing ~/.clusterdeck/profiles.yaml (UI coming later)"
+        >
           <Plus size={16} /> Add profile
         </button>
       </aside>

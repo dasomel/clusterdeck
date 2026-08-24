@@ -2,6 +2,7 @@
 
 use crate::services::config::{Bastion, Host};
 use crate::services::process::CommandRunner;
+use crate::services::validate::is_safe_ssh_identifier;
 use serde::Serialize;
 
 #[derive(Debug, Clone, Serialize)]
@@ -17,10 +18,6 @@ pub struct BootstrapResult {
     pub key_deployed: bool,
     pub verified: bool,
     pub detail: String,
-}
-
-fn is_safe_ssh_identifier(s: &str) -> bool {
-    !s.is_empty() && !s.starts_with('-')
 }
 
 pub fn build_ssh_target_args(
@@ -127,8 +124,7 @@ pub async fn probe_password_auth(
     }
 
     let mut args = vec![
-        "-p".to_string(),
-        password.to_string(),
+        "-e".to_string(),
         "ssh".to_string(),
         "-o".to_string(),
         "ConnectTimeout=5".to_string(),
@@ -159,7 +155,14 @@ pub async fn probe_password_auth(
     args.push(format!("{}@{}", host.user, host.address));
     args.push("true".to_string());
 
-    match runner.run("sshpass", &args).await {
+    match runner
+        .run_with_env(
+            "sshpass",
+            &args,
+            &[("SSHPASS".to_string(), password.to_string())],
+        )
+        .await
+    {
         Ok(output) => ProbeResult {
             host: host.name.clone(),
             reachable: output.success,
@@ -199,8 +202,7 @@ pub async fn deploy_public_key(
     }
 
     let mut args = vec![
-        "-p".to_string(),
-        password.to_string(),
+        "-e".to_string(),
         "ssh-copy-id".to_string(),
         "-o".to_string(),
         "ConnectTimeout=5".to_string(),
@@ -230,7 +232,13 @@ pub async fn deploy_public_key(
     args.push("--".to_string());
     args.push(format!("{}@{}", host.user, host.address));
 
-    let output = runner.run("sshpass", &args).await?;
+    let output = runner
+        .run_with_env(
+            "sshpass",
+            &args,
+            &[("SSHPASS".to_string(), password.to_string())],
+        )
+        .await?;
     if output.success {
         Ok(())
     } else {
@@ -411,5 +419,52 @@ mod tests {
         h.user = "-oProxyCommand=evil".into();
         let result = probe_key_auth(&runner, &h, None).await;
         assert!(!result.reachable);
+    }
+
+    struct EnvCapturingRunner {
+        calls: std::sync::Mutex<Vec<(Vec<String>, Vec<(String, String)>)>>,
+    }
+
+    #[async_trait]
+    impl CommandRunner for EnvCapturingRunner {
+        async fn run(&self, _bin: &str, _args: &[String]) -> Result<CommandOutput, String> {
+            Ok(CommandOutput {
+                stdout: String::new(),
+                stderr: String::new(),
+                success: true,
+            })
+        }
+
+        async fn run_with_env(
+            &self,
+            bin: &str,
+            args: &[String],
+            env: &[(String, String)],
+        ) -> Result<CommandOutput, String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((args.to_vec(), env.to_vec()));
+            self.run(bin, args).await
+        }
+    }
+
+    #[tokio::test]
+    async fn probe_password_auth_and_deploy_key_pass_password_via_env_not_argv() {
+        let runner = EnvCapturingRunner {
+            calls: std::sync::Mutex::new(Vec::new()),
+        };
+        let secret = "super_secret_password_123";
+
+        let _ = probe_password_auth(&runner, &host(), None, secret).await;
+        let _ = deploy_public_key(&runner, &host(), None, secret).await;
+
+        let calls = runner.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        for (args, env) in calls.iter() {
+            assert!(args.contains(&"-e".to_string()));
+            assert!(!args.contains(&secret.to_string()));
+            assert!(env.contains(&("SSHPASS".to_string(), secret.to_string())));
+        }
     }
 }

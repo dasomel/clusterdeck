@@ -25,6 +25,7 @@ pub struct ConnectionResult {
     pub aliases_written: bool,
     pub kubeconfig: Option<KubeconfigSummary>,
     pub verification: VerificationResult,
+    pub errors: Vec<String>,
 }
 
 #[tauri::command]
@@ -195,13 +196,28 @@ pub async fn connect_profile(
         });
     }
 
+    let mut errors = Vec::new();
+
     let mut aliases_written = false;
-    if ssh_config::write_profile_config(&paths, &profile).is_ok() {
-        if let Ok(home) = std::env::var("HOME") {
-            let home_ssh_config = PathBuf::from(home).join(".ssh").join("config");
-            if ssh_config::ensure_ssh_include(&home_ssh_config, &paths).is_ok() {
-                aliases_written = true;
+    match ssh_config::write_profile_config(&paths, &profile) {
+        Ok(_) => match std::env::var("HOME") {
+            Ok(home) => {
+                let home_ssh_config = PathBuf::from(home).join(".ssh").join("config");
+                match ssh_config::ensure_ssh_include(&home_ssh_config, &paths) {
+                    Ok(_) => {
+                        aliases_written = true;
+                    }
+                    Err(e) => {
+                        errors.push(format!("alias include generation failed: {e}"));
+                    }
+                }
             }
+            Err(e) => {
+                errors.push(format!("HOME environment variable not set: {e}"));
+            }
+        },
+        Err(e) => {
+            errors.push(format!("alias write failed: {e}"));
         }
     }
 
@@ -209,10 +225,13 @@ pub async fn connect_profile(
     let mut kubeconfig_summary = None;
 
     if profile.kubeconfig.is_some() && any_host_reachable {
-        if let Ok(summary) =
-            crate::services::kubeconfig::fetch_and_store(&runner, &paths, &profile).await
-        {
-            kubeconfig_summary = Some(summary);
+        match crate::services::kubeconfig::fetch_and_store(&runner, &paths, &profile).await {
+            Ok(summary) => {
+                kubeconfig_summary = Some(summary);
+            }
+            Err(e) => {
+                errors.push(format!("kubeconfig fetch failed: {e}"));
+            }
         }
     }
 
@@ -242,5 +261,6 @@ pub async fn connect_profile(
         aliases_written,
         kubeconfig: kubeconfig_summary,
         verification,
+        errors,
     })
 }

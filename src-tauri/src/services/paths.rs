@@ -27,6 +27,7 @@ impl ClusterDeckPaths {
     }
 
     pub fn ssh_conf(&self, profile_id: &str) -> PathBuf {
+        debug_assert!(crate::services::validate::is_safe_profile_id(profile_id));
         self.ssh_dir().join(format!("{profile_id}.conf"))
     }
 
@@ -35,6 +36,7 @@ impl ClusterDeckPaths {
     }
 
     pub fn kubeconfig_file(&self, profile_id: &str) -> PathBuf {
+        debug_assert!(crate::services::validate::is_safe_profile_id(profile_id));
         self.kubeconfigs_dir().join(format!("{profile_id}.yaml"))
     }
 

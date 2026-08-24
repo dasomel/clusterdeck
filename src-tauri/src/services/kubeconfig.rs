@@ -84,11 +84,22 @@ pub fn normalize(raw_yaml: &str, profile_id: &str) -> Result<String, String> {
     serde_yaml::to_string(&val).map_err(|e| format!("Failed to serialize normalized YAML: {e}"))
 }
 
+struct TempFileCleaner<'a>(&'a std::path::Path);
+impl<'a> Drop for TempFileCleaner<'a> {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(self.0);
+    }
+}
+
 pub async fn fetch_and_store(
     runner: &dyn CommandRunner,
     paths: &ClusterDeckPaths,
     profile: &Profile,
 ) -> Result<KubeconfigSummary, String> {
+    if !crate::services::validate::is_safe_profile_id(&profile.id) {
+        return Err("invalid profile id".to_string());
+    }
+
     let kube_source = profile
         .kubeconfig
         .as_ref()
@@ -110,6 +121,7 @@ pub async fn fetch_and_store(
 
     let tmp_filename = format!("clusterdeck-kc-{}-{}.tmp", profile.id, std::process::id());
     let tmp_path = std::env::temp_dir().join(tmp_filename);
+    let _cleaner = TempFileCleaner(&tmp_path);
 
     let scp_args = vec![
         "-F".to_string(),
@@ -128,11 +140,8 @@ pub async fn fetch_and_store(
         return Err(format!("kubeconfig fetch failed: {err_msg}"));
     }
 
-    let raw_yaml = std::fs::read_to_string(&tmp_path).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp_path);
-        format!("failed to read fetched kubeconfig file: {e}")
-    })?;
-    let _ = std::fs::remove_file(&tmp_path);
+    let raw_yaml = std::fs::read_to_string(&tmp_path)
+        .map_err(|e| format!("failed to read fetched kubeconfig file: {e}"))?;
 
     let normalized_yaml = normalize(&raw_yaml, &profile.id)?;
 

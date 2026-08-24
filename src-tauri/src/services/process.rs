@@ -27,6 +27,14 @@ pub struct CommandOutput {
 #[async_trait]
 pub trait CommandRunner: Send + Sync {
     async fn run(&self, bin: &str, args: &[String]) -> Result<CommandOutput, String>;
+    async fn run_with_env(
+        &self,
+        bin: &str,
+        args: &[String],
+        _env: &[(String, String)],
+    ) -> Result<CommandOutput, String> {
+        self.run(bin, args).await
+    }
 }
 
 pub struct SystemRunner;
@@ -37,6 +45,29 @@ impl CommandRunner for SystemRunner {
         let path = resolve_cli_path(bin)?;
         let output = Command::new(path)
             .args(args)
+            .output()
+            .await
+            .map_err(|err| format!("{bin} execution failed: {err}"))?;
+        Ok(CommandOutput {
+            stdout: String::from_utf8_lossy(&output.stdout).trim().to_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            success: output.status.success(),
+        })
+    }
+
+    async fn run_with_env(
+        &self,
+        bin: &str,
+        args: &[String],
+        env: &[(String, String)],
+    ) -> Result<CommandOutput, String> {
+        let path = resolve_cli_path(bin)?;
+        let mut cmd = Command::new(path);
+        cmd.args(args);
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let output = cmd
             .output()
             .await
             .map_err(|err| format!("{bin} execution failed: {err}"))?;

@@ -72,6 +72,7 @@ pub fn save_profiles(paths: &ClusterDeckPaths, profiles: &[Profile]) -> Result<(
 }
 
 pub fn upsert_profile(paths: &ClusterDeckPaths, profile: Profile) -> Result<(), String> {
+    crate::services::validate::validate_profile(&profile)?;
     let mut profiles = load_profiles(paths)?;
     if let Some(pos) = profiles.iter().position(|p| p.id == profile.id) {
         profiles[pos] = profile;
@@ -152,5 +153,19 @@ mod tests {
         upsert_profile(&paths, profile).unwrap();
         delete_profile(&paths, "x").unwrap();
         assert!(get_profile(&paths, "x").is_err());
+    }
+
+    #[test]
+    fn upsert_profile_rejects_invalid_profile_id() {
+        let paths = temp_paths("invalid-id");
+        let profile = Profile {
+            id: "../../evil".into(),
+            name: "Evil".into(),
+            hosts: vec![],
+            bastion: None,
+            bootstrap: BootstrapPolicy::default(),
+            kubeconfig: None,
+        };
+        assert!(upsert_profile(&paths, profile).is_err());
     }
 }
