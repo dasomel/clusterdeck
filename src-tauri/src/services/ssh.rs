@@ -30,6 +30,8 @@ pub fn build_ssh_target_args(
         "BatchMode=yes".to_string(),
         "-o".to_string(),
         "ConnectTimeout=5".to_string(),
+        "-o".to_string(),
+        "StrictHostKeyChecking=accept-new".to_string(),
         "-p".to_string(),
         host.port.to_string(),
     ];
@@ -386,6 +388,23 @@ mod tests {
         )
         .await;
         assert!(!result.reachable);
+    }
+
+    #[test]
+    fn build_ssh_target_args_accepts_new_host_keys_without_prompting() {
+        // Regression: without this, BatchMode connections to a host never seen
+        // before (ClusterDeck's whole reason to exist -- frequently recreated
+        // VMs) fail outright with "Host key verification failed." instead of
+        // trust-on-first-use, because SSH's default StrictHostKeyChecking=ask
+        // cannot prompt in BatchMode.
+        let args = build_ssh_target_args(&host(), None, &[]);
+        let pos = args
+            .iter()
+            .position(|a| a == "StrictHostKeyChecking=accept-new");
+        assert!(
+            pos.is_some(),
+            "expected StrictHostKeyChecking=accept-new in ssh args"
+        );
     }
 
     #[tokio::test]
