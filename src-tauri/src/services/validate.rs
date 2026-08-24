@@ -76,6 +76,7 @@ mod tests {
             bastion: None,
             bootstrap: BootstrapPolicy::default(),
             kubeconfig: None,
+            manage_hosts_file: false,
         };
         assert!(validate_profile(&valid_profile).is_ok());
 

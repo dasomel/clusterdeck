@@ -282,6 +282,7 @@ users:
                 local_path: "".to_string(),
                 context: "cka".to_string(),
             }),
+            manage_hosts_file: false,
         };
 
         let runner = FakeScpRunner {

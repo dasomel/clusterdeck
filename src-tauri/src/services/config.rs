@@ -10,6 +10,8 @@ pub struct Profile {
     pub bastion: Option<Bastion>,
     pub bootstrap: BootstrapPolicy,
     pub kubeconfig: Option<KubeconfigSource>,
+    #[serde(default)]
+    pub manage_hosts_file: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

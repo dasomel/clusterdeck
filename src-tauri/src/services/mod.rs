@@ -1,5 +1,6 @@
 pub mod config;
 pub mod discovery;
+pub mod hosts_file;
 pub mod kubeconfig;
 pub mod paths;
 pub mod process;

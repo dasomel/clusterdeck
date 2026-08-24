@@ -23,6 +23,8 @@ struct ProfileBody {
     bootstrap: BootstrapPolicy,
     #[serde(default)]
     kubeconfig: Option<KubeconfigSource>,
+    #[serde(default)]
+    manage_hosts_file: bool,
 }
 
 pub fn load_profiles(paths: &ClusterDeckPaths) -> Result<Vec<Profile>, String> {
@@ -42,6 +44,7 @@ pub fn load_profiles(paths: &ClusterDeckPaths) -> Result<Vec<Profile>, String> {
             bastion: body.bastion,
             bootstrap: body.bootstrap,
             kubeconfig: body.kubeconfig,
+            manage_hosts_file: body.manage_hosts_file,
         })
         .collect();
     Ok(profiles)
@@ -62,6 +65,7 @@ pub fn save_profiles(paths: &ClusterDeckPaths, profiles: &[Profile]) -> Result<(
                 bastion: p.bastion.clone(),
                 bootstrap: p.bootstrap.clone(),
                 kubeconfig: p.kubeconfig.clone(),
+                manage_hosts_file: p.manage_hosts_file,
             },
         );
     }
@@ -132,11 +136,13 @@ mod tests {
             bastion: None,
             bootstrap: BootstrapPolicy::default(),
             kubeconfig: None,
+            manage_hosts_file: true,
         };
         upsert_profile(&paths, profile.clone()).unwrap();
         let loaded = get_profile(&paths, "cka").unwrap();
         assert_eq!(loaded.name, "CKA Lab");
         assert_eq!(loaded.hosts.len(), 1);
+        assert!(loaded.manage_hosts_file);
     }
 
     #[test]
@@ -149,6 +155,7 @@ mod tests {
             bastion: None,
             bootstrap: BootstrapPolicy::default(),
             kubeconfig: None,
+            manage_hosts_file: false,
         };
         upsert_profile(&paths, profile).unwrap();
         delete_profile(&paths, "x").unwrap();
@@ -165,6 +172,7 @@ mod tests {
             bastion: None,
             bootstrap: BootstrapPolicy::default(),
             kubeconfig: None,
+            manage_hosts_file: false,
         };
         assert!(upsert_profile(&paths, profile).is_err());
     }
