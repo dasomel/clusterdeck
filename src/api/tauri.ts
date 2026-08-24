@@ -64,6 +64,13 @@ export type ConnectionResult = {
 
 export type DiscoveredHost = { address: string; ssh_open: boolean };
 
+export type LocalKubeContext = {
+  context_name: string;
+  cluster_name: string;
+  user_name: string;
+  server: string;
+};
+
 export const api = {
   listProfiles: () => invoke<Profile[]>('list_profiles'),
   getProfile: (profileId: string) => invoke<Profile>('get_profile_cmd', { profileId }),
@@ -78,4 +85,5 @@ export const api = {
   getProfileStatus: (profileId: string) => invoke<VerificationResult | null>('get_profile_status', { profileId }),
   connectProfile: (profileId: string, bootstrapPassword?: string) =>
     invoke<ConnectionResult>('connect_profile', { profileId, bootstrapPassword }),
+  listLocalKubeContexts: () => invoke<LocalKubeContext[]>('list_local_kube_contexts_cmd'),
 };
