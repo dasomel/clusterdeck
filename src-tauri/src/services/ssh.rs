@@ -421,6 +421,7 @@ mod tests {
         assert!(!result.reachable);
     }
 
+    #[allow(clippy::type_complexity)]
     struct EnvCapturingRunner {
         calls: std::sync::Mutex<Vec<(Vec<String>, Vec<(String, String)>)>>,
     }
