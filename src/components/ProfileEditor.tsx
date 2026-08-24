@@ -225,16 +225,15 @@ export default function ProfileEditor({ initial, onClose, onSaved }: ProfileEdit
   const computedLocalKubePath = `~/.clusterdeck/kubeconfigs/${id.trim() || '<id>'}.yaml`;
 
   return (
-    <div className="modal-backdrop" onClick={onClose}>
-      <div className="modal-panel" onClick={(e) => e.stopPropagation()}>
-        <div className="modal-header">
-          <h3>{isEditing ? 'Edit Profile' : 'Create Profile'}</h3>
-          <button type="button" className="icon-button" onClick={onClose} title="Close">
-            <X size={18} />
-          </button>
-        </div>
+    <div className="panel-card editor-panel">
+      <div className="modal-header">
+        <h3>{isEditing ? 'Edit Profile' : 'Create Profile'}</h3>
+        <button type="button" className="icon-button" onClick={onClose} title="Close">
+          <X size={18} />
+        </button>
+      </div>
 
-        <div className="modal-body">
+      <div className="modal-body">
           {/* Identity & Basic Info */}
           <div className="form-section">
             <div className="form-section-title">Profile Identity</div>
@@ -575,7 +574,6 @@ export default function ProfileEditor({ initial, onClose, onSaved }: ProfileEdit
             </button>
           </div>
         </div>
-      </div>
     </div>
   );
 }

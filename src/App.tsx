@@ -84,6 +84,15 @@ export default function App() {
     }
   };
 
+  const openSshSession = async (hostName: string) => {
+    if (!selected) return;
+    try {
+      await api.openSshSession(selected.id, hostName);
+    } catch (err) {
+      setLoadError(String(err));
+    }
+  };
+
   const refresh = () => loadProfiles();
 
   return (
@@ -118,11 +127,13 @@ export default function App() {
                   onClick={() => {
                     setSelectedId(profile.id);
                     setLastResult(null);
+                    setEditorState({ open: false, profile: null });
                   }}
                   onKeyDown={(e) => {
                     if (e.key === 'Enter' || e.key === ' ') {
                       setSelectedId(profile.id);
                       setLastResult(null);
+                      setEditorState({ open: false, profile: null });
                     }
                   }}
                 >
@@ -186,87 +197,100 @@ export default function App() {
           </div>
         </header>
 
-        <section className="hero-card">
-          <div>
-            <div className="eyebrow">READY TO CONNECT</div>
-            <h2>Bring the cluster to your local workstation.</h2>
-            <p>Discover hosts, bootstrap SSH, fetch kubeconfig, and verify Kubernetes access from one profile.</p>
-          </div>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', alignItems: 'flex-end' }}>
-            {selected?.bootstrap.enabled && (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', width: '200px' }}>
-                <label className="form-label" style={{ fontSize: '11px' }}>
-                  SSH Bootstrap Password
-                </label>
-                <input
-                  type="password"
-                  placeholder="Enter SSH password"
-                  value={bootstrapPassword}
-                  onChange={(e) => setBootstrapPassword(e.target.value)}
-                  className="form-input mono"
-                />
+        {editorState.open ? (
+          <ProfileEditor
+            initial={editorState.profile}
+            onClose={() => setEditorState({ open: false, profile: null })}
+            onSaved={() => loadProfiles()}
+          />
+        ) : (
+          <>
+            <section className="hero-card">
+              <div>
+                <div className="eyebrow">READY TO CONNECT</div>
+                <h2>Bring the cluster to your local workstation.</h2>
+                <p>Discover hosts, bootstrap SSH, fetch kubeconfig, and verify Kubernetes access from one profile.</p>
               </div>
-            )}
-            <button className="primary-button" onClick={connect} disabled={connecting || !selected}>
-              {connecting ? <RefreshCw size={16} className="spin" /> : <Terminal size={16} />}
-              {connecting ? 'Connecting…' : 'Connect / Sync'}
-            </button>
-          </div>
-        </section>
-
-        <section className="grid-two">
-          <div className="panel-card">
-            <div className="panel-title"><Server size={16} /> Hosts</div>
-            <div className="host-list">
-              {selected?.hosts.map((host) => {
-                const reachable = lastResult?.hosts.find((h) => h.host === host.name)?.reachable ?? false;
-                return (
-                  <div className="host-row" key={host.name}>
-                    <div>
-                      <div className="host-name">{host.name}</div>
-                      <div className="host-address">{host.address}</div>
-                    </div>
-                    <span className={`pill ${reachable ? 'success' : 'warning'}`}>
-                      {reachable ? 'SSH reachable' : 'Needs retry'}
-                    </span>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', alignItems: 'flex-end' }}>
+                {selected?.bootstrap.enabled && (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', width: '200px' }}>
+                    <label className="form-label" style={{ fontSize: '11px' }}>
+                      SSH Bootstrap Password
+                    </label>
+                    <input
+                      type="password"
+                      placeholder="Enter SSH password"
+                      value={bootstrapPassword}
+                      onChange={(e) => setBootstrapPassword(e.target.value)}
+                      className="form-input mono"
+                    />
                   </div>
-                );
-              })}
-            </div>
-          </div>
-
-          <div className="panel-card">
-            <div className="panel-title"><Boxes size={16} /> Kubernetes</div>
-            <div className="status-stack">
-              <div className="status-row"><span>SSH</span><strong>{lastResult?.verification.ssh ? 'Ready' : '—'}</strong></div>
-              <div className="status-row"><span>Kubeconfig</span><strong>{lastResult?.verification.kubeconfig ? 'Synced' : '—'}</strong></div>
-              <div className="status-row"><span>Context</span><strong className="mono">{selected?.kubeconfig?.context ?? '—'}</strong></div>
-              <div className="status-row"><span>API</span><strong>{lastResult?.verification.kubernetes ? 'Verified' : '—'}</strong></div>
-            </div>
-          </div>
-        </section>
-
-        <section className="panel-card flow-card">
-          <div className="panel-title">Connection flow</div>
-          <div className="flow">
-            {['IP discovery', 'SSH bootstrap', 'kubeconfig fetch', 'Cluster check'].map((step, index) => (
-              <div className="flow-step" key={step}>
-                <span className="flow-index mono">{index + 1}</span>
-                <span>{step}</span>
-                {index < 3 && <span className="flow-arrow">→</span>}
+                )}
+                <button className="primary-button" onClick={connect} disabled={connecting || !selected}>
+                  {connecting ? <RefreshCw size={16} className="spin" /> : <Terminal size={16} />}
+                  {connecting ? 'Connecting…' : 'Connect / Sync'}
+                </button>
               </div>
-            ))}
-          </div>
-        </section>
-      </main>
+            </section>
 
-      {editorState.open && (
-        <ProfileEditor
-          initial={editorState.profile}
-          onClose={() => setEditorState({ open: false, profile: null })}
-          onSaved={() => loadProfiles()}
-        />
-      )}
+            <section className="grid-two">
+              <div className="panel-card">
+                <div className="panel-title"><Server size={16} /> Hosts</div>
+                <div className="host-list">
+                  {selected?.hosts.map((host) => {
+                    const reachable = lastResult?.hosts.find((h) => h.host === host.name)?.reachable ?? false;
+                    return (
+                      <div className="host-row" key={host.name}>
+                        <div>
+                          <div className="host-name">{host.name}</div>
+                          <div className="host-address">{host.address}</div>
+                        </div>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                          <button
+                            type="button"
+                            className="icon-button"
+                            style={{ width: '26px', height: '26px', padding: 0 }}
+                            title="Open SSH session"
+                            onClick={() => openSshSession(host.name)}
+                          >
+                            <Terminal size={14} />
+                          </button>
+                          <span className={`pill ${reachable ? 'success' : 'warning'}`}>
+                            {reachable ? 'SSH reachable' : 'Needs retry'}
+                          </span>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+
+              <div className="panel-card">
+                <div className="panel-title"><Boxes size={16} /> Kubernetes</div>
+                <div className="status-stack">
+                  <div className="status-row"><span>SSH</span><strong>{lastResult?.verification.ssh ? 'Ready' : '—'}</strong></div>
+                  <div className="status-row"><span>Kubeconfig</span><strong>{lastResult?.verification.kubeconfig ? 'Synced' : '—'}</strong></div>
+                  <div className="status-row"><span>Context</span><strong className="mono">{selected?.kubeconfig?.context ?? '—'}</strong></div>
+                  <div className="status-row"><span>API</span><strong>{lastResult?.verification.kubernetes ? 'Verified' : '—'}</strong></div>
+                </div>
+              </div>
+            </section>
+
+            <section className="panel-card flow-card">
+              <div className="panel-title">Connection flow</div>
+              <div className="flow">
+                {['IP discovery', 'SSH bootstrap', 'kubeconfig fetch', 'Cluster check'].map((step, index) => (
+                  <div className="flow-step" key={step}>
+                    <span className="flow-index mono">{index + 1}</span>
+                    <span>{step}</span>
+                    {index < 3 && <span className="flow-arrow">→</span>}
+                  </div>
+                ))}
+              </div>
+            </section>
+          </>
+        )}
+      </main>
     </div>
   );
 }
