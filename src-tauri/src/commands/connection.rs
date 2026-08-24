@@ -223,6 +223,12 @@ pub async fn connect_profile(
         }
     }
 
+    if profile.manage_hosts_file {
+        if let Err(e) = crate::services::hosts_file::upsert_hosts_block(&runner, &profile).await {
+            errors.push(format!("hosts file update failed: {e}"));
+        }
+    }
+
     let any_host_reachable = host_stage_results.iter().any(|h| h.reachable);
     let mut kubeconfig_summary = None;
 

@@ -213,3 +213,78 @@ mod tests {
         assert!(result.contains("127.0.0.1 localhost"));
     }
 }
+
+pub async fn write_hosts_file(
+    runner: &dyn crate::services::process::CommandRunner,
+    new_content: &str,
+) -> Result<(), String> {
+    let tmp_path =
+        std::env::temp_dir().join(format!("clusterdeck-hosts-{}.tmp", std::process::id()));
+    if let Err(e) = std::fs::write(&tmp_path, new_content) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(format!("failed to write temporary hosts file: {e}"));
+    }
+
+    let tmp_path_str = tmp_path.to_string_lossy();
+    let script = format!(
+        "do shell script \"cp '{tmp_path_str}' {HOSTS_FILE_PATH}\" with administrator privileges"
+    );
+
+    let res = runner.run("osascript", &["-e".to_string(), script]).await;
+
+    let _ = std::fs::remove_file(&tmp_path);
+
+    let output = res?;
+    if output.success {
+        Ok(())
+    } else {
+        Err(output.stderr)
+    }
+}
+
+pub async fn upsert_hosts_block(
+    runner: &dyn crate::services::process::CommandRunner,
+    profile: &crate::services::config::Profile,
+) -> Result<(), String> {
+    let existing = std::fs::read_to_string(HOSTS_FILE_PATH).unwrap_or_default();
+    let block = render_hosts_block(profile)?;
+    let new_content = compute_updated_hosts_content(&existing, &profile.id, Some(&block));
+    write_hosts_file(runner, &new_content).await
+}
+
+pub async fn remove_hosts_block(
+    runner: &dyn crate::services::process::CommandRunner,
+    profile_id: &str,
+) -> Result<(), String> {
+    let existing = std::fs::read_to_string(HOSTS_FILE_PATH).unwrap_or_default();
+    let new_content = compute_updated_hosts_content(&existing, profile_id, None);
+    write_hosts_file(runner, &new_content).await
+}
+
+#[cfg(test)]
+mod write_tests {
+    use super::*;
+    use crate::services::process::CommandOutput;
+    use async_trait::async_trait;
+
+    struct DenyingRunner;
+
+    #[async_trait]
+    impl crate::services::process::CommandRunner for DenyingRunner {
+        async fn run(&self, _bin: &str, _args: &[String]) -> Result<CommandOutput, String> {
+            Ok(CommandOutput {
+                stdout: String::new(),
+                stderr: "User canceled.".into(),
+                success: false,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn write_hosts_file_reports_error_when_admin_prompt_is_cancelled() {
+        let runner = DenyingRunner;
+        let result = write_hosts_file(&runner, "127.0.0.1 localhost\n").await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("User canceled"));
+    }
+}

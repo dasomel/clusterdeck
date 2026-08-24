@@ -19,7 +19,9 @@ pub fn save_profile(profile: Profile) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn delete_profile_cmd(profile_id: String) -> Result<(), String> {
+pub async fn delete_profile_cmd(profile_id: String) -> Result<(), String> {
     let paths = ClusterDeckPaths::resolve()?;
+    let runner = crate::services::process::SystemRunner;
+    let _ = crate::services::hosts_file::remove_hosts_block(&runner, &profile_id).await;
     store::delete_profile(&paths, &profile_id)
 }

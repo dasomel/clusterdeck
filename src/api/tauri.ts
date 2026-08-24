@@ -36,6 +36,7 @@ export type Profile = {
   bastion: Bastion | null;
   bootstrap: BootstrapPolicy;
   kubeconfig: KubeconfigSource | null;
+  manage_hosts_file: boolean;
 };
 
 export type HostStageResult = { host: string; reachable: boolean; detail: string };
