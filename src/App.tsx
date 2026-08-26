@@ -2,9 +2,11 @@ import { useMemo, useState } from 'react';
 import {
   Check,
   CircleAlert,
+  Command,
   Plus,
   RefreshCw,
   RotateCcw,
+  Server,
   Terminal,
 } from 'lucide-react';
 
@@ -45,19 +47,19 @@ const initialProfiles: Profile[] = [
   },
 ];
 
-const flowSteps = ['IP discovery', 'SSH bootstrap', 'kubeconfig fetch', 'API verify'];
+const flowSteps = ['Discover hosts', 'Bootstrap SSH', 'Sync kubeconfig', 'Verify API'];
 
 function StatusBadge({ reachable }: { reachable: boolean }) {
   return (
     <span className={`status-badge ${reachable ? 'success' : 'warning'}`}>
       <span className="status-dot" />
-      {reachable ? 'SSH reachable' : 'Needs retry'}
+      {reachable ? 'Reachable' : 'Needs retry'}
     </span>
   );
 }
 
 function ConnectionStep({ label, state }: { label: string; state: StepState }) {
-  const stateLabel = {
+  const status = {
     waiting: 'Waiting',
     active: 'In progress',
     success: 'Completed',
@@ -66,13 +68,13 @@ function ConnectionStep({ label, state }: { label: string; state: StepState }) {
 
   return (
     <div className={`connection-step ${state}`}>
-      <span className="step-indicator">
-        {state === 'success' ? <Check size={14} /> : state === 'error' ? <CircleAlert size={14} /> : null}
+      <span className="step-marker">
+        {state === 'success' ? <Check size={13} /> : state === 'error' ? <CircleAlert size={13} /> : null}
       </span>
-      <span className="step-copy">
+      <div className="step-copy">
         <strong>{label}</strong>
-        <small>{stateLabel}</small>
-      </span>
+        <small>{status}</small>
+      </div>
     </div>
   );
 }
@@ -87,16 +89,19 @@ export default function App() {
     [profiles, selectedId],
   );
 
+  const healthyHosts = selected.hosts.filter((host) => host.reachable).length;
+  const hasFailures = healthyHosts !== selected.hosts.length;
+  const isConnecting = connectState === 'connecting';
+  const showFailure = connectState === 'partial-failure';
+
   const connect = async () => {
     setConnectState('connecting');
-    // TODO: replace simulation with invoke('connect_profile', { profileId: selected.id }).
     await new Promise((resolve) => setTimeout(resolve, 900));
     setConnectState(selected.hosts.every((host) => host.reachable) ? 'ready' : 'partial-failure');
   };
 
   const retryFailedHosts = async () => {
     setConnectState('connecting');
-    // TODO: replace with a targeted retry command from the Tauri backend.
     await new Promise((resolve) => setTimeout(resolve, 700));
     setProfiles((current) =>
       current.map((profile) =>
@@ -110,142 +115,177 @@ export default function App() {
 
   const refresh = () => setProfiles((current) => current.map((profile) => ({ ...profile })));
 
-  const healthyHosts = selected.hosts.filter((host) => host.reachable).length;
-  const hasFailures = healthyHosts !== selected.hosts.length;
-  const isConnecting = connectState === 'connecting';
-
-  const hero = {
-    ready: {
-      eyebrow: 'READY TO CONNECT',
-      title: 'Bring the cluster to your local workstation.',
-      description: 'Discover hosts, bootstrap SSH, sync kubeconfig, and verify API access from one profile.',
-    },
-    connecting: {
-      eyebrow: 'CONNECTING',
-      title: 'Preparing local cluster access.',
-      description: 'ClusterDeck is validating hosts and synchronizing the Kubernetes context.',
-    },
-    'partial-failure': {
-      eyebrow: 'ACTION REQUIRED',
-      title: 'One host needs attention.',
-      description: 'Healthy hosts remain available. Retry only the failed target without restarting the full flow.',
-    },
-  }[connectState];
-
   const stepStates: StepState[] = isConnecting
     ? ['success', 'active', 'waiting', 'waiting']
-    : connectState === 'partial-failure'
+    : showFailure
       ? ['success', 'error', 'waiting', 'waiting']
       : ['success', 'success', 'success', 'success'];
 
+  const environmentMessage = isConnecting
+    ? 'Discovering hosts and synchronizing local access…'
+    : showFailure
+      ? 'One host needs attention. Healthy targets remain available.'
+      : 'Local access is healthy and synchronized.';
+
+  const apiStatus = isConnecting ? 'Pending' : showFailure ? 'Blocked' : 'Verified';
+  const kubeStatus = isConnecting ? 'Syncing' : 'Synced';
+
   return (
-    <div className="app-shell">
-      <aside className="sidebar">
-        <div className="brand-block">
-          <div className="brand-name">ClusterDeck</div>
-          <div className="brand-subtitle">macOS cluster access</div>
+    <div className="desktop-window">
+      <header className="titlebar">
+        <div className="window-controls" aria-hidden="true">
+          <span className="traffic red" />
+          <span className="traffic amber" />
+          <span className="traffic green" />
         </div>
-
-        <div className="section-label">PROFILES</div>
-        <div className="profile-list">
-          {profiles.map((profile) => {
-            const profileHealthy = profile.hosts.filter((host) => host.reachable).length;
-            const selectedProfile = profile.id === selectedId;
-            return (
-              <button
-                key={profile.id}
-                className={`profile-item ${selectedProfile ? 'selected' : ''}`}
-                onClick={() => {
-                  setSelectedId(profile.id);
-                  setConnectState('ready');
-                }}
-              >
-                <span>
-                  <strong>{profile.name}</strong>
-                  <small>{profile.hosts.length} hosts · {profile.bastion ? 'Bastion' : 'Direct'}</small>
-                </span>
-                <span className={`profile-health ${profileHealthy === profile.hosts.length ? 'ok' : 'warn'}`} />
-              </button>
-            );
-          })}
-        </div>
-
-        <button className="sidebar-action">
-          <Plus size={15} /> Add profile
+        <div className="titlebar-name">ClusterDeck</div>
+        <button className="quick-action" type="button">
+          <Command size={12} />K <span>Quick actions</span>
         </button>
-      </aside>
+      </header>
 
-      <main className="main-panel">
-        <header className="page-header">
-          <div>
-            <div className="eyebrow muted">ENVIRONMENT</div>
-            <h1>{selected.name}</h1>
-          </div>
-          <button className="icon-button" title="Refresh" onClick={refresh} aria-label="Refresh profile status">
-            <RefreshCw size={16} />
-          </button>
-        </header>
-
-        <section className={`hero-card ${connectState}`}>
-          <div className="hero-copy">
-            <div className={`eyebrow ${connectState === 'partial-failure' ? 'warning' : ''}`}>{hero.eyebrow}</div>
-            <h2>{hero.title}</h2>
-            <p>{hero.description}</p>
-          </div>
-
-          {connectState === 'partial-failure' ? (
-            <button className="primary-button retry" onClick={retryFailedHosts}>
-              <RotateCcw size={15} /> Retry failed host
+      <div className="workspace-shell">
+        <aside className="sidebar">
+          <div className="sidebar-top">
+            <div className="product-kicker">CLUSTERDECK</div>
+            <div className="sidebar-heading">Profiles</div>
+            <div className="profile-list">
+              {profiles.map((profile) => {
+                const healthy = profile.hosts.filter((host) => host.reachable).length;
+                const selectedProfile = profile.id === selectedId;
+                return (
+                  <button
+                    key={profile.id}
+                    className={`profile-item ${selectedProfile ? 'selected' : ''}`}
+                    onClick={() => {
+                      setSelectedId(profile.id);
+                      setConnectState('ready');
+                    }}
+                  >
+                    <span className={`profile-health ${healthy === profile.hosts.length ? 'ok' : 'warn'}`} />
+                    <span className="profile-copy">
+                      <strong>{profile.name}</strong>
+                      <small>{profile.hosts.length} hosts · {profile.bastion ? 'Bastion' : 'Direct'}</small>
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+            <button className="add-profile" type="button">
+              <Plus size={13} /> Add profile
             </button>
-          ) : (
-            <button className="primary-button" onClick={connect} disabled={isConnecting}>
-              {isConnecting ? <RefreshCw size={15} className="spin" /> : <Terminal size={15} />}
-              {isConnecting ? 'Connecting…' : 'Connect / Sync'}
-            </button>
-          )}
-        </section>
+          </div>
 
-        <section className="content-grid">
-          <div className="panel-card hosts-panel">
-            <div className="panel-title">Hosts</div>
-            <div className="host-list">
-              {selected.hosts.map((host) => (
-                <div className={`host-row ${host.reachable ? '' : 'unhealthy'}`} key={host.name}>
-                  <div>
-                    <div className="host-name">{host.name}</div>
-                    <div className="host-address">{host.address}</div>
-                  </div>
-                  <StatusBadge reachable={host.reachable} />
+          <div className="local-status">
+            <div className="product-kicker">LOCAL WORKSTATION</div>
+            <div className="local-platform">macOS · arm64</div>
+            <div className="local-ready"><span /> Ready</div>
+          </div>
+        </aside>
+
+        <main className="main-panel">
+          <section className="environment-header">
+            <div>
+              <div className="eyebrow">ENVIRONMENT</div>
+              <h1>{selected.name}</h1>
+              <p className={showFailure ? 'warning-copy' : ''}>{environmentMessage}</p>
+            </div>
+            <div className="header-actions">
+              <button className="secondary-button" onClick={refresh} type="button">
+                <RefreshCw size={14} /> Refresh
+              </button>
+              {showFailure ? (
+                <button className="primary-button" onClick={retryFailedHosts} type="button">
+                  <RotateCcw size={14} /> Retry failed host
+                </button>
+              ) : (
+                <button className="primary-button" onClick={connect} disabled={isConnecting} type="button">
+                  {isConnecting ? <RefreshCw size={14} className="spin" /> : <Terminal size={14} />}
+                  {isConnecting ? 'Connecting…' : 'Connect / Sync'}
+                </button>
+              )}
+            </div>
+          </section>
+
+          <section className="metric-grid">
+            <article className="metric-card">
+              <span>Hosts</span>
+              <strong>{healthyHosts} / {selected.hosts.length}</strong>
+              <small className={hasFailures ? 'warning-text' : 'success-text'}>
+                <i /> {hasFailures ? `${selected.hosts.length - healthyHosts} needs retry` : 'All reachable'}
+              </small>
+            </article>
+            <article className="metric-card">
+              <span>SSH</span>
+              <strong>{hasFailures ? `${healthyHosts} ready` : 'Ready'}</strong>
+              <small className="success-text"><i /> {selected.bastion ? 'Via bastion' : 'Direct access'}</small>
+            </article>
+            <article className="metric-card">
+              <span>Kubeconfig</span>
+              <strong>{kubeStatus}</strong>
+              <small className="accent-text"><i /> {selected.kubeContext}</small>
+            </article>
+            <article className="metric-card">
+              <span>Kubernetes API</span>
+              <strong className={showFailure ? 'warning-text' : ''}>{apiStatus}</strong>
+              <small className={showFailure ? 'warning-text' : 'success-text'}>
+                <i /> {showFailure ? 'Awaiting SSH' : isConnecting ? 'Checking…' : '12 ms'}
+              </small>
+            </article>
+          </section>
+
+          <section className="content-grid">
+            <article className="panel hosts-panel">
+              <div className="panel-heading">
+                <div>
+                  <h2>Hosts</h2>
+                  <p>{selected.hosts.length} targets</p>
                 </div>
-              ))}
-            </div>
-            {hasFailures && connectState === 'partial-failure' && (
-              <div className="failure-note">
-                <CircleAlert size={14} /> {selected.hosts.length - healthyHosts} host requires SSH retry.
               </div>
-            )}
-          </div>
+              <div className="host-table-head">
+                <span>HOST</span><span>ADDRESS</span><span>STATUS</span>
+              </div>
+              <div className="host-table">
+                {selected.hosts.map((host) => (
+                  <div className="host-row" key={host.name}>
+                    <div className="host-identity">
+                      <span className="host-icon"><Server size={14} /></span>
+                      <span><strong>{host.name}</strong><small>Linux node</small></span>
+                    </div>
+                    <code>{host.address}</code>
+                    <StatusBadge reachable={host.reachable} />
+                  </div>
+                ))}
+              </div>
+            </article>
 
-          <div className="panel-card kube-panel">
-            <div className="panel-title">Kubernetes</div>
-            <div className="status-stack">
-              <div className="status-row"><span>SSH</span><strong>{hasFailures ? `${healthyHosts}/${selected.hosts.length} ready` : 'Ready'}</strong></div>
-              <div className="status-row"><span>Kubeconfig</span><strong>{isConnecting ? 'Pending' : 'Synced'}</strong></div>
-              <div className="status-row"><span>Context</span><strong>{selected.kubeContext}</strong></div>
-              <div className="status-row"><span>API</span><strong>{isConnecting ? 'Pending' : hasFailures && connectState === 'partial-failure' ? 'Blocked' : 'Verified'}</strong></div>
+            <article className="panel activity-panel">
+              <div className="panel-heading">
+                <div><h2>Connection activity</h2><p>Latest session</p></div>
+              </div>
+              <div className="activity-list">
+                {flowSteps.map((step, index) => (
+                  <ConnectionStep key={step} label={step} state={stepStates[index]} />
+                ))}
+              </div>
+            </article>
+          </section>
+
+          <section className="workspace-strip">
+            <div>
+              <strong>{showFailure ? 'Partial workspace' : isConnecting ? 'Preparing workspace' : 'Connected workspace'}</strong>
+              <div className="workspace-meta">
+                <span>Context&nbsp; <b>{selected.kubeContext}</b></span>
+                <span>Kubeconfig&nbsp; <b>~/.kube/config</b></span>
+                <span>API&nbsp; <b>https://192.0.2.10:6443</b></span>
+              </div>
             </div>
-          </div>
-        </section>
-
-        <section className="panel-card flow-panel">
-          <div className="panel-title">Connection flow</div>
-          <div className="flow-grid">
-            {flowSteps.map((step, index) => (
-              <ConnectionStep key={step} label={step} state={stepStates[index]} />
-            ))}
-          </div>
-        </section>
-      </main>
+            <button className="secondary-button terminal-button" type="button">
+              <Terminal size={14} /> Open Terminal ↗
+            </button>
+          </section>
+        </main>
+      </div>
     </div>
   );
 }
