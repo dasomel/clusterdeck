@@ -1,3 +1,6 @@
+// These helpers are intentionally staged ahead of the Tauri commands that consume them.
+#![allow(dead_code)]
+
 use std::path::PathBuf;
 use tokio::process::Command;
 
