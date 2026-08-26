@@ -1,12 +1,7 @@
 use std::path::PathBuf;
 use tokio::process::Command;
 
-const SEARCH_PATHS: [&str; 4] = [
-    "/opt/homebrew/bin",
-    "/usr/local/bin",
-    "/usr/bin",
-    "/bin",
-];
+const SEARCH_PATHS: [&str; 4] = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"];
 
 pub fn resolve_cli_path(bin: &str) -> Result<PathBuf, String> {
     for dir in SEARCH_PATHS {
