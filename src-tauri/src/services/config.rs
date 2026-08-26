@@ -1,3 +1,7 @@
+// These models are the planned boundary between the desktop UI and the Tauri backend.
+// Keep them in the bootstrap skeleton before the profile commands are wired up.
+#![allow(dead_code)]
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
