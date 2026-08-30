@@ -7,6 +7,7 @@ export default function App() {
   const [profiles, setProfiles] = useState<Profile[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [connecting, setConnecting] = useState(false);
+  const [testing, setTesting] = useState(false);
   const [lastResult, setLastResult] = useState<ConnectionResult | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
 
@@ -81,6 +82,33 @@ export default function App() {
     } finally {
       setConnecting(false);
       setBootstrapPassword('');
+    }
+  };
+
+  const testConnection = async () => {
+    if (!selected) return;
+    setTesting(true);
+    try {
+      const hosts = await api.probeProfileHosts(selected.id);
+      setLastResult({
+        aliases_written: lastResult?.aliases_written ?? false,
+        kubeconfig: lastResult?.kubeconfig ?? null,
+        verification: lastResult?.verification ?? {
+          ssh: false,
+          kubeconfig: false,
+          kubernetes: false,
+          node_count: null,
+          kubernetes_version: null,
+          api_endpoint: null,
+          last_verified: null,
+        },
+        errors: lastResult?.errors ?? [],
+        hosts,
+      });
+    } catch (err) {
+      setLoadError(String(err));
+    } finally {
+      setTesting(false);
     }
   };
 
@@ -226,10 +254,21 @@ export default function App() {
                     />
                   </div>
                 )}
-                <button className="primary-button" onClick={connect} disabled={connecting || !selected}>
-                  {connecting ? <RefreshCw size={16} className="spin" /> : <Terminal size={16} />}
-                  {connecting ? 'Connecting…' : 'Connect / Sync'}
-                </button>
+                <div style={{ display: 'flex', gap: '8px' }}>
+                  <button
+                    className="secondary-button"
+                    style={{ width: 'auto', marginTop: 0 }}
+                    onClick={testConnection}
+                    disabled={testing || connecting || !selected}
+                  >
+                    {testing ? <RefreshCw size={16} className="spin" /> : <Terminal size={16} />}
+                    {testing ? 'Testing…' : 'Test Connection'}
+                  </button>
+                  <button className="primary-button" onClick={connect} disabled={connecting || !selected}>
+                    {connecting ? <RefreshCw size={16} className="spin" /> : <Terminal size={16} />}
+                    {connecting ? 'Connecting…' : 'Connect / Sync'}
+                  </button>
+                </div>
               </div>
             </section>
 
@@ -272,6 +311,8 @@ export default function App() {
                   <div className="status-row"><span>Kubeconfig</span><strong>{lastResult?.verification.kubeconfig ? 'Synced' : '—'}</strong></div>
                   <div className="status-row"><span>Context</span><strong className="mono">{selected?.kubeconfig?.context ?? '—'}</strong></div>
                   <div className="status-row"><span>API</span><strong>{lastResult?.verification.kubernetes ? 'Verified' : '—'}</strong></div>
+                  <div className="status-row"><span>Version</span><strong>{lastResult?.verification.kubernetes_version ?? '—'}</strong></div>
+                  <div className="status-row"><span>Endpoint</span><strong className="mono">{lastResult?.verification.api_endpoint ?? '—'}</strong></div>
                 </div>
               </div>
             </section>

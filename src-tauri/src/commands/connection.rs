@@ -115,6 +115,7 @@ pub async fn verify_profile(profile_id: String) -> Result<VerificationResult, St
             kubeconfig: false,
             kubernetes: false,
             node_count: None,
+            kubernetes_version: None,
             api_endpoint: None,
             last_verified: None,
         }
@@ -254,6 +255,7 @@ pub async fn connect_profile(
             kubeconfig: false,
             kubernetes: false,
             node_count: None,
+            kubernetes_version: None,
             api_endpoint: None,
             last_verified: None,
         }

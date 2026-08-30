@@ -68,6 +68,7 @@ mod tests {
             kubeconfig: true,
             kubernetes: true,
             node_count: Some(3),
+            kubernetes_version: Some("v1.35.2".into()),
             api_endpoint: None,
             last_verified: Some("2026-08-24T00:00:00Z".into()),
         };

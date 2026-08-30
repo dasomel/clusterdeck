@@ -50,6 +50,7 @@ export type VerificationResult = {
   kubeconfig: boolean;
   kubernetes: boolean;
   node_count: number | null;
+  kubernetes_version: string | null;
   api_endpoint: string | null;
   last_verified: string | null;
 };
