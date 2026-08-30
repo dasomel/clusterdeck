@@ -1,2 +1,13 @@
 pub mod config;
+pub mod discovery;
+pub mod hosts_file;
+pub mod kube_import;
+pub mod kubeconfig;
+pub mod paths;
 pub mod process;
+pub mod ssh;
+pub mod ssh_config;
+pub mod state;
+pub mod store;
+pub mod validate;
+pub mod verify;
