@@ -1,3 +1,4 @@
 fn main() {
-    tauri_build::build();
+    // Generate the build-time context consumed by tauri::generate_context!().
+    tauri_build::build()
 }
