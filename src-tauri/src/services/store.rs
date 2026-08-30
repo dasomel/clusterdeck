@@ -37,14 +37,27 @@ pub fn load_profiles(paths: &ClusterDeckPaths) -> Result<Vec<Profile>, String> {
     let profiles = parsed
         .profiles
         .into_iter()
-        .map(|(id, body)| Profile {
-            id,
-            name: body.name,
-            hosts: body.hosts,
-            bastion: body.bastion,
-            bootstrap: body.bootstrap,
-            kubeconfig: body.kubeconfig,
-            manage_hosts_file: body.manage_hosts_file,
+        .filter_map(|(id, body)| {
+            let profile = Profile {
+                id,
+                name: body.name,
+                hosts: body.hosts,
+                bastion: body.bastion,
+                bootstrap: body.bootstrap,
+                kubeconfig: body.kubeconfig,
+                manage_hosts_file: body.manage_hosts_file,
+            };
+            match crate::services::validate::validate_profile(&profile) {
+                Ok(()) => Some(profile),
+                Err(e) => {
+                    eprintln!(
+                        "skipping invalid profile '{}' loaded from {}: {e}",
+                        profile.id,
+                        file_path.display()
+                    );
+                    None
+                }
+            }
         })
         .collect();
     Ok(profiles)
@@ -160,6 +173,34 @@ mod tests {
         upsert_profile(&paths, profile).unwrap();
         delete_profile(&paths, "x").unwrap();
         assert!(get_profile(&paths, "x").is_err());
+    }
+
+    #[test]
+    fn load_profiles_skips_invalid_profiles_and_returns_valid_ones() {
+        let paths = temp_paths("skip-invalid");
+        if let Some(parent) = paths.profiles_file().parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        let yaml = r#"
+profiles:
+  cka:
+    name: "CKA Lab"
+    hosts:
+      - name: m1
+        address: 192.0.2.10
+        port: 22
+        user: root
+    manage_hosts_file: false
+  "../../evil":
+    name: "Evil"
+    hosts: []
+    manage_hosts_file: false
+"#;
+        std::fs::write(paths.profiles_file(), yaml).unwrap();
+
+        let loaded = load_profiles(&paths).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, "cka");
     }
 
     #[test]

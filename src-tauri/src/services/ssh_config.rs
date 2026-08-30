@@ -71,8 +71,10 @@ pub fn ensure_ssh_include(
         String::new()
     };
 
-    if !content.contains("Include") {
-        let include_line = format!("Include {}/*.conf", paths.ssh_dir().display());
+    let include_line = format!("Include {}/*.conf", paths.ssh_dir().display());
+    let already_present = content.lines().any(|line| line.trim() == include_line);
+
+    if !already_present {
         let new_content = if content.is_empty() {
             format!("{include_line}\n")
         } else {
@@ -138,6 +140,24 @@ mod tests {
         let content = std::fs::read_to_string(&ssh_config).unwrap();
         assert!(content.contains("Include"));
         assert!(content.contains("ssh/*.conf"));
+    }
+
+    #[test]
+    fn ensure_ssh_include_adds_line_when_unrelated_include_exists() {
+        let dir =
+            std::env::temp_dir().join(format!("clusterdeck-sshcfg-test-d-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ssh_config = dir.join("config");
+        std::fs::write(
+            &ssh_config,
+            "Include other.conf\nHost existing\n  HostName example.invalid\n",
+        )
+        .unwrap();
+        let paths = crate::services::paths::ClusterDeckPaths::at(dir.join("cdhome"));
+        ensure_ssh_include(&ssh_config, &paths).unwrap();
+        let content = std::fs::read_to_string(&ssh_config).unwrap();
+        assert!(content.contains("Include other.conf"));
+        assert!(content.contains(&format!("Include {}/*.conf", paths.ssh_dir().display())));
     }
 
     #[test]

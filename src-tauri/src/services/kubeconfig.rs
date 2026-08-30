@@ -5,7 +5,7 @@ use crate::services::paths::ClusterDeckPaths;
 use crate::services::process::CommandRunner;
 use serde::Serialize;
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::OpenOptionsExt;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct KubeconfigSummary {
@@ -130,6 +130,18 @@ pub async fn fetch_and_store(
         tmp_path.to_string_lossy().to_string(),
     ];
 
+    #[cfg(unix)]
+    {
+        use std::fs::OpenOptions;
+        OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp_path)
+            .map_err(|e| format!("failed to create temp kubeconfig file: {e}"))?;
+    }
+
     let output = runner.run("scp", &scp_args).await?;
     if !output.success {
         let err_msg = if !output.stderr.is_empty() {
@@ -149,13 +161,25 @@ pub async fn fetch_and_store(
         .ensure_dirs()
         .map_err(|e| format!("failed to create kubeconfigs directory: {e}"))?;
     let dest_path = paths.kubeconfig_file(&profile.id);
-    std::fs::write(&dest_path, normalized_yaml)
-        .map_err(|e| format!("failed to write kubeconfig file: {e}"))?;
 
     #[cfg(unix)]
     {
-        std::fs::set_permissions(&dest_path, std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| format!("failed to set permissions on kubeconfig file: {e}"))?;
+        use std::fs::OpenOptions;
+        use std::io::Write;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&dest_path)
+            .map_err(|e| format!("failed to create kubeconfig file: {e}"))?;
+        file.write_all(normalized_yaml.as_bytes())
+            .map_err(|e| format!("failed to write kubeconfig file: {e}"))?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(&dest_path, normalized_yaml)
+            .map_err(|e| format!("failed to write kubeconfig file: {e}"))?;
     }
 
     Ok(KubeconfigSummary {
@@ -299,6 +323,49 @@ users:
         let stored_yaml = std::fs::read_to_string(paths.kubeconfig_file("cka")).unwrap();
         let value: serde_yaml::Value = serde_yaml::from_str(&stored_yaml).unwrap();
         assert_eq!(value["current-context"].as_str().unwrap(), "cka");
+
+        std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fetch_and_store_creates_destination_with_0600_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp_dir =
+            std::env::temp_dir().join(format!("clusterdeck-kc-test-perms-{}", std::process::id()));
+        let paths = ClusterDeckPaths::at(temp_dir.clone());
+        let profile = Profile {
+            id: "cka-perms".to_string(),
+            name: "CKA Lab".to_string(),
+            hosts: vec![Host {
+                name: "m1".to_string(),
+                address: "192.0.2.10".to_string(),
+                port: 22,
+                user: "root".to_string(),
+                identity_file: None,
+            }],
+            bastion: None,
+            bootstrap: BootstrapPolicy::default(),
+            kubeconfig: Some(KubeconfigSource {
+                remote_path: "/etc/kubernetes/admin.conf".to_string(),
+                control_plane: "m1".to_string(),
+                local_path: "".to_string(),
+                context: "cka-perms".to_string(),
+            }),
+            manage_hosts_file: false,
+        };
+
+        let runner = FakeScpRunner {
+            should_succeed: true,
+            sample_yaml: SAMPLE.to_string(),
+            scp_called: AtomicBool::new(false),
+        };
+
+        fetch_and_store(&runner, &paths, &profile).await.unwrap();
+
+        let dest_path = paths.kubeconfig_file("cka-perms");
+        let mode = std::fs::metadata(&dest_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
 
         std::fs::remove_dir_all(&temp_dir).ok();
     }

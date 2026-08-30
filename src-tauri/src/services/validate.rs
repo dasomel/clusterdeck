@@ -16,6 +16,9 @@ pub fn validate_profile(profile: &crate::services::config::Profile) -> Result<()
         return Err(format!("invalid profile id: {}", profile.id));
     }
     for host in &profile.hosts {
+        if !is_safe_ssh_identifier(&host.name) {
+            return Err(format!("invalid host name: {}", host.name));
+        }
         if !is_safe_ssh_identifier(&host.user) || !is_safe_ssh_identifier(&host.address) {
             return Err(format!("invalid host user/address for host {}", host.name));
         }
@@ -26,6 +29,9 @@ pub fn validate_profile(profile: &crate::services::config::Profile) -> Result<()
         }
     }
     if let Some(bastion) = &profile.bastion {
+        if !is_safe_ssh_identifier(&bastion.name) {
+            return Err(format!("invalid bastion name: {}", bastion.name));
+        }
         if !is_safe_ssh_identifier(&bastion.user) || !is_safe_ssh_identifier(&bastion.address) {
             return Err("invalid bastion user/address".to_string());
         }
@@ -59,6 +65,36 @@ mod tests {
         assert!(!is_safe_profile_id(""));
         assert!(is_safe_profile_id("cka-lab"));
         assert!(is_safe_profile_id("cka_lab_1"));
+    }
+
+    #[test]
+    fn validate_profile_rejects_newline_in_host_name() {
+        let mut profile = Profile {
+            id: "cka-lab".into(),
+            name: "CKA Lab".into(),
+            hosts: vec![Host {
+                name: "m1\nHost evil".into(),
+                address: "192.168.1.10".into(),
+                port: 22,
+                user: "root".into(),
+                identity_file: None,
+            }],
+            bastion: None,
+            bootstrap: BootstrapPolicy::default(),
+            kubeconfig: None,
+            manage_hosts_file: false,
+        };
+        assert!(validate_profile(&profile).is_err());
+
+        profile.hosts[0].name = "m1".into();
+        profile.bastion = Some(crate::services::config::Bastion {
+            name: "bastion\nHost evil".into(),
+            address: "10.0.0.1".into(),
+            port: 22,
+            user: "root".into(),
+            identity_file: None,
+        });
+        assert!(validate_profile(&profile).is_err());
     }
 
     #[test]

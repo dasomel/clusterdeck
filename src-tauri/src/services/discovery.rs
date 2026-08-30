@@ -56,6 +56,9 @@ pub fn expand_targets(input: &str) -> Result<Vec<String>, String> {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect();
+        if targets.len() > 1024 {
+            return Err("Too many targets (max 1024 hosts)".to_string());
+        }
         Ok(targets)
     }
 }
@@ -115,6 +118,15 @@ mod tests {
     #[test]
     fn expand_targets_rejects_oversized_cidr() {
         assert!(expand_targets("10.0.0.0/8").is_err());
+    }
+
+    #[test]
+    fn expand_targets_rejects_oversized_comma_list() {
+        let list = (0..1025)
+            .map(|i| format!("10.0.{}.{}", i / 256, i % 256))
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(expand_targets(&list).is_err());
     }
 
     #[tokio::test]
