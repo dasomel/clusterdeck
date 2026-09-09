@@ -6,7 +6,7 @@ compatibility: Requires the ClusterDeck checkout and project Rust/Tauri/pnpm too
 metadata:
   openforge-scope: project
   openforge-owner: dasomel/clusterdeck
-  openforge-maturity: verified
+  openforge-maturity: draft
   openforge-version: "1"
 ---
 
