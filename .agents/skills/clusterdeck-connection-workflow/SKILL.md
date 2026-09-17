@@ -6,7 +6,7 @@ compatibility: Requires the ClusterDeck checkout and project Rust/Tauri/pnpm too
 metadata:
   openforge-scope: project
   openforge-owner: dasomel/clusterdeck
-  openforge-maturity: verified
+  openforge-maturity: draft
   openforge-version: "1"
 ---
 
@@ -56,6 +56,6 @@ Report static/build/unit evidence separately from real SSH/Tauri/Kubernetes evid
 - `AGENTS.md`
 - `docs/ARCHITECTURE.md`
 - `docs/03-mvp-design.md`
-- `services/process.rs`
-- `services/validate.rs`
+- `src-tauri/src/services/process.rs`
+- `src-tauri/src/services/validate.rs`
 - `Makefile`
