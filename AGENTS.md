@@ -68,6 +68,8 @@ If an automated regression test is impractical, record executable reproduction e
 
 Use `cargo clippy --all-targets --all-features -- -D warnings`, not a bare `cargo clippy -- -D warnings` — the narrower invocation skips test-target code and has missed real warnings there more than once. `--all-targets` is what `make lint` actually runs.
 
+`make evidence` runs the verify stages individually and appends sanitized pass/fail/duration records to `research/evidence/YYYY-MM.jsonl`, per the OpenForge Research Evidence Collection Standard (`docs/research-evidence.md`). It never captures raw command output, credentials, or infrastructure identifiers — only exit codes and timings.
+
 When code changes affect a critical path (SSH argv construction, `/etc/hosts` or `~/.ssh/config` writes, kubeconfig normalization), a unit test with a `FakeRunner` proves the code path executes but not that the real external command behaves as intended — prefer also exercising the real binary once (a temporary `#[ignore]`d test against a real local target, e.g. `colima`'s SSH-exposed VM, removed before committing) when the change touches how an argv list or file is actually built. More generally, distinguish frontend/unit evidence from real Tauri/native/SSH/Kubernetes runtime evidence, and do not claim completion without stating which checks actually ran.
 
 ## Coding Guidance
@@ -92,7 +94,6 @@ Activity is not progress. Do not keep patching when the work is no longer conver
 - Use Issues for requirements, bugs, architecture, security, and implementation scope.
 - Use short-lived branches.
 - Use focused PRs linked to Issues.
-- Prefer Conventional Commits.
 - Do not merge a change that bypasses known security or test failures without a documented decision.
 
 ## Documentation

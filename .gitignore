@@ -7,3 +7,5 @@ src-tauri/gen/
 
 .DS_Store
 .idea/
+
+research/evidence/

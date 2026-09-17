@@ -1,7 +1,8 @@
-.PHONY: help verify format fmt lint test build install dev release clean
+.PHONY: help verify format fmt lint test build install dev release clean evidence
 
 help:
 	@echo "verify   - run the full CI-equivalent gate (format+lint+test+build)"
+	@echo "evidence - run verify stages and append sanitized JSONL timing/result records (docs/research-evidence.md)"
 	@echo "format   - check Rust formatting (no changes written)"
 	@echo "fmt      - apply Rust formatting"
 	@echo "lint     - cargo clippy -D warnings"
@@ -41,3 +42,6 @@ release:
 clean:
 	cd src-tauri && cargo clean
 	rm -rf dist
+
+evidence:
+	./scripts/collect-evidence.sh
