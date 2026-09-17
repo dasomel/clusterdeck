@@ -487,4 +487,79 @@ mod tests {
             assert!(env.contains(&("SSHPASS".to_string(), secret.to_string())));
         }
     }
+
+    /// Real-process regression: FakeRunner tests above only prove build_ssh_target_args
+    /// returns the right Vec<String>, not that a real spawned process actually receives
+    /// those exact argv strings intact (shell/exec quoting, arg splitting, etc. can differ
+    /// from a mocked call). Spawns a real OS process (a stub `ssh` script, since
+    /// CommandRunner::run's resolve_cli_path only searches fixed system dirs and we must
+    /// not shadow the real /usr/bin/ssh) via the same tokio::process::Command mechanism
+    /// SystemRunner uses, and reads back the argv the OS actually delivered.
+    /// AGENTS.md: this class of bug (missing StrictHostKeyChecking on probe_key_auth) was
+    /// only caught by a real end-to-end SSH test, not FakeRunner unit tests.
+    #[tokio::test]
+    #[ignore = "spawns a real OS process; run manually with `cargo test -- --ignored`"]
+    async fn real_process_receives_batchmode_stricthostkeychecking_and_proxyjump_argv() {
+        use crate::services::config::Bastion;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "clusterdeck-real-ssh-argv-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let capture_path = dir.join("captured_argv.txt");
+        let stub_path = dir.join("ssh");
+        std::fs::write(
+            &stub_path,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\n",
+                capture_path.display()
+            ),
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&stub_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&stub_path, perms).unwrap();
+
+        let bastion = Bastion {
+            name: "bastion01".into(),
+            address: "10.0.0.10".into(),
+            port: 22,
+            user: "ubuntu".into(),
+            identity_file: None,
+        };
+        let args = build_ssh_target_args(&host(), Some(&bastion), &["true"]);
+
+        let output = tokio::process::Command::new(&stub_path)
+            .args(&args)
+            .output()
+            .await
+            .expect("failed to spawn stub ssh");
+        assert!(output.status.success());
+
+        let captured = std::fs::read_to_string(&capture_path).unwrap();
+        assert!(
+            captured.contains("BatchMode=yes"),
+            "missing BatchMode=yes in real argv: {captured}"
+        );
+        assert!(
+            captured.contains("StrictHostKeyChecking=accept-new"),
+            "missing StrictHostKeyChecking=accept-new in real argv: {captured}"
+        );
+        assert!(
+            captured.contains("-J"),
+            "missing -J (ProxyJump) in real argv: {captured}"
+        );
+        assert!(
+            captured.contains("ubuntu@10.0.0.10"),
+            "missing bastion target in real argv: {captured}"
+        );
+        assert!(
+            captured.contains(&format!("{}@{}", host().user, host().address)),
+            "missing target host in real argv: {captured}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
