@@ -50,7 +50,7 @@ kubeconfigs via SSH exec + local write instead of shelling out to `scp`, so Clus
 controls the destination file's permissions directly instead of relying on `scp`'s
 behavior. That is a materially larger change than this issue's scope (it touches the
 kubeconfig fetch transport, not just a permissions call), so it is being split into its own
-follow-up issue rather than bundled here.
+follow-up issue rather than bundled here: #23.
 
 ## Consequences
 
