@@ -1,8 +1,10 @@
 pub mod config;
 pub mod discovery;
 pub mod hosts_file;
+pub mod k8s_endpoints;
 pub mod kube_import;
 pub mod kubeconfig;
+pub mod local_runtime;
 pub mod paths;
 pub mod process;
 pub mod ssh;

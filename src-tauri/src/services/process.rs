@@ -79,6 +79,23 @@ impl CommandRunner for SystemRunner {
     }
 }
 
+/// Runs macOS `open` with `args`: Ok on success, else Err(stderr) if non-empty, otherwise
+/// Err(fallback_err). Shared by the Finder/browser/SSH-session "reveal externally" call sites.
+pub async fn open_with_system(
+    runner: &dyn CommandRunner,
+    args: &[String],
+    fallback_err: &str,
+) -> Result<(), String> {
+    let out = runner.run("open", args).await?;
+    if out.success {
+        Ok(())
+    } else if out.stderr.is_empty() {
+        Err(fallback_err.to_string())
+    } else {
+        Err(out.stderr)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

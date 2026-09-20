@@ -39,6 +39,15 @@ pub fn get_status(
     Ok(state.profiles.get(profile_id).cloned())
 }
 
+pub fn delete_status(paths: &ClusterDeckPaths, profile_id: &str) -> Result<(), String> {
+    let mut state = load_state(paths)?;
+    if state.profiles.remove(profile_id).is_some() {
+        let json = serde_json::to_string_pretty(&state).map_err(|e| e.to_string())?;
+        std::fs::write(paths.state_file(), json).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

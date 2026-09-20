@@ -46,6 +46,7 @@ pub fn render_profile_config(profile: &Profile) -> String {
         if let Some(identity) = &bastion.identity_file {
             lines.push(format!("  IdentityFile {identity}"));
         }
+        lines.push("  StrictHostKeyChecking accept-new".to_string());
         blocks.push(lines.join("\n"));
     }
 
@@ -61,6 +62,7 @@ pub fn render_profile_config(profile: &Profile) -> String {
         if profile.bastion.is_some() {
             lines.push(format!("  ProxyJump {}-bastion", profile.id));
         }
+        lines.push("  StrictHostKeyChecking accept-new".to_string());
         blocks.push(lines.join("\n"));
     }
 

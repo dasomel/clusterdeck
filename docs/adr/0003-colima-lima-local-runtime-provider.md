@@ -3,6 +3,7 @@
 - Status: Accepted
 - Date: 2026-09-17
 - Issue: #14
+- Note: the as-built implementation diverges from this decision; see [ADR-0005](0005-local-host-detection-prefills-profiles.md) (Proposed).
 
 ## Context
 

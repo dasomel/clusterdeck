@@ -21,3 +21,4 @@ async-trait = "0.1"
 serde_yaml = "0.9"
 chrono = { version = "0.4", features = ["serde"] }
 futures = "0.3"
+base64 = "0.22"

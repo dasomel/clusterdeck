@@ -55,12 +55,28 @@ export type VerificationResult = {
   last_verified: string | null;
 };
 
+export type DiscoveredEndpoint = {
+  host: string;
+  ip: string;
+  source: string;
+  resource_name: string;
+};
+
 export type ConnectionResult = {
   hosts: HostStageResult[];
   aliases_written: boolean;
   kubeconfig: KubeconfigSummary | null;
   verification: VerificationResult;
+  endpoints: DiscoveredEndpoint[];
   errors: string[];
+};
+
+export type SyncHostsResult = {
+  success: boolean;
+  endpoints_count: number;
+  hosts_count: number;
+  endpoints: DiscoveredEndpoint[];
+  message: string;
 };
 
 export type DiscoveredHost = { address: string; ssh_open: boolean };
@@ -70,6 +86,77 @@ export type LocalKubeContext = {
   cluster_name: string;
   user_name: string;
   server: string;
+};
+
+export type DiscoveredLocalHost = {
+  provider: string;
+  instance_name: string;
+  status: string;
+  host_name: string;
+  address: string;
+  port: number;
+  user: string;
+  identity_file: string | null;
+  runtime: string | null;
+  kube_context: string | null;
+  kube_remote_path: string | null;
+};
+
+export type BackupKubeconfigResult = {
+  backed_up: boolean;
+  backup_path: string | null;
+  message: string;
+};
+
+export type MergeKubeconfigResult = {
+  success: boolean;
+  target_path: string;
+  context_name: string;
+  clusters_count: number;
+  contexts_count: number;
+  backup: BackupKubeconfigResult | null;
+  message: string;
+};
+
+export type KubeconfigBackupInfo = {
+  filename: string;
+  path: string;
+  size_bytes: number;
+  modified_at: string;
+};
+
+export type KubeContextInfo = {
+  name: string;
+  cluster: string;
+  user: string;
+  server: string;
+  is_current: boolean;
+};
+
+export type UserKubeconfigDetails = {
+  path: string;
+  exists: boolean;
+  size_bytes: number;
+  current_context: string | null;
+  contexts: KubeContextInfo[];
+  raw_yaml: string | null;
+};
+
+export type ManagedProfileKubeconfig = {
+  profile_id: string;
+  profile_name: string;
+  path: string;
+  exists: boolean;
+  size_bytes: number;
+  current_context: string | null;
+  server: string | null;
+};
+
+export type HostsFileStatus = {
+  managed_by_profile: boolean;
+  is_synced: boolean;
+  active_entries: string[];
+  pending_entries: string[];
 };
 
 export const api = {
@@ -87,5 +174,35 @@ export const api = {
   connectProfile: (profileId: string, bootstrapPassword?: string) =>
     invoke<ConnectionResult>('connect_profile', { profileId, bootstrapPassword }),
   openSshSession: (profileId: string, hostName: string) => invoke<void>('open_ssh_session', { profileId, hostName }),
+  backupKubeconfig: (moveFile?: boolean) =>
+    invoke<BackupKubeconfigResult>('backup_kubeconfig', { moveFile }),
+  mergeKubeconfigToSystem: (profileId: string, backupFirst?: boolean) =>
+    invoke<MergeKubeconfigResult>('merge_kubeconfig_to_system', { profileId, backupFirst }),
+  listKubeconfigBackups: () => invoke<KubeconfigBackupInfo[]>('list_kubeconfig_backups'),
+  restoreKubeconfigBackup: (filename: string) =>
+    invoke<BackupKubeconfigResult>('restore_kubeconfig_backup', { filename }),
+  deleteKubeconfigBackup: (filename: string) =>
+    invoke<void>('delete_kubeconfig_backup', { filename }),
+  getUserKubeconfigDetails: (includeRaw?: boolean) =>
+    invoke<UserKubeconfigDetails>('get_user_kubeconfig_details', { includeRaw }),
+  setCurrentContext: (contextName: string) =>
+    invoke<void>('set_current_context', { contextName }),
+  deleteUserKubeContext: (contextName: string) =>
+    invoke<void>('delete_user_kube_context', { contextName }),
+  listManagedProfileKubeconfigs: () =>
+    invoke<ManagedProfileKubeconfig[]>('list_managed_profile_kubeconfigs'),
+  openPathInFinder: (path: string) => invoke<void>('open_path_in_finder', { path }),
   listLocalKubeContexts: () => invoke<LocalKubeContext[]>('list_local_kube_contexts_cmd'),
+  detectLocalHosts: () => invoke<DiscoveredLocalHost[]>('detect_local_hosts'),
+  discoverClusterEndpoints: (profileId: string) =>
+    invoke<DiscoveredEndpoint[]>('discover_cluster_endpoints_cmd', { profileId }),
+  syncHostsFile: (profileId: string) =>
+    invoke<SyncHostsResult>('sync_hosts_file_cmd', { profileId }),
+  getHostsFileStatus: (profileId: string) =>
+    invoke<HostsFileStatus>('get_hosts_file_status', { profileId }),
+  removeHostsFile: (profileId: string) =>
+    invoke<SyncHostsResult>('remove_hosts_file_cmd', { profileId }),
+  openUrlInBrowser: (url: string) =>
+    invoke<void>('open_url_in_browser', { url }),
 };
+

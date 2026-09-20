@@ -1,8 +1,8 @@
 #![allow(dead_code)]
 
 use crate::services::config::{Bastion, Host};
-use crate::services::process::CommandRunner;
-use crate::services::validate::is_safe_ssh_identifier;
+use crate::services::process::{CommandOutput, CommandRunner};
+use crate::services::validate::{is_safe_known_hosts_path, is_safe_ssh_identifier};
 use serde::Serialize;
 
 #[derive(Debug, Clone, Serialize)]
@@ -20,21 +20,19 @@ pub struct BootstrapResult {
     pub detail: String,
 }
 
-pub fn build_ssh_target_args(
-    host: &Host,
-    bastion: Option<&Bastion>,
-    extra: &[&str],
-) -> Vec<String> {
-    let mut args = vec![
-        "-o".to_string(),
-        "BatchMode=yes".to_string(),
-        "-o".to_string(),
-        "ConnectTimeout=5".to_string(),
-        "-o".to_string(),
-        "StrictHostKeyChecking=accept-new".to_string(),
-        "-p".to_string(),
-        host.port.to_string(),
-    ];
+/// Pushes the SSH options shared by every connection path: a short connect timeout,
+/// trust-on-first-use host key acceptance (required because ClusterDeck's whole use case is
+/// frequently recreated VMs, which by definition are hosts SSH has never seen before -- see
+/// AGENTS.md Security Rules), the target port, and an identity file when one is configured.
+/// Deliberately excludes `-o BatchMode=yes`: that flag is not always wanted (see
+/// probe_password_auth), so callers that need it push it themselves before calling this.
+fn push_connection_options(args: &mut Vec<String>, host: &Host) {
+    args.push("-o".to_string());
+    args.push("ConnectTimeout=5".to_string());
+    args.push("-o".to_string());
+    args.push("StrictHostKeyChecking=accept-new".to_string());
+    args.push("-p".to_string());
+    args.push(host.port.to_string());
 
     if let Some(identity) = &host.identity_file {
         if !identity.is_empty() {
@@ -42,15 +40,29 @@ pub fn build_ssh_target_args(
             args.push(identity.clone());
         }
     }
+}
+
+/// Formats a bastion as an SSH connection target: `user@address`, or `user@address:port` when
+/// the bastion isn't reachable on the default port 22.
+fn jump_target(b: &Bastion) -> String {
+    if b.port == 22 {
+        format!("{}@{}", b.user, b.address)
+    } else {
+        format!("{}@{}:{}", b.user, b.address, b.port)
+    }
+}
+
+pub fn build_ssh_target_args(
+    host: &Host,
+    bastion: Option<&Bastion>,
+    extra: &[&str],
+) -> Vec<String> {
+    let mut args = vec!["-o".to_string(), "BatchMode=yes".to_string()];
+    push_connection_options(&mut args, host);
 
     if let Some(b) = bastion {
         args.push("-J".to_string());
-        let bastion_target = if b.port == 22 {
-            format!("{}@{}", b.user, b.address)
-        } else {
-            format!("{}@{}:{}", b.user, b.address, b.port)
-        };
-        args.push(bastion_target);
+        args.push(jump_target(b));
     }
 
     args.push("--".to_string());
@@ -61,6 +73,119 @@ pub fn build_ssh_target_args(
     }
 
     args
+}
+
+/// Checks whether OpenSSH stderr indicates that the remote host key has changed
+/// (the classic "WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!" error,
+/// common when frequently recreated VMs reuse IPs).
+pub fn is_host_key_changed_error(stderr: &str) -> bool {
+    stderr.contains("REMOTE HOST IDENTIFICATION HAS CHANGED")
+        || (stderr.contains("Host key for ") && stderr.contains("has changed"))
+        || (stderr.contains("Host key verification failed") && stderr.contains("Offending"))
+}
+
+/// Parses the offending known_hosts file path from OpenSSH error output if present,
+/// e.g. "Offending ED25519 key in /Users/m/.ssh/known_hosts:2" -> "/Users/m/.ssh/known_hosts".
+pub fn extract_offending_known_hosts_file(stderr: &str) -> Option<String> {
+    for line in stderr.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("Offending ") && trimmed.contains(" key in ") {
+            if let Some(pos) = trimmed.find(" key in ") {
+                let rest = &trimmed[pos + " key in ".len()..];
+                if let Some(colon_pos) = rest.rfind(':') {
+                    let path = rest[..colon_pos].trim();
+                    if is_safe_known_hosts_path(path) {
+                        return Some(path.to_string());
+                    }
+                }
+            }
+        }
+        if trimmed.starts_with("Add correct host key in ") && trimmed.contains(" to get rid of") {
+            let after = &trimmed["Add correct host key in ".len()..];
+            if let Some(end_pos) = after.find(" to get rid of") {
+                let path = after[..end_pos].trim();
+                if is_safe_known_hosts_path(path) {
+                    return Some(path.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Prunes stale host keys using `ssh-keygen -R` for the given host and bastion (if applicable).
+/// Invokes `ssh-keygen -f <offending_file> -R <target>` if an offending file was identified,
+/// as well as the default `ssh-keygen -R <target>`.
+pub async fn prune_stale_host_keys(
+    runner: &dyn CommandRunner,
+    host: &Host,
+    bastion: Option<&Bastion>,
+    stderr: &str,
+) {
+    let offending_file = extract_offending_known_hosts_file(stderr);
+
+    let mut targets = Vec::new();
+    targets.push(host.address.clone());
+    if host.port != 22 {
+        targets.push(format!("[{}]:{}", host.address, host.port));
+    }
+
+    if let Some(b) = bastion {
+        targets.push(b.address.clone());
+        if b.port != 22 {
+            targets.push(format!("[{}]:{}", b.address, b.port));
+        }
+    }
+
+    for target in targets {
+        if let Some(file) = &offending_file {
+            let _ = runner
+                .run(
+                    "ssh-keygen",
+                    &[
+                        "-f".to_string(),
+                        file.clone(),
+                        "-R".to_string(),
+                        target.clone(),
+                    ],
+                )
+                .await;
+        }
+
+        let _ = runner.run("ssh-keygen", &["-R".to_string(), target]).await;
+    }
+}
+
+/// Runs `bin` (via `run_with_env` when `env` is non-empty, otherwise plain `run`) and, if it
+/// fails with a changed-host-key error, prunes the stale known_hosts entry and retries exactly
+/// once. Recreated VMs frequently reuse addresses, so a changed host key is an expected
+/// condition here, not an attack signal.
+pub async fn run_with_host_key_retry(
+    runner: &dyn CommandRunner,
+    bin: &str,
+    args: &[String],
+    env: &[(String, String)],
+    host: &Host,
+    bastion: Option<&Bastion>,
+) -> Result<CommandOutput, String> {
+    let mut output = if env.is_empty() {
+        runner.run(bin, args).await
+    } else {
+        runner.run_with_env(bin, args, env).await
+    };
+
+    if let Ok(ref out) = output {
+        if !out.success && is_host_key_changed_error(&out.stderr) {
+            prune_stale_host_keys(runner, host, bastion, &out.stderr).await;
+            output = if env.is_empty() {
+                runner.run(bin, args).await
+            } else {
+                runner.run_with_env(bin, args, env).await
+            };
+        }
+    }
+
+    output
 }
 
 pub async fn probe_key_auth(
@@ -82,7 +207,9 @@ pub async fn probe_key_auth(
     }
 
     let args = build_ssh_target_args(host, bastion, &["true"]);
-    match runner.run("ssh", &args).await {
+    let output = run_with_host_key_retry(runner, "ssh", &args, &[], host, bastion).await;
+
+    match output {
         Ok(output) => ProbeResult {
             host: host.name.clone(),
             reachable: output.success,
@@ -125,46 +252,31 @@ pub async fn probe_password_auth(
         };
     }
 
-    let mut args = vec![
-        "-e".to_string(),
-        "ssh".to_string(),
-        "-o".to_string(),
-        "ConnectTimeout=5".to_string(),
-        "-o".to_string(),
-        "StrictHostKeyChecking=accept-new".to_string(),
-        "-p".to_string(),
-        host.port.to_string(),
-    ];
-
-    if let Some(identity) = &host.identity_file {
-        if !identity.is_empty() {
-            args.push("-i".to_string());
-            args.push(identity.clone());
-        }
-    }
+    // No BatchMode=yes here: BatchMode disables the interactive password prompt that sshpass
+    // answers via SSHPASS, so this probe must allow that prompt through.
+    let mut args = vec!["-e".to_string(), "ssh".to_string()];
+    push_connection_options(&mut args, host);
 
     if let Some(b) = bastion {
         args.push("-J".to_string());
-        let bastion_target = if b.port == 22 {
-            format!("{}@{}", b.user, b.address)
-        } else {
-            format!("{}@{}:{}", b.user, b.address, b.port)
-        };
-        args.push(bastion_target);
+        args.push(jump_target(b));
     }
 
     args.push("--".to_string());
     args.push(format!("{}@{}", host.user, host.address));
     args.push("true".to_string());
 
-    match runner
-        .run_with_env(
-            "sshpass",
-            &args,
-            &[("SSHPASS".to_string(), password.to_string())],
-        )
-        .await
-    {
+    let output = run_with_host_key_retry(
+        runner,
+        "sshpass",
+        &args,
+        &[("SSHPASS".to_string(), password.to_string())],
+        host,
+        bastion,
+    )
+    .await;
+
+    match output {
         Ok(output) => ProbeResult {
             host: host.name.clone(),
             reachable: output.success,
@@ -203,44 +315,28 @@ pub async fn deploy_public_key(
         return Err("unsafe SSH identifier".to_string());
     }
 
-    let mut args = vec![
-        "-e".to_string(),
-        "ssh-copy-id".to_string(),
-        "-o".to_string(),
-        "ConnectTimeout=5".to_string(),
-        "-o".to_string(),
-        "StrictHostKeyChecking=accept-new".to_string(),
-        "-p".to_string(),
-        host.port.to_string(),
-    ];
-
-    if let Some(identity) = &host.identity_file {
-        if !identity.is_empty() {
-            args.push("-i".to_string());
-            args.push(identity.clone());
-        }
-    }
+    let mut args = vec!["-e".to_string(), "ssh-copy-id".to_string()];
+    push_connection_options(&mut args, host);
 
     if let Some(b) = bastion {
-        let bastion_target = if b.port == 22 {
-            format!("{}@{}", b.user, b.address)
-        } else {
-            format!("{}@{}:{}", b.user, b.address, b.port)
-        };
+        // ssh-copy-id has no -J flag; -o ProxyJump=<target> is the equivalent it does support.
         args.push("-o".to_string());
-        args.push(format!("ProxyJump={bastion_target}"));
+        args.push(format!("ProxyJump={}", jump_target(b)));
     }
 
     args.push("--".to_string());
     args.push(format!("{}@{}", host.user, host.address));
 
-    let output = runner
-        .run_with_env(
-            "sshpass",
-            &args,
-            &[("SSHPASS".to_string(), password.to_string())],
-        )
-        .await?;
+    let output = run_with_host_key_retry(
+        runner,
+        "sshpass",
+        &args,
+        &[("SSHPASS".to_string(), password.to_string())],
+        host,
+        bastion,
+    )
+    .await?;
+
     if output.success {
         Ok(())
     } else {
@@ -488,6 +584,29 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn shared_connection_options_present_on_all_three_ssh_argv_paths() {
+        // Guards push_connection_options: a future SSH call site that forgets to route through
+        // it (or that drops StrictHostKeyChecking/ConnectTimeout from it) fails this test, the
+        // same class of regression AGENTS.md documents for probe_key_auth.
+        let build_args = build_ssh_target_args(&host(), None, &[]);
+        assert!(build_args.contains(&"StrictHostKeyChecking=accept-new".to_string()));
+        assert!(build_args.contains(&"ConnectTimeout=5".to_string()));
+
+        let runner = EnvCapturingRunner {
+            calls: std::sync::Mutex::new(Vec::new()),
+        };
+        let _ = probe_password_auth(&runner, &host(), None, "irrelevant").await;
+        let _ = deploy_public_key(&runner, &host(), None, "irrelevant").await;
+
+        let calls = runner.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        for (args, _env) in calls.iter() {
+            assert!(args.contains(&"StrictHostKeyChecking=accept-new".to_string()));
+            assert!(args.contains(&"ConnectTimeout=5".to_string()));
+        }
+    }
+
     /// Real-process regression: FakeRunner tests above only prove build_ssh_target_args
     /// returns the right Vec<String>, not that a real spawned process actually receives
     /// those exact argv strings intact (shell/exec quoting, arg splitting, etc. can differ
@@ -561,5 +680,118 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn is_host_key_changed_error_detects_all_patterns() {
+        let actual_error = r#"
+@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+@ WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED! @
+@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+IT IS POSSIBLE THAT SOMEONE IS DOING SOMETHING NASTY!
+Someone could be eavesdropping on you right now (man-in-the-middle attack)!
+It is also possible that a host key has just been changed.
+The fingerprint for the ED25519 key sent by the remote host is SHA256:VuSZc8Rg1PGTVRvt6IzIShJ0C0ssgZZrFQMVDeMkXns.
+Please contact your system administrator.
+Add correct host key in /Users/m/.ssh/known_hosts to get rid of this message.
+Offending ED25519 key in /Users/m/.ssh/known_hosts:2
+Host key for 172.16.221.136 has changed and you have requested strict checking.
+Host key verification failed.
+"#;
+        assert!(is_host_key_changed_error(actual_error));
+        assert!(is_host_key_changed_error(
+            "Host key for 10.0.0.1 has changed"
+        ));
+        assert!(!is_host_key_changed_error("Permission denied (publickey)"));
+        assert!(!is_host_key_changed_error("Connection timed out"));
+    }
+
+    #[test]
+    fn extract_offending_known_hosts_file_extracts_path() {
+        let stderr1 =
+            "Offending ED25519 key in /Users/m/.ssh/known_hosts:2\nHost key verification failed.";
+        assert_eq!(
+            extract_offending_known_hosts_file(stderr1),
+            Some("/Users/m/.ssh/known_hosts".to_string())
+        );
+
+        let stderr2 = "Add correct host key in /custom/hosts to get rid of this message.";
+        assert_eq!(
+            extract_offending_known_hosts_file(stderr2),
+            Some("/custom/hosts".to_string())
+        );
+
+        let stderr3 = "Permission denied (publickey)";
+        assert_eq!(extract_offending_known_hosts_file(stderr3), None);
+    }
+
+    struct HostKeyPruningTestRunner {
+        calls: std::sync::Mutex<Vec<(String, Vec<String>)>>,
+    }
+
+    #[async_trait]
+    impl CommandRunner for HostKeyPruningTestRunner {
+        async fn run(&self, bin: &str, args: &[String]) -> Result<CommandOutput, String> {
+            let mut calls = self.calls.lock().unwrap();
+            calls.push((bin.to_string(), args.to_vec()));
+            let call_count = calls.len();
+            drop(calls);
+
+            if bin == "ssh" && call_count == 1 {
+                Ok(CommandOutput {
+                    stdout: String::new(),
+                    stderr: "WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!\nOffending ED25519 key in /Users/m/.ssh/known_hosts:2\nHost key verification failed.".into(),
+                    success: false,
+                })
+            } else if bin == "ssh-keygen" {
+                Ok(CommandOutput {
+                    stdout: "# Host found and updated".into(),
+                    stderr: String::new(),
+                    success: true,
+                })
+            } else if bin == "ssh" {
+                Ok(CommandOutput {
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    success: true,
+                })
+            } else {
+                Err(format!("unexpected bin: {bin}"))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn probe_key_auth_auto_prunes_stale_host_key_and_retries_successfully() {
+        let runner = HostKeyPruningTestRunner {
+            calls: std::sync::Mutex::new(Vec::new()),
+        };
+
+        let result = probe_key_auth(&runner, &host(), None).await;
+        assert!(result.reachable);
+        assert_eq!(result.detail, "SSH key auth succeeded");
+
+        let recorded = runner.calls.lock().unwrap();
+        // Call 1: ssh (failed with host key mismatch)
+        assert_eq!(recorded[0].0, "ssh");
+        // Call 2: ssh-keygen -f /Users/m/.ssh/known_hosts -R 192.0.2.10
+        assert_eq!(recorded[1].0, "ssh-keygen");
+        assert_eq!(
+            recorded[1].1,
+            vec![
+                "-f".to_string(),
+                "/Users/m/.ssh/known_hosts".to_string(),
+                "-R".to_string(),
+                "192.0.2.10".to_string(),
+            ]
+        );
+        // Call 3: ssh-keygen -R 192.0.2.10 (default known_hosts)
+        assert_eq!(recorded[2].0, "ssh-keygen");
+        assert_eq!(
+            recorded[2].1,
+            vec!["-R".to_string(), "192.0.2.10".to_string()]
+        );
+        // Call 4: ssh retry (succeeded)
+        assert_eq!(recorded[3].0, "ssh");
     }
 }

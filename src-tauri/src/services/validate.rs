@@ -11,6 +11,51 @@ pub fn is_safe_profile_id(s: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
+pub fn is_safe_ip_address(s: &str) -> bool {
+    s.parse::<std::net::IpAddr>().is_ok()
+}
+
+/// Sink validator for `open_url_in_browser`: only http(s) URLs with no whitespace or control
+/// characters may reach the `open` argv (macOS treats some URL schemes/args specially).
+pub fn is_safe_open_url(url: &str) -> bool {
+    let trimmed = url.trim();
+    (trimmed.starts_with("http://") || trimmed.starts_with("https://"))
+        && !trimmed.contains('\n')
+        && !trimmed.contains('\r')
+        && !trimmed.contains(' ')
+}
+
+/// Sink validator for the known_hosts path OpenSSH reports in its "Offending key"/"Add correct
+/// host key" stderr lines, before that path is used as an `ssh-keygen -f` argument.
+pub fn is_safe_known_hosts_path(path: &str) -> bool {
+    if path.is_empty() || path.starts_with('-') {
+        return false;
+    }
+    !path
+        .chars()
+        .any(|c| c.is_control() || c == '"' || c == '\'')
+}
+
+pub fn is_safe_host_domain(s: &str) -> bool {
+    if s.is_empty() || s.len() > 253 {
+        return false;
+    }
+    if s.starts_with('.') || s.ends_with('.') || s.contains("..") {
+        return false;
+    }
+    for label in s.split('.') {
+        if label.is_empty()
+            || label.len() > 63
+            || label.starts_with('-')
+            || label.ends_with('-')
+            || !label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        {
+            return false;
+        }
+    }
+    true
+}
+
 pub fn validate_profile(profile: &crate::services::config::Profile) -> Result<(), String> {
     if !is_safe_profile_id(&profile.id) {
         return Err(format!("invalid profile id: {}", profile.id));
@@ -119,5 +164,55 @@ mod tests {
         let mut invalid_profile = valid_profile.clone();
         invalid_profile.hosts[0].address = "192.168.1.10\nHost evil".into();
         assert!(validate_profile(&invalid_profile).is_err());
+    }
+
+    #[test]
+    fn is_safe_open_url_accepts_http_https_and_rejects_unsafe_urls() {
+        assert!(is_safe_open_url("https://example.com"));
+        assert!(is_safe_open_url("http://example.com/path?x=1"));
+        assert!(!is_safe_open_url("ftp://example.com"));
+        assert!(!is_safe_open_url("javascript:alert(1)"));
+        assert!(!is_safe_open_url("https://example.com/a b"));
+        assert!(!is_safe_open_url("https://example.com\nHost: evil"));
+        assert!(!is_safe_open_url("https://example.com\revil"));
+    }
+
+    #[test]
+    fn is_safe_known_hosts_path_rejects_dash_prefix_and_control_chars() {
+        assert!(is_safe_known_hosts_path("/Users/m/.ssh/known_hosts"));
+        assert!(!is_safe_known_hosts_path(""));
+        assert!(!is_safe_known_hosts_path("-oProxyCommand=evil"));
+        assert!(!is_safe_known_hosts_path("/tmp/evil\"; rm -rf /"));
+        assert!(!is_safe_known_hosts_path("/tmp/evil\nHost x"));
+    }
+
+    #[test]
+    fn is_safe_ip_address_validates_ipv4_and_ipv6() {
+        assert!(is_safe_ip_address("192.168.77.10"));
+        assert!(is_safe_ip_address("10.0.0.1"));
+        assert!(is_safe_ip_address("::1"));
+        assert!(is_safe_ip_address("2001:db8::1"));
+        assert!(!is_safe_ip_address(""));
+        assert!(!is_safe_ip_address("not-an-ip"));
+        assert!(!is_safe_ip_address("192.168.1.1\nevil"));
+        assert!(!is_safe_ip_address("192.168.1.1 80"));
+    }
+
+    #[test]
+    fn is_safe_host_domain_validates_rfc1123() {
+        assert!(is_safe_host_domain("trino.local.beluga.internal"));
+        assert!(is_safe_host_domain("api.example.com"));
+        assert!(is_safe_host_domain("my-cluster-1.internal"));
+        assert!(is_safe_host_domain("localhost"));
+        assert!(!is_safe_host_domain(""));
+        assert!(!is_safe_host_domain("*.example.com"));
+        assert!(!is_safe_host_domain(".example.com"));
+        assert!(!is_safe_host_domain("example.com."));
+        assert!(!is_safe_host_domain("example..com"));
+        assert!(!is_safe_host_domain("-bad.domain"));
+        assert!(!is_safe_host_domain("bad-.domain"));
+        assert!(!is_safe_host_domain("bad\nhost.internal"));
+        assert!(!is_safe_host_domain("bad host.internal"));
+        assert!(!is_safe_host_domain("bad/host.internal"));
     }
 }

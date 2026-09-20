@@ -1,20 +1,31 @@
-import { useState } from 'react';
-import { Plus, Trash2, X, Download } from 'lucide-react';
+import { useMemo, useState } from 'react';
+import { Plus, Trash2, X, Download, Search, RefreshCw } from 'lucide-react';
 import {
   api,
   type Profile,
   type Host,
   type Bastion,
   type LocalKubeContext,
+  type DiscoveredLocalHost,
 } from '../api/tauri';
 
 export type ProfileEditorProps = {
   initial: Profile | null;
   onClose: () => void;
   onSaved: (profile: Profile) => void;
+  onDeleteRequest: (profile: Profile) => void;
 };
 
-export default function ProfileEditor({ initial, onClose, onSaved }: ProfileEditorProps) {
+const deriveProjectName = (item: DiscoveredLocalHost) =>
+  item.instance_name.includes('/') ? item.instance_name.split('/')[0] : item.instance_name;
+
+const deriveBaseId = (provider: string, projectName: string) =>
+  `${provider.toLowerCase()}-${projectName}`.replace(/[^a-z0-9_-]/g, '-');
+
+const deriveFormattedName = (provider: string, projectName: string) =>
+  projectName === 'default' ? `${provider} Local` : `${projectName} (${provider})`;
+
+export default function ProfileEditor({ initial, onClose, onSaved, onDeleteRequest }: ProfileEditorProps) {
   const isEditing = initial !== null;
 
   const [id, setId] = useState(initial?.id ?? '');
@@ -61,8 +72,130 @@ export default function ProfileEditor({ initial, onClose, onSaved }: ProfileEdit
   const [loadingContexts, setLoadingContexts] = useState(false);
   const [contextLoadError, setContextLoadError] = useState<string | null>(null);
 
+  const [detectedHosts, setDetectedHosts] = useState<DiscoveredLocalHost[] | null>(null);
+  const [detectingLocal, setDetectingLocal] = useState(false);
+  const [detectError, setDetectError] = useState<string | null>(null);
+
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
+
+  const handleDelete = () => {
+    if (!initial) return;
+    onDeleteRequest(initial);
+  };
+
+  const handleDetectLocal = async () => {
+    setDetectingLocal(true);
+    setDetectError(null);
+    try {
+      const list = await api.detectLocalHosts();
+      setDetectedHosts(list);
+      if (list.length === 0) {
+        setDetectError('No local VMs found (Colima or Lima is not running or not installed).');
+      }
+    } catch (err) {
+      setDetectError(String(err));
+    } finally {
+      setDetectingLocal(false);
+    }
+  };
+
+  const applyKubeconfigIfPresent = (source: DiscoveredLocalHost) => {
+    if (source.kube_context) {
+      setUseKubeconfig(true);
+      setKubeControlPlane(source.host_name);
+      setKubeContext(source.kube_context);
+      if (source.kube_remote_path) {
+        setKubeRemotePath(source.kube_remote_path);
+      }
+    }
+  };
+
+  const applyDetectedHost = (detected: DiscoveredLocalHost) => {
+    const projectName = deriveProjectName(detected);
+
+    if (!id.trim()) {
+      setId(deriveBaseId(detected.provider, projectName));
+    }
+    if (!name.trim()) {
+      setName(deriveFormattedName(detected.provider, projectName));
+    }
+
+    const existingIndex = hosts.findIndex(
+      (h) => h.name === detected.host_name || (h.address === detected.address && h.port === detected.port)
+    );
+
+    const newHost: Host = {
+      name: detected.host_name,
+      address: detected.address,
+      port: detected.port,
+      user: detected.user,
+      identity_file: detected.identity_file,
+    };
+
+    let updatedHosts: Host[];
+    if (existingIndex >= 0) {
+      updatedHosts = [...hosts];
+      updatedHosts[existingIndex] = newHost;
+    } else if (hosts.length === 1 && (!hosts[0].address || hosts[0].name.startsWith('host-'))) {
+      updatedHosts = [newHost];
+    } else {
+      updatedHosts = [...hosts, newHost];
+    }
+    setHosts(updatedHosts);
+
+    applyKubeconfigIfPresent(detected);
+
+    setDetectedHosts(null);
+  };
+
+  const applyAllFromGroup = (items: DiscoveredLocalHost[]) => {
+    if (items.length === 0) return;
+    const first = items[0];
+    const projectName = deriveProjectName(first);
+
+    if (!id.trim()) {
+      setId(deriveBaseId(first.provider, projectName));
+    }
+    if (!name.trim()) {
+      setName(deriveFormattedName(first.provider, projectName));
+    }
+
+    const newHostList: Host[] = items.map((d) => ({
+      name: d.host_name,
+      address: d.address,
+      port: d.port,
+      user: d.user,
+      identity_file: d.identity_file,
+    }));
+    setHosts(newHostList);
+
+    const masterHost = items.find(
+      (d) => d.host_name.includes('master') || d.host_name.includes('control') || d.kube_context
+    ) || first;
+
+    applyKubeconfigIfPresent(masterHost);
+
+    setDetectedHosts(null);
+  };
+
+  const groupedDetected = useMemo(() => {
+    if (!detectedHosts) return [];
+    const groups: { [key: string]: DiscoveredLocalHost[] } = {};
+    for (const d of detectedHosts) {
+      const groupKey = d.instance_name.includes('/')
+        ? `${d.provider}: ${d.instance_name.split('/')[0]}`
+        : `${d.provider} (${d.instance_name})`;
+      if (!groups[groupKey]) {
+        groups[groupKey] = [];
+      }
+      groups[groupKey].push(d);
+    }
+    return Object.entries(groups).map(([groupName, items]) => ({
+      groupName,
+      items,
+    }));
+  }, [detectedHosts]);
 
   const handleUseBastionToggle = (enabled: boolean) => {
     setUseBastion(enabled);
@@ -269,10 +402,100 @@ export default function ProfileEditor({ initial, onClose, onSaved }: ProfileEdit
           <div className="form-section">
             <div className="form-section-title">
               <span>Hosts ({hosts.length}) *</span>
-              <button type="button" className="secondary-button compact-btn" onClick={addHost}>
-                <Plus size={14} /> Add host
-              </button>
+              <div style={{ display: 'flex', gap: '8px' }}>
+                <button
+                  type="button"
+                  className="secondary-button compact-btn"
+                  onClick={handleDetectLocal}
+                  disabled={detectingLocal}
+                  title="Detect local VMs (Colima, Lima)"
+                >
+                  {detectingLocal ? <RefreshCw size={13} className="spin" /> : <Search size={13} />}
+                  {detectingLocal ? 'Detecting…' : 'Detect local VM'}
+                </button>
+                <button type="button" className="secondary-button compact-btn" onClick={addHost}>
+                  <Plus size={14} /> Add host
+                </button>
+              </div>
             </div>
+
+            {detectError && (
+              <div className="form-error" style={{ marginBottom: '8px' }}>
+                {detectError}
+              </div>
+            )}
+
+            {detectedHosts !== null && (
+              <div className="local-detect-box" style={{ marginBottom: '12px' }}>
+                <div className="local-detect-header">
+                  <span className="form-label" style={{ margin: 0 }}>
+                    Detected Local VMs ({detectedHosts.length})
+                  </span>
+                  <button
+                    type="button"
+                    className="icon-button"
+                    style={{ width: '22px', height: '22px', padding: 0 }}
+                    onClick={() => setDetectedHosts(null)}
+                    title="Close"
+                  >
+                    <X size={13} />
+                  </button>
+                </div>
+                {detectedHosts.length === 0 ? (
+                  <p className="form-helper" style={{ margin: '4px 0 0' }}>
+                    No local VMs found (Colima, Lima, or Vagrant is not running or not installed).
+                  </p>
+                ) : (
+                  <div className="local-detect-list">
+                    {groupedDetected.map(({ groupName, items }) => (
+                      <div key={groupName} className="local-detect-group">
+                        <div className="local-detect-group-header">
+                          <span className="local-detect-group-title">{groupName}</span>
+                          {items.length > 1 && (
+                            <button
+                              type="button"
+                              className="secondary-button compact-btn"
+                              style={{ fontSize: '11px', padding: '2px 8px' }}
+                              onClick={() => applyAllFromGroup(items)}
+                            >
+                              Apply all {items.length} hosts
+                            </button>
+                          )}
+                        </div>
+                        {items.map((d, idx) => (
+                          <div key={idx} className="local-detect-row">
+                            <div className="local-detect-info">
+                              <div className="local-detect-name">
+                                <strong>{d.host_name}</strong>
+                                <span
+                                  className={`pill ${d.status === 'Running' ? 'success' : 'warning'}`}
+                                  style={{ fontSize: '9px', padding: '2px 6px' }}
+                                >
+                                  {d.status}
+                                </span>
+                                {d.runtime && <span className="local-detect-runtime mono">{d.runtime}</span>}
+                              </div>
+                              <div className="local-detect-meta mono">
+                                {d.user}@{d.address}:{d.port}
+                                {d.identity_file && ` · key: ${d.identity_file.split('/').pop()}`}
+                                {d.kube_context && ` · k8s: ${d.kube_context}`}
+                              </div>
+                            </div>
+                            <button
+                              type="button"
+                              className="secondary-button compact-btn"
+                              onClick={() => applyDetectedHost(d)}
+                            >
+                              Apply
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
 
             {hosts.length === 0 ? (
               <p className="form-helper" style={{ margin: 0 }}>
@@ -563,7 +786,31 @@ export default function ProfileEditor({ initial, onClose, onSaved }: ProfileEdit
           </div>
         </div>
 
-        <div className="modal-footer">
+        <div className="modal-footer" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+          <div>
+            {isEditing && (
+              <button
+                type="button"
+                className="secondary-button"
+                style={{
+                  color: 'var(--danger)',
+                  borderColor: 'var(--border)',
+                  marginTop: 0,
+                  width: 'auto',
+                  padding: '7px 12px',
+                  fontSize: '12px',
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: '6px',
+                }}
+                onClick={handleDelete}
+                disabled={saving}
+              >
+                <Trash2 size={13} />
+                Delete profile
+              </button>
+            )}
+          </div>
           {saveError && <div className="form-error">{saveError}</div>}
           <div className="modal-footer-actions">
             <button type="button" className="secondary-button" onClick={onClose} disabled={saving}>

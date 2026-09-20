@@ -14,9 +14,9 @@
       {
         "title": "ClusterDeck",
         "width": 1120,
-        "height": 760,
+        "height": 740,
         "minWidth": 960,
-        "minHeight": 680,
+        "minHeight": 620,
         "resizable": true
       }
     ]
