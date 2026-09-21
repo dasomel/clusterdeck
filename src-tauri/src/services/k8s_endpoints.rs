@@ -136,6 +136,17 @@ pub(crate) async fn curl_k8s_api(
         .and_then(|u| u.get("client-key"))
         .and_then(|v| v.as_str());
 
+    let cluster_obj = value
+        .get("clusters")
+        .and_then(|c| c.get(0))
+        .and_then(|c| c.get("cluster"));
+    let ca_data = cluster_obj
+        .and_then(|c| c.get("certificate-authority-data"))
+        .and_then(|v| v.as_str());
+    let ca_path = cluster_obj
+        .and_then(|c| c.get("certificate-authority"))
+        .and_then(|v| v.as_str());
+
     let target_url = format!("{server_url}{api_path}");
 
     let now_nanos = std::time::SystemTime::now()
@@ -145,13 +156,34 @@ pub(crate) async fn curl_k8s_api(
     let seq = TEMP_FILE_SEQ.fetch_add(1, Ordering::Relaxed);
     let temp_cert = std::env::temp_dir().join(format!("cd_tmp_cert_{now_nanos}_{seq}.crt"));
     let temp_key = std::env::temp_dir().join(format!("cd_tmp_key_{now_nanos}_{seq}.key"));
+    let temp_ca = std::env::temp_dir().join(format!("cd_tmp_ca_{now_nanos}_{seq}.crt"));
 
     let mut curl_args = vec![
-        "-k".to_string(),
         "-s".to_string(),
         "--connect-timeout".to_string(),
         "5".to_string(),
     ];
+
+    // Verify the server's certificate against the kubeconfig's own CA (same trust source
+    // `kubectl` itself uses, per client-go's rest.Config) instead of skipping verification
+    // (`-k`/`--insecure`) outright. `-k` would let a network-path attacker (e.g. ARP/rogue-AP on
+    // the same LAN as these frequently-local clusters) intercept this call, harvest the client
+    // cert/bearer token sent below, and return spoofed cluster data -- this fallback is reachable
+    // whenever kubectl fails or is absent (e.g. macOS Sequoia Local Network Privacy), not a rare
+    // path. If the kubeconfig has no CA data at all, fall back to curl's system trust store
+    // (still no `-k`) rather than disabling verification -- a cluster with a real self-signed CA
+    // and no CA data on file should fail closed, not connect insecurely.
+    if let Some(data) = ca_data {
+        if let Some(bytes) = decode_base64(data) {
+            if write_owner_only_file(&temp_ca, &bytes).is_ok() {
+                curl_args.push("--cacert".to_string());
+                curl_args.push(temp_ca.to_string_lossy().to_string());
+            }
+        }
+    } else if let Some(path) = ca_path {
+        curl_args.push("--cacert".to_string());
+        curl_args.push(path.to_string());
+    }
 
     if let (Some(c_data), Some(k_data)) = (cert_data, key_data) {
         if let (Some(c_bytes), Some(k_bytes)) = (decode_base64(c_data), decode_base64(k_data)) {
@@ -178,9 +210,10 @@ pub(crate) async fn curl_k8s_api(
 
     let res = runner.run("curl", &curl_args).await;
 
-    // Unconditional: a failed key write must not leave the cert (or a partial key) behind.
+    // Unconditional: a failed key write must not leave the cert/key/CA (or a partial one) behind.
     let _ = std::fs::remove_file(&temp_cert);
     let _ = std::fs::remove_file(&temp_key);
+    let _ = std::fs::remove_file(&temp_ca);
 
     let output = res.map_err(|e| format!("curl execution failed: {e}"))?;
     if !output.success {
@@ -923,6 +956,105 @@ mod tests {
         assert!(
             !key_path.exists(),
             "temp key file should be removed after curl_k8s_api returns"
+        );
+    }
+
+    struct ArgCapturingRunner {
+        captured_args: std::sync::Mutex<Option<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl CommandRunner for ArgCapturingRunner {
+        async fn run(
+            &self,
+            bin: &str,
+            args: &[String],
+        ) -> Result<crate::services::process::CommandOutput, String> {
+            assert_eq!(bin, "curl");
+            *self.captured_args.lock().unwrap() = Some(args.to_vec());
+            Ok(crate::services::process::CommandOutput {
+                stdout: "{}".to_string(),
+                stderr: String::new(),
+                success: true,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn curl_k8s_api_never_passes_insecure_flag() {
+        // Regression test: curl_k8s_api must never disable TLS verification (`-k`/`--insecure`),
+        // whether or not the kubeconfig has CA data -- a bare token-only kubeconfig with no
+        // clusters[0].cluster.certificate-authority-data must still verify against curl's system
+        // trust store, not skip verification.
+        let kubeconfig_yaml =
+            "clusters:\n- cluster:\n    server: https://127.0.0.1:6443\n  name: fake\nusers:\n- name: fake\n  user:\n    token: fake-token\n";
+        let kubeconfig_path = std::env::temp_dir().join(format!(
+            "clusterdeck-test-curl-no-ca-{}-{}.yaml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&kubeconfig_path, kubeconfig_yaml).unwrap();
+
+        let runner = ArgCapturingRunner {
+            captured_args: std::sync::Mutex::new(None),
+        };
+        let result = curl_k8s_api(&runner, &kubeconfig_path, "/api/v1/services").await;
+        let _ = std::fs::remove_file(&kubeconfig_path);
+
+        assert!(result.is_ok(), "curl_k8s_api failed: {result:?}");
+        let args = runner.captured_args.lock().unwrap().clone().unwrap();
+        assert!(
+            !args.contains(&"-k".to_string()) && !args.contains(&"--insecure".to_string()),
+            "curl args must never disable TLS verification: {args:?}"
+        );
+        assert!(
+            !args.contains(&"--cacert".to_string()),
+            "no CA data in kubeconfig means no --cacert should be passed either: {args:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn curl_k8s_api_uses_cacert_from_kubeconfig_and_cleans_up() {
+        use base64::prelude::*;
+        let ca_b64 = BASE64_STANDARD.encode(b"fake-ca-cert");
+        let kubeconfig_yaml = format!(
+            "clusters:\n- cluster:\n    server: https://127.0.0.1:6443\n    certificate-authority-data: {ca_b64}\n  name: fake\nusers:\n- name: fake\n  user:\n    token: fake-token\n"
+        );
+        let kubeconfig_path = std::env::temp_dir().join(format!(
+            "clusterdeck-test-curl-with-ca-{}-{}.yaml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&kubeconfig_path, &kubeconfig_yaml).unwrap();
+
+        let runner = ArgCapturingRunner {
+            captured_args: std::sync::Mutex::new(None),
+        };
+        let result = curl_k8s_api(&runner, &kubeconfig_path, "/api/v1/services").await;
+        let _ = std::fs::remove_file(&kubeconfig_path);
+
+        assert!(result.is_ok(), "curl_k8s_api failed: {result:?}");
+        let args = runner.captured_args.lock().unwrap().clone().unwrap();
+        assert!(
+            !args.contains(&"-k".to_string()),
+            "must not pass -k when CA data is available: {args:?}"
+        );
+        let ca_idx = args
+            .iter()
+            .position(|a| a == "--cacert")
+            .expect("--cacert missing from curl args");
+        // curl_k8s_api unconditionally deletes the temp CA file before returning, so its content
+        // must be captured from inside ArgCapturingRunner::run (while it still exists), not here.
+        let ca_path = std::path::PathBuf::from(&args[ca_idx + 1]);
+        assert!(
+            !ca_path.exists(),
+            "temp CA file should be removed after curl_k8s_api returns"
         );
     }
 
