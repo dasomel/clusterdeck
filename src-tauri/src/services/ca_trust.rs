@@ -12,6 +12,14 @@ use crate::services::k8s_endpoints::{query_k8s_api_json, DiscoveredEndpoint};
 use crate::services::validate::is_safe_host_domain;
 
 pub fn pem_to_der(pem: &str) -> Result<Vec<u8>, String> {
+    let cert_count = pem.matches("-----BEGIN CERTIFICATE-----").count();
+    if cert_count > 1 {
+        return Err(format!(
+            "PEM contains {cert_count} certificates; expected exactly one (multi-certificate \
+             bundles are not supported -- concatenating them would silently fingerprint a \
+             value that is not any single certificate)"
+        ));
+    }
     let body: String = pem
         .lines()
         .filter(|line| !line.trim().is_empty() && !line.starts_with("-----"))
@@ -373,7 +381,21 @@ pub async fn discover_cluster_cas(
             Err(_) => continue,
         }
     }
-    Ok(result)
+
+    // Secret-ref dedup above only avoids redundant fetches; it doesn't avoid redundant *rows*
+    // when two different secrets happen to hold byte-identical certs (e.g. the same
+    // cert-manager ClusterIssuer backing both an Ingress and an ApisixTls). Collapse those into
+    // one row here, merging their source_hosts, per the spec's fingerprint-based dedup.
+    let mut by_fingerprint: BTreeMap<String, DiscoveredCa> = BTreeMap::new();
+    for ca in result {
+        match by_fingerprint.get_mut(&ca.meta.fingerprint_sha256) {
+            Some(existing) => existing.source_hosts.extend(ca.source_hosts),
+            None => {
+                by_fingerprint.insert(ca.meta.fingerprint_sha256.clone(), ca);
+            }
+        }
+    }
+    Ok(by_fingerprint.into_values().collect())
 }
 
 pub async fn resolve_login_keychain_path(runner: &dyn CommandRunner) -> Result<String, String> {
@@ -514,6 +536,14 @@ mod tests {
     fn pem_to_der_rejects_empty_input() {
         assert!(pem_to_der("").is_err());
         assert!(pem_to_der("-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----\n").is_err());
+    }
+
+    #[test]
+    fn pem_to_der_rejects_multi_certificate_bundle() {
+        let bundle = format!("{TEST_CA_PEM}{TEST_CA_PEM}");
+        let result = pem_to_der(&bundle);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains('2'));
     }
 
     #[test]
@@ -779,6 +809,126 @@ mod tests {
             "8b75bf97e19ce7efe9bb4d6c76b4f10e072a9d6ea89d8f438f423afea7156246"
         );
         assert_eq!(result[0].meta.subject_cn, "clusterdeck-test-ca.invalid");
+    }
+
+    struct FakeSameFingerprintDifferentSecretsRunner;
+
+    #[async_trait::async_trait]
+    impl CommandRunner for FakeSameFingerprintDifferentSecretsRunner {
+        async fn run(
+            &self,
+            bin: &str,
+            args: &[String],
+        ) -> Result<crate::services::process::CommandOutput, String> {
+            if bin == "kubectl" {
+                if let Some(path_idx) = args.iter().position(|a| a == "--raw") {
+                    let raw_path = &args[path_idx + 1];
+                    // One host resolves via an Ingress, the other via an ApisixTls -- two
+                    // different secret refs, in different namespaces, so the pre-fetch
+                    // (namespace, name) dedup in discover_cluster_cas does NOT collapse them.
+                    if raw_path == "/apis/networking.k8s.io/v1/ingresses" {
+                        return Ok(ok_output(
+                            r#"{
+                            "items": [{
+                                "metadata": { "name": "web", "namespace": "apps" },
+                                "spec": {
+                                    "tls": [{ "hosts": ["ingress.example.internal"], "secretName": "ingress-tls-secret" }]
+                                }
+                            }]
+                        }"#,
+                        ));
+                    }
+                    if raw_path == "/apis/apisix.apache.org/v2/apisixtlses" {
+                        return Ok(ok_output(
+                            r#"{
+                            "items": [{
+                                "metadata": { "name": "apisix-gateway-tls", "namespace": "platform-system" },
+                                "spec": {
+                                    "snis": ["apisix.example.internal"],
+                                    "secret": { "name": "apisix-gateway-tls-secret", "namespace": "platform-system" }
+                                }
+                            }]
+                        }"#,
+                        ));
+                    }
+                    // Both secrets hold byte-identical ca.crt content (e.g. the same
+                    // cert-manager ClusterIssuer backing both resources).
+                    if raw_path == "/api/v1/namespaces/apps/secrets/ingress-tls-secret"
+                        || raw_path
+                            == "/api/v1/namespaces/platform-system/secrets/apisix-gateway-tls-secret"
+                    {
+                        let ca_crt_b64 = BASE64_STANDARD.encode(TEST_CA_PEM.as_bytes());
+                        return Ok(ok_output(&format!(
+                            r#"{{"data": {{"ca.crt": "{ca_crt_b64}", "tls.crt": "unused", "tls.key": "unused"}}}}"#
+                        )));
+                    }
+                }
+                return Ok(crate::services::process::CommandOutput {
+                    stdout: "{}".to_string(),
+                    stderr: "NotFound".to_string(),
+                    success: false,
+                });
+            }
+            if bin == "openssl" {
+                if args.contains(&"-subject".to_string()) {
+                    return Ok(ok_output("subject=CN = clusterdeck-test-ca.invalid"));
+                }
+                if args.contains(&"-enddate".to_string()) {
+                    return Ok(ok_output("notAfter=Sep 18 05:40:47 2036 GMT"));
+                }
+            }
+            Ok(crate::services::process::CommandOutput {
+                stdout: String::new(),
+                stderr: format!("unexpected command: {bin}"),
+                success: false,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn discover_cluster_cas_collapses_different_secrets_sharing_one_fingerprint() {
+        let endpoints = vec![
+            DiscoveredEndpoint {
+                host: "ingress.example.internal".to_string(),
+                ip: "192.168.77.10".to_string(),
+                source: "ingress".to_string(),
+                resource_name: "apps/web".to_string(),
+            },
+            DiscoveredEndpoint {
+                host: "apisix.example.internal".to_string(),
+                ip: "192.168.77.200".to_string(),
+                source: "apisix".to_string(),
+                resource_name: "platform-system/argocd".to_string(),
+            },
+        ];
+        let temp_kc = std::env::temp_dir().join("test-ca-trust-dummy-kc-fp-collapse.yaml");
+        let _ = std::fs::write(&temp_kc, "dummy");
+
+        let result = discover_cluster_cas(
+            &FakeSameFingerprintDifferentSecretsRunner,
+            &temp_kc,
+            &endpoints,
+        )
+        .await
+        .unwrap();
+        let _ = std::fs::remove_file(&temp_kc);
+
+        // apps/ingress-tls-secret and platform-system/apisix-gateway-tls-secret are two
+        // distinct secret refs -- proving this collapse is NOT just the existing pre-fetch
+        // (namespace, name) dedup -- but their ca.crt is byte-identical, so the post-fetch
+        // fingerprint pass must collapse them into a single row with both source_hosts merged.
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result[0].meta.fingerprint_sha256,
+            "8b75bf97e19ce7efe9bb4d6c76b4f10e072a9d6ea89d8f438f423afea7156246"
+        );
+        assert_eq!(result[0].source_hosts.len(), 2);
+        assert!(result[0]
+            .source_hosts
+            .contains(&"ingress.example.internal".to_string()));
+        assert!(result[0]
+            .source_hosts
+            .contains(&"apisix.example.internal".to_string()));
     }
 
     #[tokio::test]
