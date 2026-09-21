@@ -128,6 +128,7 @@ mod tests {
             bootstrap: BootstrapPolicy::default(),
             kubeconfig: None,
             manage_hosts_file: false,
+            trusted_cas: Vec::new(),
         };
         assert!(validate_profile(&profile).is_err());
 
@@ -158,6 +159,7 @@ mod tests {
             bootstrap: BootstrapPolicy::default(),
             kubeconfig: None,
             manage_hosts_file: false,
+            trusted_cas: Vec::new(),
         };
         assert!(validate_profile(&valid_profile).is_ok());
 

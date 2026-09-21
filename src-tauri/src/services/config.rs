@@ -12,6 +12,8 @@ pub struct Profile {
     pub kubeconfig: Option<KubeconfigSource>,
     #[serde(default)]
     pub manage_hosts_file: bool,
+    #[serde(default)]
+    pub trusted_cas: Vec<crate::services::ca_trust::TrustedCa>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

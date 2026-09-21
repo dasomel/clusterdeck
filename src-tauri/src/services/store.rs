@@ -25,6 +25,8 @@ struct ProfileBody {
     kubeconfig: Option<KubeconfigSource>,
     #[serde(default)]
     manage_hosts_file: bool,
+    #[serde(default)]
+    trusted_cas: Vec<crate::services::ca_trust::TrustedCa>,
 }
 
 pub fn load_profiles(paths: &ClusterDeckPaths) -> Result<Vec<Profile>, String> {
@@ -46,6 +48,7 @@ pub fn load_profiles(paths: &ClusterDeckPaths) -> Result<Vec<Profile>, String> {
                 bootstrap: body.bootstrap,
                 kubeconfig: body.kubeconfig,
                 manage_hosts_file: body.manage_hosts_file,
+                trusted_cas: body.trusted_cas,
             };
             match crate::services::validate::validate_profile(&profile) {
                 Ok(()) => Some(profile),
@@ -79,6 +82,7 @@ pub fn save_profiles(paths: &ClusterDeckPaths, profiles: &[Profile]) -> Result<(
                 bootstrap: p.bootstrap.clone(),
                 kubeconfig: p.kubeconfig.clone(),
                 manage_hosts_file: p.manage_hosts_file,
+                trusted_cas: p.trusted_cas.clone(),
             },
         );
     }
@@ -150,6 +154,7 @@ mod tests {
             bootstrap: BootstrapPolicy::default(),
             kubeconfig: None,
             manage_hosts_file: true,
+            trusted_cas: Vec::new(),
         };
         upsert_profile(&paths, profile.clone()).unwrap();
         let loaded = get_profile(&paths, "cka").unwrap();
@@ -169,6 +174,7 @@ mod tests {
             bootstrap: BootstrapPolicy::default(),
             kubeconfig: None,
             manage_hosts_file: false,
+            trusted_cas: Vec::new(),
         };
         upsert_profile(&paths, profile).unwrap();
         delete_profile(&paths, "x").unwrap();
@@ -214,7 +220,55 @@ profiles:
             bootstrap: BootstrapPolicy::default(),
             kubeconfig: None,
             manage_hosts_file: false,
+            trusted_cas: Vec::new(),
         };
         assert!(upsert_profile(&paths, profile).is_err());
+    }
+
+    #[test]
+    fn upsert_then_load_roundtrips_trusted_cas() {
+        let paths = temp_paths("trusted-cas-roundtrip");
+        let profile = Profile {
+            id: "cka".into(),
+            name: "CKA Lab".into(),
+            hosts: vec![],
+            bastion: None,
+            bootstrap: BootstrapPolicy::default(),
+            kubeconfig: None,
+            manage_hosts_file: false,
+            trusted_cas: vec![crate::services::ca_trust::TrustedCa {
+                secret_ref: "platform-system/apisix-gateway-tls-secret".into(),
+                fingerprint_sha256:
+                    "8b75bf97e19ce7efe9bb4d6c76b4f10e072a9d6ea89d8f438f423afea7156246".into(),
+                fingerprint_sha1: "67fc8cc8df72476829ecd88d188331a6d29baabb".into(),
+                subject_cn: "clusterdeck-test-ca.invalid".into(),
+                not_after: "Sep 18 05:40:47 2036 GMT".into(),
+                trusted_at: "2026-09-21T00:00:00+00:00".into(),
+            }],
+        };
+        upsert_profile(&paths, profile.clone()).unwrap();
+        let loaded = get_profile(&paths, "cka").unwrap();
+        assert_eq!(loaded.trusted_cas.len(), 1);
+        assert_eq!(loaded.trusted_cas[0], profile.trusted_cas[0]);
+    }
+
+    #[test]
+    fn load_profiles_defaults_trusted_cas_when_field_absent_from_yaml() {
+        let paths = temp_paths("trusted-cas-default");
+        if let Some(parent) = paths.profiles_file().parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        // Simulates a profiles.yaml written before this field existed.
+        let yaml = r#"
+profiles:
+  legacy:
+    name: "Legacy"
+    hosts: []
+    manage_hosts_file: false
+"#;
+        std::fs::write(paths.profiles_file(), yaml).unwrap();
+        let loaded = load_profiles(&paths).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].trusted_cas.len(), 0);
     }
 }

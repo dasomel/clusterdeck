@@ -340,6 +340,7 @@ export default function ProfileEditor({ initial, onClose, onSaved, onDeleteReque
           }
         : null,
       manage_hosts_file: manageHostsFile,
+      trusted_cas: initial?.trusted_cas ?? [],
     };
 
     try {

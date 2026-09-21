@@ -18,7 +18,7 @@ pub struct DiscoveredEndpoint {
     pub resource_name: String, // e.g. "analytics/trino"
 }
 
-fn decode_base64(input: &str) -> Option<Vec<u8>> {
+pub(crate) fn decode_base64(input: &str) -> Option<Vec<u8>> {
     use base64::prelude::*;
     let clean: String = input.chars().filter(|c| !c.is_whitespace()).collect();
     BASE64_STANDARD.decode(clean).ok()
@@ -66,14 +66,14 @@ pub async fn query_k8s_api_json(
 /// timestamp, so concurrent callers (e.g. discover_cluster_endpoints's tokio::join! queries,
 /// or verify running alongside discovery) never collide on the same file name even when the
 /// clock tick is coarser than actual concurrency.
-static TEMP_FILE_SEQ: AtomicU64 = AtomicU64::new(0);
+pub(crate) static TEMP_FILE_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Creates `path` with owner-only (0600) permissions and writes `contents` to it in one step,
 /// so the file (a decoded TLS client certificate or private key) never exists at the default,
 /// world-readable permissions even momentarily -- unlike a create-then-chmod sequence, which
 /// leaves that window open. Mirrors the temp-file idiom in kubeconfig.rs.
 #[cfg(unix)]
-fn write_owner_only_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_owner_only_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     use std::fs::OpenOptions;
     use std::io::Write;
     OpenOptions::new()
@@ -85,7 +85,7 @@ fn write_owner_only_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
 }
 
 #[cfg(not(unix))]
-fn write_owner_only_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_owner_only_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     std::fs::write(path, contents)
 }
 
