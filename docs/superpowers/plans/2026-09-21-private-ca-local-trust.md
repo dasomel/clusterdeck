@@ -567,7 +567,7 @@ Add to `mod tests`:
             "items": [{
                 "metadata": { "name": "apisix-gateway-tls", "namespace": "platform-system" },
                 "spec": {
-                    "snis": ["*.local.beluga.internal", "local.beluga.internal"],
+                    "hosts": ["*.local.beluga.internal", "local.beluga.internal"],
                     "secret": { "name": "apisix-gateway-tls-secret", "namespace": "platform-system" }
                 }
             }]
@@ -581,7 +581,7 @@ Add to `mod tests`:
     }
 ```
 
-Note: these fixture shapes are independently confirmed against a real cluster (`kubectl get apisixtls -A -o jsonpath=...` was run against a live cert-manager + APISIX ingress-controller install during design) — `spec.snis` (not `spec.hosts`) and `spec.secret.{name,namespace}` are the real `ApisixTls` CRD field names.
+**CORRECTION (post-implementation, 2026-09-21):** this note originally claimed "`spec.snis` (not `spec.hosts`)" — that was backwards. The real `ApisixTls` CRD field is `spec.hosts`; `kubectl get apisixtls`'s table view merely *labels* that column "SNIS" (a CRD `additionalPrinterColumns` display name), which does not reflect the actual JSON field. This error was caught only after full implementation and review, when the feature shipped and silently found zero CAs on the real cluster — no task-level or security review caught it because the test fixtures above were written against the same wrong assumption, so implementation and tests agreed with each other while both being wrong. Root-caused and fixed directly in `resolve_apisixtls_secret_ref` (`services/ca_trust.rs`) and every fixture using this key, verified against the real cluster's raw API response before and after the fix. Left here uncorrected-in-place (rather than silently rewritten) as a record of the mistake for anyone reading this plan later.
 
 - [ ] **Step 2: Run, verify compile failure**
 
@@ -654,11 +654,14 @@ pub fn resolve_apisixtls_secret_ref(apisixtls: &serde_json::Value, host: &str) -
             (Some(ns), Some(name)) => (ns, name),
             _ => continue,
         };
-        let snis = match spec.get("snis").and_then(|s| s.as_array()) {
+        // CORRECTION (post-implementation, 2026-09-21): the real ApisixTls CRD field is
+        // `spec.hosts`, not `spec.snis` as originally written here -- see the correction note
+        // after Task 4's Step 1 test above for how this was caught and confirmed.
+        let hosts = match spec.get("hosts").and_then(|s| s.as_array()) {
             Some(s) => s,
             None => continue,
         };
-        let matched = snis
+        let matched = hosts
             .iter()
             .any(|s| s.as_str().map(|s| sni_matches_host(s, host)).unwrap_or(false));
         if matched {
@@ -744,7 +747,7 @@ Add to `mod tests` (needs `use base64::prelude::*;` added to the `use super::*;`
                             "items": [{
                                 "metadata": { "name": "apisix-gateway-tls", "namespace": "platform-system" },
                                 "spec": {
-                                    "snis": ["*.local.beluga.internal", "local.beluga.internal"],
+                                    "hosts": ["*.local.beluga.internal", "local.beluga.internal"],
                                     "secret": { "name": "apisix-gateway-tls-secret", "namespace": "platform-system" }
                                 }
                             }]

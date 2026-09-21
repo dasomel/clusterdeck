@@ -213,11 +213,18 @@ pub fn resolve_apisixtls_secret_ref(
             (Some(ns), Some(name)) => (ns, name),
             _ => continue,
         };
-        let snis = match spec.get("snis").and_then(|s| s.as_array()) {
+        // The ApisixTls CRD's field is `spec.hosts` (confirmed against a live cluster's raw API
+        // response), not `spec.snis` -- `kubectl get apisixtls`'s table view labels this column
+        // "SNIS" (a CRD-defined additionalPrinterColumns display name), which does not reflect
+        // the actual JSON field name. An earlier version of this function read the wrong key
+        // and always found zero matches; discover_cluster_cas silently returned 0 CAs on every
+        // real cluster as a result -- no test caught it because the test fixtures were written
+        // against the same wrong assumption.
+        let hosts = match spec.get("hosts").and_then(|s| s.as_array()) {
             Some(s) => s,
             None => continue,
         };
-        let matched = snis.iter().any(|s| {
+        let matched = hosts.iter().any(|s| {
             s.as_str()
                 .map(|s| sni_matches_host(s, host))
                 .unwrap_or(false)
@@ -688,7 +695,7 @@ mod tests {
             "items": [{
                 "metadata": { "name": "apisix-gateway-tls", "namespace": "platform-system" },
                 "spec": {
-                    "snis": ["*.local.beluga.internal", "local.beluga.internal"],
+                    "hosts": ["*.local.beluga.internal", "local.beluga.internal"],
                     "secret": { "name": "apisix-gateway-tls-secret", "namespace": "platform-system" }
                 }
             }]
@@ -730,7 +737,7 @@ mod tests {
                             "items": [{
                                 "metadata": { "name": "apisix-gateway-tls", "namespace": "platform-system" },
                                 "spec": {
-                                    "snis": ["*.local.beluga.internal", "local.beluga.internal"],
+                                    "hosts": ["*.local.beluga.internal", "local.beluga.internal"],
                                     "secret": { "name": "apisix-gateway-tls-secret", "namespace": "platform-system" }
                                 }
                             }]
@@ -844,7 +851,7 @@ mod tests {
                             "items": [{
                                 "metadata": { "name": "apisix-gateway-tls", "namespace": "platform-system" },
                                 "spec": {
-                                    "snis": ["apisix.example.internal"],
+                                    "hosts": ["apisix.example.internal"],
                                     "secret": { "name": "apisix-gateway-tls-secret", "namespace": "platform-system" }
                                 }
                             }]
@@ -1003,14 +1010,14 @@ mod tests {
                                     {
                                         "metadata": { "name": "apisix-gateway-tls", "namespace": "platform-system" },
                                         "spec": {
-                                            "snis": ["*.local.beluga.internal"],
+                                            "hosts": ["*.local.beluga.internal"],
                                             "secret": { "name": "apisix-gateway-tls-secret", "namespace": "platform-system" }
                                         }
                                     },
                                     {
                                         "metadata": { "name": "forbidden-tls", "namespace": "restricted-ns" },
                                         "spec": {
-                                            "snis": ["forbidden.example.internal"],
+                                            "hosts": ["forbidden.example.internal"],
                                             "secret": { "name": "forbidden-secret", "namespace": "restricted-ns" }
                                         }
                                     }
