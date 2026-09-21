@@ -18,7 +18,7 @@ pub struct DiscoveredEndpoint {
     pub resource_name: String, // e.g. "analytics/trino"
 }
 
-fn decode_base64(input: &str) -> Option<Vec<u8>> {
+pub(crate) fn decode_base64(input: &str) -> Option<Vec<u8>> {
     use base64::prelude::*;
     let clean: String = input.chars().filter(|c| !c.is_whitespace()).collect();
     BASE64_STANDARD.decode(clean).ok()
