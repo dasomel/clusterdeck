@@ -314,7 +314,27 @@ The main interaction should require as few clicks as possible. Detailed configur
 - Make destructive actions explicit and reversible where possible.
 - Keep all network and filesystem operations in the Rust backend rather than the frontend.
 
-## 14. MVP Boundaries
+## 14. Local Runtime Detection (Profile Prefill)
+
+`services/local_runtime.rs` and `commands/local_runtime.rs` expose one Tauri command,
+`detect_local_hosts`, that concurrently probes Colima, Lima, and Vagrant on the local machine
+and returns a vendor-neutral `Vec<DiscoveredLocalHost>`. It is not a standing observation
+surface: it runs only when the user clicks "Detect local VM" inside the Profile editor, and
+detected hosts are held in editor component state only, never persisted, until the user applies
+a host to the in-progress form and presses Save. `Profile` gains no schema for this; a saved
+host is an ordinary SSH host entry. See [ADR-0005](adr/0005-local-host-detection-prefills-profiles.md)
+for the full design and its relationship to the earlier, differently-scoped
+[ADR-0003](adr/0003-colima-lima-local-runtime-provider.md).
+
+## 15. Kubernetes Endpoint Discovery
+
+`services/k8s_endpoints.rs` queries a profile's cluster (via `kubectl --kubeconfig` or a `curl`
+fallback) to discover reachable API endpoints exposed through APISIX, Ingress, Istio, Gateway
+API, or plain Services, for use when normalizing a fetched kubeconfig's server endpoint. TLS
+client certificate/key material extracted during this process is written to owner-only (0600)
+temporary files and unconditionally cleaned up, including on failure paths.
+
+## 16. MVP Boundaries
 
 The first implementation should focus on:
 

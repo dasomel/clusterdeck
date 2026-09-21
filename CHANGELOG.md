@@ -12,3 +12,6 @@ The format follows the principles of Keep a Changelog and uses semantic versioni
 - Add remote kubeconfig management design
 - Add Bastion/ProxyJump design
 - Add Kubernetes connectivity verification design
+- Add on-demand local VM detection (Colima/Lima/Vagrant) that prefills the Profile editor (ADR-0005)
+- Add Kubernetes API endpoint discovery (APISIX/Ingress/Istio/Gateway API/Service) for kubeconfig endpoint normalization
+- Add `StatusBanner`, `KubeconfigManager`, and `ConfirmModal` UI components

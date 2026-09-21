@@ -1,6 +1,6 @@
 # 구현 상태
 
-Last verified: 2026-09-09 against `main`
+Last verified: 2026-09-21 against `main`
 
 이 문서는 미래 product direction이 아니라 현재 default branch의 동작을 기록합니다.
 
@@ -13,6 +13,8 @@ Last verified: 2026-09-09 against `main`
 - 사용자 파일 전체를 덮어쓰지 않는 SSH config, kubeconfig state, optional `/etc/hosts` managed-file boundary.
 - `sshpass -e`/environment 처리와 private-key content를 frontend에 노출하지 않는 credential rule.
 - 향후 autonomous mutation surface에 exact resolved-operation approval을 요구하는 OpenForge reduced local-tool security profile.
+- Profile editor를 prefill하는 on-demand local VM detection(Colima/Lima/Vagrant). Detected 상태는 editor component state에만 유지되며 사용자가 profile을 저장하기 전까지 persist되지 않습니다 (ADR-0005 참조).
+- 가져온 kubeconfig의 server endpoint를 정규화하기 위한 Kubernetes API endpoint discovery(APISIX/Ingress/Istio/Gateway API/Service), 그리고 기본/kubeconfig-manager/profile-editor 화면에 노출되는 status banner UI.
 
 ## 부분적 / 환경 의존
 
@@ -33,3 +35,5 @@ Last verified: 2026-09-09 against `main`
 - `src-tauri/`
 - repository `make verify` / CI
 - PR #16 (`e7daf5bcf64786c3d253674f6f0486882d040d70`)
+- commit `d4d143a` (local runtime provider, kubeconfig endpoint fetch, status banner UI)
+- `docs/adr/0005-local-host-detection-prefills-profiles.md`

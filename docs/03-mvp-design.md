@@ -103,12 +103,19 @@ Rust is the system boundary. Frontend code must not execute SSH, SCP, kubectl, f
 commands/
   app.rs             app metadata
   profiles.rs        profile CRUD/load/save
-  connection.rs      high-level connection workflow
+  connection.rs      high-level connection workflow (SSH, kubeconfig fetch/backup/merge)
+  local_runtime.rs   detect_local_hosts (Colima/Lima/Vagrant prefill)
 
 services/
   process.rs         executable discovery + async command runner
   config.rs          Profile/Host/Bastion/kubeconfig domain types
+  local_runtime.rs   local VM detection (Colima/Lima/Vagrant) for Profile-editor prefill
+  k8s_endpoints.rs   Kubernetes API endpoint discovery (APISIX/Ingress/Istio/Gateway API/Service)
 ```
+
+The frontend adds `StatusBanner`, `KubeconfigManager`, and `ConfirmModal` components alongside
+`ProfileEditor`; see [ARCHITECTURE.md](ARCHITECTURE.md) sections 14-15 for the local runtime
+detection and Kubernetes endpoint discovery features.
 
 The existing process helper intentionally searches common macOS paths because bundled `.app` processes do not necessarily inherit the user's login-shell PATH. This follows the same defensive pattern used by KubeMetal.
 
