@@ -132,6 +132,92 @@ pub fn sni_matches_host(sni: &str, host: &str) -> bool {
     }
 }
 
+pub struct TlsSecretRef {
+    pub namespace: String,
+    pub name: String,
+}
+
+pub fn resolve_ingress_secret_ref(
+    ingresses: &serde_json::Value,
+    host: &str,
+) -> Option<TlsSecretRef> {
+    let items = ingresses.get("items")?.as_array()?;
+    for item in items {
+        let ns = match item
+            .get("metadata")
+            .and_then(|m| m.get("namespace"))
+            .and_then(|n| n.as_str())
+        {
+            Some(ns) => ns,
+            None => continue,
+        };
+        let tls_list = match item
+            .get("spec")
+            .and_then(|s| s.get("tls"))
+            .and_then(|t| t.as_array())
+        {
+            Some(list) => list,
+            None => continue,
+        };
+        for tls in tls_list {
+            let secret_name = match tls.get("secretName").and_then(|s| s.as_str()) {
+                Some(s) => s,
+                None => continue,
+            };
+            let hosts = match tls.get("hosts").and_then(|h| h.as_array()) {
+                Some(h) => h,
+                None => continue,
+            };
+            if hosts.iter().any(|h| h.as_str() == Some(host)) {
+                return Some(TlsSecretRef {
+                    namespace: ns.to_string(),
+                    name: secret_name.to_string(),
+                });
+            }
+        }
+    }
+    None
+}
+
+pub fn resolve_apisixtls_secret_ref(
+    apisixtls: &serde_json::Value,
+    host: &str,
+) -> Option<TlsSecretRef> {
+    let items = apisixtls.get("items")?.as_array()?;
+    for item in items {
+        let spec = match item.get("spec") {
+            Some(s) => s,
+            None => continue,
+        };
+        let secret = match spec.get("secret") {
+            Some(s) => s,
+            None => continue,
+        };
+        let ns = secret.get("namespace").and_then(|n| n.as_str());
+        let name = secret.get("name").and_then(|n| n.as_str());
+        let (ns, name) = match (ns, name) {
+            (Some(ns), Some(name)) => (ns, name),
+            _ => continue,
+        };
+        let snis = match spec.get("snis").and_then(|s| s.as_array()) {
+            Some(s) => s,
+            None => continue,
+        };
+        let matched = snis.iter().any(|s| {
+            s.as_str()
+                .map(|s| sni_matches_host(s, host))
+                .unwrap_or(false)
+        });
+        if matched {
+            return Some(TlsSecretRef {
+                namespace: ns.to_string(),
+                name: name.to_string(),
+            });
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -248,11 +334,69 @@ mod tests {
 
     #[test]
     fn sni_matches_host_handles_exact_and_wildcard() {
-        assert!(sni_matches_host("local.beluga.internal", "local.beluga.internal"));
-        assert!(sni_matches_host("*.local.beluga.internal", "argocd.local.beluga.internal"));
-        assert!(!sni_matches_host("*.local.beluga.internal", "local.beluga.internal"));
-        assert!(!sni_matches_host("*.local.beluga.internal", "a.b.local.beluga.internal"));
-        assert!(!sni_matches_host("*.local.beluga.internal", "evillocal.beluga.internal"));
-        assert!(!sni_matches_host("*.local.beluga.internal", "argocd.other.internal"));
+        assert!(sni_matches_host(
+            "local.beluga.internal",
+            "local.beluga.internal"
+        ));
+        assert!(sni_matches_host(
+            "*.local.beluga.internal",
+            "argocd.local.beluga.internal"
+        ));
+        assert!(!sni_matches_host(
+            "*.local.beluga.internal",
+            "local.beluga.internal"
+        ));
+        assert!(!sni_matches_host(
+            "*.local.beluga.internal",
+            "a.b.local.beluga.internal"
+        ));
+        assert!(!sni_matches_host(
+            "*.local.beluga.internal",
+            "evillocal.beluga.internal"
+        ));
+        assert!(!sni_matches_host(
+            "*.local.beluga.internal",
+            "argocd.other.internal"
+        ));
+    }
+
+    #[test]
+    fn resolve_ingress_secret_ref_matches_host_in_tls_block() {
+        let json: serde_json::Value = serde_json::from_str(
+            r#"{
+            "items": [{
+                "metadata": { "name": "web", "namespace": "apps" },
+                "spec": {
+                    "tls": [{ "hosts": ["app.example.internal"], "secretName": "web-tls" }],
+                    "rules": [{ "host": "app.example.internal" }]
+                }
+            }]
+        }"#,
+        )
+        .unwrap();
+        let found = resolve_ingress_secret_ref(&json, "app.example.internal").unwrap();
+        assert_eq!(found.namespace, "apps");
+        assert_eq!(found.name, "web-tls");
+        assert!(resolve_ingress_secret_ref(&json, "other.example.internal").is_none());
+    }
+
+    #[test]
+    fn resolve_apisixtls_secret_ref_matches_wildcard_sni() {
+        let json: serde_json::Value = serde_json::from_str(
+            r#"{
+            "items": [{
+                "metadata": { "name": "apisix-gateway-tls", "namespace": "platform-system" },
+                "spec": {
+                    "snis": ["*.local.beluga.internal", "local.beluga.internal"],
+                    "secret": { "name": "apisix-gateway-tls-secret", "namespace": "platform-system" }
+                }
+            }]
+        }"#,
+        )
+        .unwrap();
+        let found = resolve_apisixtls_secret_ref(&json, "argocd.local.beluga.internal").unwrap();
+        assert_eq!(found.namespace, "platform-system");
+        assert_eq!(found.name, "apisix-gateway-tls-secret");
+        assert!(resolve_apisixtls_secret_ref(&json, "unrelated.example.com").is_none());
     }
 }
