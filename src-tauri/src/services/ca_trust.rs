@@ -395,6 +395,11 @@ pub async fn trust_ca(runner: &dyn CommandRunner, pem: &str) -> Result<String, S
                 "add-trusted-cert".to_string(),
                 "-r".to_string(),
                 "trustRoot".to_string(),
+                // Least privilege: without -p, trustRoot applies to every policy (S/MIME,
+                // codeSign, pkgSign, timestamping, ...), not just the TLS use case this feature
+                // exists for. Scope it to SSL/TLS only.
+                "-p".to_string(),
+                "ssl".to_string(),
                 "-k".to_string(),
                 keychain_path,
                 temp_pem.to_string_lossy().to_string(),
@@ -417,7 +422,20 @@ pub async fn trust_ca(runner: &dyn CommandRunner, pem: &str) -> Result<String, S
 }
 
 pub async fn untrust_ca(runner: &dyn CommandRunner, fingerprint_sha1: &str) -> Result<(), String> {
+    // Defensive re-check at this sink: fingerprint_sha1 will later (Task 9) be sourced from a
+    // stored Profile record (profiles.yaml), not only from trust_ca's own return value, so its
+    // shape is validated here before it reaches the security(1) argv, per AGENTS.md's
+    // "re-check defensively at the sink" rule.
+    if fingerprint_sha1.len() != 40 || !fingerprint_sha1.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!("invalid SHA-1 fingerprint: {fingerprint_sha1}"));
+    }
     let keychain_path = resolve_login_keychain_path(runner).await?;
+    // `delete-certificate`'s synopsis is `[-h] [-c name] [-Z hash] [-t] [keychain...]` -- the
+    // keychain is a trailing POSITIONAL argument, there is no `-k` flag (that flag exists only
+    // on `add-trusted-cert`, where it means something different: which keychain a *new*
+    // certificate item is stored in). Passing `-k` here does not silently no-op -- `security`
+    // treats it as an unrecognized option and the whole subcommand fails, so untrust_ca would
+    // always return Err. Verified against `man security` (delete-certificate section) directly.
     let output = runner
         .run(
             "security",
@@ -426,7 +444,6 @@ pub async fn untrust_ca(runner: &dyn CommandRunner, fingerprint_sha1: &str) -> R
                 "-Z".to_string(),
                 fingerprint_sha1.to_string(),
                 "-t".to_string(),
-                "-k".to_string(),
                 keychain_path,
             ],
         )
@@ -970,14 +987,27 @@ mod tests {
                 bin == "security" && args.first().map(String::as_str) == Some("add-trusted-cert")
             })
             .expect("add-trusted-cert should have been called");
-        assert!(add_call.1.contains(&"-r".to_string()));
-        assert!(add_call.1.contains(&"trustRoot".to_string()));
-        assert!(add_call
-            .1
-            .contains(&"/Users/m/Library/Keychains/login.keychain-db".to_string()));
-        let temp_path = add_call.1.last().unwrap();
+        // Full exact-match, not `.contains()` on individual flags: a subset check would have
+        // silently passed even with an invalid flag mixed in (this is exactly how a real bug
+        // shipped during this task's review -- `.contains()` checks can't see the argv also
+        // contained something that shouldn't be there, only that a specific expected element
+        // is present somewhere in it).
+        let temp_path = add_call.1.last().unwrap().clone();
+        assert_eq!(
+            add_call.1,
+            vec![
+                "add-trusted-cert".to_string(),
+                "-r".to_string(),
+                "trustRoot".to_string(),
+                "-p".to_string(),
+                "ssl".to_string(),
+                "-k".to_string(),
+                "/Users/m/Library/Keychains/login.keychain-db".to_string(),
+                temp_path.clone(),
+            ]
+        );
         assert!(
-            !Path::new(temp_path).exists(),
+            !Path::new(&temp_path).exists(),
             "temp PEM file must be cleaned up after trust_ca returns"
         );
     }
@@ -1081,11 +1111,41 @@ mod tests {
                 bin == "security" && args.first().map(String::as_str) == Some("delete-certificate")
             })
             .expect("delete-certificate should have been called");
-        assert!(delete_call.1.contains(&"-Z".to_string()));
-        assert!(delete_call
-            .1
-            .contains(&"67fc8cc8df72476829ecd88d188331a6d29baabb".to_string()));
-        assert!(delete_call.1.contains(&"-t".to_string()));
+        // Full exact-match (see the same note in trust_ca's argv test above).
+        assert_eq!(
+            delete_call.1,
+            vec![
+                "delete-certificate".to_string(),
+                "-Z".to_string(),
+                "67fc8cc8df72476829ecd88d188331a6d29baabb".to_string(),
+                "-t".to_string(),
+                "/Users/m/Library/Keychains/login.keychain-db".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn untrust_ca_rejects_malformed_fingerprint_before_running_any_command() {
+        struct UnusedRunner;
+        #[async_trait::async_trait]
+        impl CommandRunner for UnusedRunner {
+            async fn run(
+                &self,
+                _bin: &str,
+                _args: &[String],
+            ) -> Result<crate::services::process::CommandOutput, String> {
+                panic!("should not be called -- validation must reject before any command runs");
+            }
+        }
+        assert!(untrust_ca(&UnusedRunner, "not-a-fingerprint")
+            .await
+            .is_err());
+        assert!(untrust_ca(&UnusedRunner, "").await.is_err());
+        assert!(
+            untrust_ca(&UnusedRunner, "67fc8cc8df72476829ecd88d188331a6d29baa")
+                .await
+                .is_err()
+        ); // 39 chars, one short
     }
 
     // Manual-only: `security add-trusted-cert` blocks on a GUI authorization prompt even for a
@@ -1100,6 +1160,13 @@ mod tests {
         let runner = SystemRunner;
         let test_keychain = std::env::temp_dir().join("clusterdeck-ca-trust-test.keychain-db");
         let temp_pem = std::env::temp_dir().join("clusterdeck-ca-trust-test.pem");
+        // `-o` below redirects add-trusted-cert's TRUST SETTING write to this throwaway file.
+        // Without it, the trust setting itself (as opposed to the certificate item, which `-k`
+        // scopes) is written to the developer's real user trust domain regardless of which
+        // keychain `-k` names -- `man security`'s add-trusted-cert section: "-o settingsFileOut
+        // Output trust settings file; default is user domain." This is what makes the test
+        // actually safe to run against the developer's own login session.
+        let throwaway_trust_settings = std::env::temp_dir().join("clusterdeck-ca-trust-test.plist");
         let _ = std::fs::remove_file(&test_keychain);
         write_owner_only_file(&temp_pem, TEST_CA_PEM.as_bytes()).unwrap();
 
@@ -1115,7 +1182,6 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(create.success, "create-keychain failed: {}", create.stderr);
 
         let add = runner
             .run(
@@ -1124,6 +1190,8 @@ mod tests {
                     "add-trusted-cert".to_string(),
                     "-k".to_string(),
                     test_keychain.to_string_lossy().to_string(),
+                    "-o".to_string(),
+                    throwaway_trust_settings.to_string_lossy().to_string(),
                     "-r".to_string(),
                     "trustRoot".to_string(),
                     temp_pem.to_string_lossy().to_string(),
@@ -1131,7 +1199,6 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(add.success, "add-trusted-cert failed: {}", add.stderr);
 
         let find = runner
             .run(
@@ -1145,11 +1212,9 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(
-            find.success,
-            "the trusted cert should be findable by its CN"
-        );
 
+        // `delete-certificate`'s keychain argument is positional -- there is no `-k` flag (see
+        // untrust_ca's own comment above; this test hit the identical bug once).
         let delete = runner
             .run(
                 "security",
@@ -1158,19 +1223,18 @@ mod tests {
                     "-Z".to_string(),
                     "67fc8cc8df72476829ecd88d188331a6d29baabb".to_string(),
                     "-t".to_string(),
-                    "-k".to_string(),
                     test_keychain.to_string_lossy().to_string(),
                 ],
             )
             .await
             .unwrap();
-        assert!(
-            delete.success,
-            "delete-certificate failed: {}",
-            delete.stderr
-        );
 
+        // Cleanup runs unconditionally, BEFORE any assertion below can panic -- a failed
+        // assertion must never skip removing the throwaway keychain/files (an earlier version
+        // of this test put cleanup after the asserts, so a failure would leave the throwaway
+        // keychain, temp PEM, and a trust-setting file behind for a human to clean up by hand).
         let _ = std::fs::remove_file(&temp_pem);
+        let _ = std::fs::remove_file(&throwaway_trust_settings);
         let _ = runner
             .run(
                 "security",
@@ -1180,5 +1244,17 @@ mod tests {
                 ],
             )
             .await;
+
+        assert!(create.success, "create-keychain failed: {}", create.stderr);
+        assert!(add.success, "add-trusted-cert failed: {}", add.stderr);
+        assert!(
+            find.success,
+            "the trusted cert should be findable by its CN"
+        );
+        assert!(
+            delete.success,
+            "delete-certificate failed: {}",
+            delete.stderr
+        );
     }
 }
