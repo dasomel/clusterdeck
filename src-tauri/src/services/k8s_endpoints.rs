@@ -66,7 +66,7 @@ pub async fn query_k8s_api_json(
 /// timestamp, so concurrent callers (e.g. discover_cluster_endpoints's tokio::join! queries,
 /// or verify running alongside discovery) never collide on the same file name even when the
 /// clock tick is coarser than actual concurrency.
-static TEMP_FILE_SEQ: AtomicU64 = AtomicU64::new(0);
+pub(crate) static TEMP_FILE_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Creates `path` with owner-only (0600) permissions and writes `contents` to it in one step,
 /// so the file (a decoded TLS client certificate or private key) never exists at the default,

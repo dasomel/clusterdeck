@@ -33,8 +33,8 @@ pub fn fingerprint_hex_sha1(der: &[u8]) -> String {
     to_hex(&hasher.finalize())
 }
 
+use crate::services::k8s_endpoints::{write_owner_only_file, TEMP_FILE_SEQ};
 use crate::services::process::CommandRunner;
-use crate::services::k8s_endpoints::write_owner_only_file;
 
 fn parse_openssl_subject_cn(output: &str) -> String {
     match output.find("CN") {
@@ -61,7 +61,8 @@ pub async fn extract_cert_metadata(runner: &dyn CommandRunner, pem: &str) -> (St
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let temp_pem = std::env::temp_dir().join(format!("cd_ca_meta_{now_nanos}.pem"));
+    let seq = TEMP_FILE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let temp_pem = std::env::temp_dir().join(format!("cd_ca_meta_{now_nanos}_{seq}.pem"));
 
     if write_owner_only_file(&temp_pem, pem.as_bytes()).is_err() {
         return (String::new(), String::new());
