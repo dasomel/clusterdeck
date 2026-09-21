@@ -21,5 +21,8 @@ The format follows the principles of Keep a Changelog and uses semantic versioni
 - Add CA trust removal from the endpoints view and a cross-profile Trusted CAs list in Settings
 - Add CA/leaf certificate health warnings (missing `serverAuth` EKU, expiry, SAN coverage, CA structural validity) surfaced per discovered CA
 - Fix kubeconfig fetch to read over SSH exec instead of shelling out to `scp`, closing a temp-file permission window (#23)
-- Finish local runtime discovery dashboard: architecture/CPU/memory/disk display and Docker context association for Colima/Lima instances (#14 Phase 1)
+- Finish local runtime discovery dashboard: architecture/CPU/memory/disk display and Docker context association for Colima/Lima instances, surfaced in Settings (#14 Phase 1)
 - Re-verify the `clusterdeck-connection-workflow` Agent Skill via real-target fresh-session replay (#22)
+- Fix a false-positive CA/leaf certificate expiry warning when `openssl` fails for a reason unrelated to genuine expiry (#25)
+- Fix TLS certificate verification being disabled on the curl Kubernetes API fallback path (#24)
+- Add a GitHub Actions release workflow that builds a macOS `.dmg` and creates a draft GitHub Release on `v*` tag push
