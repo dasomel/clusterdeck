@@ -1798,6 +1798,8 @@ git commit -m "feat(ca-trust): compute New/Trusted/Rotated status against stored
 
 Note: this codebase has **no unit tests under `src-tauri/src/commands/`** — every existing command file (`connection.rs`, `profiles.rs`, etc.) is untested glue over a tested `services/` layer, verified by `cargo build`/`cargo clippy` plus manual app verification. This task follows that same convention; all the real logic it calls was already TDD'd in Tasks 1-8.
 
+**Important — read before implementing:** `replace_ca_cmd`'s body below does two things an earlier draft of this plan got wrong — validate cheap preconditions (`split_secret_ref`, kubeconfig existence) *before* the destructive `untrust_ca` call, and clean up the stale `trusted_cas` record if the subsequent `trust_ca_cmd` call fails after the old cert was already untrusted. Without the cleanup, a failure there (e.g. the user dismisses the macOS auth prompt on the new cert, or the cluster becomes unreachable mid-replace) would leave `profile.trusted_cas` still holding the old record — the next discover would report a false `"trusted"` status for a CA that's actually no longer in the keychain. Transcribe the corrected ordering/cleanup below, not just the two-line "untrust then trust" shape you might expect from the Interfaces summary above.
+
 **Interfaces:**
 - Consumes: `ca_trust::{discover_cluster_cas, compute_trust_status, fetch_ca, trust_ca, untrust_ca, CaTrustStatus, TrustedCa}` (Tasks 5, 6, 8); `k8s_endpoints::DiscoveredEndpoint`; `store::{get_profile, upsert_profile}`; `paths::ClusterDeckPaths`; `process::SystemRunner`
 - Produces (Tauri commands, callable from the frontend): `discover_cluster_cas_cmd(profile_id: String, endpoints: Vec<DiscoveredEndpoint>) -> Result<Vec<DiscoveredCaView>, String>`, `trust_ca_cmd(profile_id: String, secret_ref: String) -> Result<TrustedCa, String>`, `replace_ca_cmd(profile_id: String, secret_ref: String) -> Result<TrustedCa, String>`
@@ -1909,6 +1911,14 @@ pub async fn replace_ca_cmd(profile_id: String, secret_ref: String) -> Result<Tr
     let profile = store::get_profile(&paths, &profile_id)?;
     let runner = SystemRunner;
 
+    // Validate preconditions before the destructive untrust step below, so the common
+    // not-connected / malformed-secret-ref case never removes the old trust entry for nothing.
+    split_secret_ref(&secret_ref)?;
+    let kubeconfig_path = paths.kubeconfig_file(&profile_id);
+    if !kubeconfig_path.exists() {
+        return Err("kubeconfig not found for profile; please connect first".to_string());
+    }
+
     if let Some(old) = profile
         .trusted_cas
         .iter()
@@ -1919,7 +1929,20 @@ pub async fn replace_ca_cmd(profile_id: String, secret_ref: String) -> Result<Tr
         let _ = ca_trust::untrust_ca(&runner, &old.fingerprint_sha1).await;
     }
 
-    trust_ca_cmd(profile_id, secret_ref).await
+    match trust_ca_cmd(profile_id.clone(), secret_ref.clone()).await {
+        Ok(record) => Ok(record),
+        Err(e) => {
+            // The old cert may already be out of the keychain (untrust above) while the new
+            // one failed to go in -- keeping the stale record would report a false "trusted"
+            // status on the next discover. Drop it so the CA correctly shows as untrusted
+            // again rather than lying about its state.
+            if let Ok(mut profile) = store::get_profile(&paths, &profile_id) {
+                profile.trusted_cas.retain(|c| c.secret_ref != secret_ref);
+                let _ = store::upsert_profile(&paths, profile);
+            }
+            Err(e)
+        }
+    }
 }
 ```
 
