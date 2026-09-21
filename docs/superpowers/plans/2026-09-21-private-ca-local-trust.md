@@ -2226,7 +2226,8 @@ In `src/App.tsx`, immediately after the `discoverEndpoints` function's closing `
     if (!selected) return;
     setCaActionBusy(true);
     try {
-      if (target.status === 'rotated') {
+      const wasRotated = target.status === 'rotated';
+      if (wasRotated) {
         await api.replaceCa(selected.id, target.secret_ref);
       } else {
         await api.trustCa(selected.id, target.secret_ref);
@@ -2234,14 +2235,22 @@ In `src/App.tsx`, immediately after the `discoverEndpoints` function's closing `
       setCaActionTarget(null);
       setStatusMessage({
         type: 'success',
-        title: 'CA Trusted',
+        title: wasRotated ? 'CA Trust Updated' : 'CA Trusted',
         details: [
           `${target.subject_cn || target.secret_ref} is now trusted for ${target.source_hosts.length} host(s). Safari/Chrome will stop warning on them.`,
         ],
         time: new Date().toLocaleTimeString(),
       });
-      const cas = await api.discoverClusterCas(selected.id, lastResult?.endpoints ?? []);
-      setCaViews(cas);
+      // Isolated from the mutation above, same reasoning as discoverEndpoints's CA overlay:
+      // the trust/replace call already succeeded and the success banner above is already
+      // queued -- a failure refreshing the status list here must not downgrade that into a
+      // reported failure. Worst case the row just stays stale until the next manual scan.
+      try {
+        const cas = await api.discoverClusterCas(selected.id, lastResult?.endpoints ?? []);
+        setCaViews(cas);
+      } catch {
+        // best-effort refresh only
+      }
     } catch (err) {
       setStatusMessage({
         type: 'error',
