@@ -72,6 +72,7 @@ export type DiscoveredCaView = {
   not_after: string;
   fingerprint_sha256: string;
   status: CaTrustStatus;
+  warnings: string[];
 };
 
 export type TrustedCa = {

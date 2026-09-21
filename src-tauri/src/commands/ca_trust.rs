@@ -13,6 +13,7 @@ pub struct DiscoveredCaView {
     pub not_after: String,
     pub fingerprint_sha256: String,
     pub status: String, // "new" | "trusted" | "rotated"
+    pub warnings: Vec<String>,
 }
 
 fn status_str(status: &CaTrustStatus) -> String {
@@ -58,6 +59,7 @@ pub async fn discover_cluster_cas_cmd(
                 not_after: d.meta.not_after,
                 fingerprint_sha256: d.meta.fingerprint_sha256,
                 status: status_str(&status),
+                warnings: d.meta.warnings,
             }
         })
         .collect())

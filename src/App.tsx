@@ -1021,6 +1021,19 @@ export default function App() {
                           <div className="host-address">
                             {ca.source_hosts.length} host(s) &middot; expires {ca.not_after || 'unknown'}
                           </div>
+                          {ca.warnings.length > 0 && (
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: '2px', marginTop: '4px' }}>
+                              {ca.warnings.map((warning, idx) => (
+                                <div
+                                  key={idx}
+                                  style={{ display: 'flex', alignItems: 'flex-start', gap: '4px', fontSize: '11px', color: 'var(--warning)' }}
+                                >
+                                  <CircleAlert size={12} style={{ flexShrink: 0, marginTop: '1px' }} />
+                                  <span>{warning}</span>
+                                </div>
+                              ))}
+                            </div>
+                          )}
                         </div>
                         <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
                           {ca.status !== 'trusted' && (
