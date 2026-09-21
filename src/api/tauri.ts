@@ -37,6 +37,7 @@ export type Profile = {
   bootstrap: BootstrapPolicy;
   kubeconfig: KubeconfigSource | null;
   manage_hosts_file: boolean;
+  trusted_cas: TrustedCa[];
 };
 
 export type HostStageResult = { host: string; reachable: boolean; detail: string };
@@ -60,6 +61,26 @@ export type DiscoveredEndpoint = {
   ip: string;
   source: string;
   resource_name: string;
+};
+
+export type CaTrustStatus = 'new' | 'trusted' | 'rotated';
+
+export type DiscoveredCaView = {
+  secret_ref: string;
+  source_hosts: string[];
+  subject_cn: string;
+  not_after: string;
+  fingerprint_sha256: string;
+  status: CaTrustStatus;
+};
+
+export type TrustedCa = {
+  secret_ref: string;
+  fingerprint_sha256: string;
+  fingerprint_sha1: string;
+  subject_cn: string;
+  not_after: string;
+  trusted_at: string;
 };
 
 export type ConnectionResult = {
@@ -204,5 +225,11 @@ export const api = {
     invoke<SyncHostsResult>('remove_hosts_file_cmd', { profileId }),
   openUrlInBrowser: (url: string) =>
     invoke<void>('open_url_in_browser', { url }),
+  discoverClusterCas: (profileId: string, endpoints: DiscoveredEndpoint[]) =>
+    invoke<DiscoveredCaView[]>('discover_cluster_cas_cmd', { profileId, endpoints }),
+  trustCa: (profileId: string, secretRef: string) =>
+    invoke<TrustedCa>('trust_ca_cmd', { profileId, secretRef }),
+  replaceCa: (profileId: string, secretRef: string) =>
+    invoke<TrustedCa>('replace_ca_cmd', { profileId, secretRef }),
 };
 
