@@ -158,13 +158,6 @@ pub fn normalize_with_host(
     serde_yaml::to_string(&val).map_err(|e| format!("Failed to serialize normalized YAML: {e}"))
 }
 
-struct TempFileCleaner<'a>(&'a std::path::Path);
-impl<'a> Drop for TempFileCleaner<'a> {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(self.0);
-    }
-}
-
 async fn fetch_remote_kubeconfig_content(
     runner: &dyn CommandRunner,
     paths: &ClusterDeckPaths,
@@ -175,51 +168,8 @@ async fn fetch_remote_kubeconfig_content(
     let alias = crate::services::ssh_config::ssh_alias(&profile.id, &host.name);
     let ssh_conf_path = paths.ssh_conf(&profile.id);
 
-    // 1. First, attempt scp with the configured path
-    let tmp_filename = format!("clusterdeck-kc-{}-{}.tmp", profile.id, std::process::id());
-    let tmp_path = std::env::temp_dir().join(tmp_filename);
-    let _cleaner = TempFileCleaner(&tmp_path);
-
-    let scp_args = vec![
-        "-F".to_string(),
-        ssh_conf_path.to_string_lossy().to_string(),
-        format!("{alias}:{configured_path}"),
-        tmp_path.to_string_lossy().to_string(),
-    ];
-
-    #[cfg(unix)]
-    {
-        use std::fs::OpenOptions;
-        let _ = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp_path);
-    }
-
-    let scp_output = crate::services::ssh::run_with_host_key_retry(
-        runner,
-        "scp",
-        &scp_args,
-        &[],
-        host,
-        profile.bastion.as_ref(),
-    )
-    .await;
-
-    if let Ok(ref out) = scp_output {
-        if out.success {
-            if let Ok(content) = std::fs::read_to_string(&tmp_path) {
-                if is_valid_kubeconfig_yaml(&content) {
-                    return Ok(content);
-                }
-            }
-        }
-    }
-
-    // 2. If scp failed (permission denied on 0600 root files, or path not found),
-    // probe candidate paths via SSH using sudo cat / cat
+    // Read candidate paths over SSH so the local destination is never exposed to a
+    // transfer-completion permission race.
     let mut candidates = vec![configured_path];
     for p in CANDIDATE_KUBECONFIG_PATHS {
         if !candidates.contains(&p) {
@@ -229,8 +179,7 @@ async fn fetch_remote_kubeconfig_content(
 
     let mut last_ssh_err = String::new();
     for candidate in candidates {
-        let read_cmd =
-            format!("sudo cat '{candidate}' 2>/dev/null || cat '{candidate}' 2>/dev/null");
+        let read_cmd = format!("sudo cat '{candidate}' 2>/dev/null || cat '{candidate}'");
         let ssh_args = vec![
             "-F".to_string(),
             ssh_conf_path.to_string_lossy().to_string(),
@@ -266,19 +215,8 @@ async fn fetch_remote_kubeconfig_content(
         }
     }
 
-    let scp_err = match scp_output {
-        Ok(out) => {
-            if !out.stderr.is_empty() {
-                out.stderr
-            } else {
-                out.stdout
-            }
-        }
-        Err(e) => e,
-    };
-
     Err(format!(
-        "kubeconfig fetch failed: scp error: {scp_err}; ssh probe error: {last_ssh_err}"
+        "kubeconfig fetch failed: ssh probe error: {last_ssh_err}"
     ))
 }
 
@@ -1234,32 +1172,21 @@ mod tests {
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    struct FakeScpRunner {
-        should_succeed: bool,
+    struct FakeSshRunner {
         sample_yaml: String,
-        scp_called: AtomicBool,
+        ssh_called: AtomicBool,
     }
 
     #[async_trait]
-    impl CommandRunner for FakeScpRunner {
-        async fn run(&self, bin: &str, args: &[String]) -> Result<CommandOutput, String> {
-            if bin == "scp" {
-                self.scp_called.store(true, Ordering::SeqCst);
-                if self.should_succeed {
-                    let dest = args.last().unwrap();
-                    std::fs::write(dest, &self.sample_yaml).unwrap();
-                    return Ok(CommandOutput {
-                        stdout: String::new(),
-                        stderr: String::new(),
-                        success: true,
-                    });
-                } else {
-                    return Ok(CommandOutput {
-                        stdout: String::new(),
-                        stderr: "Permission denied (publickey)".to_string(),
-                        success: false,
-                    });
-                }
+    impl CommandRunner for FakeSshRunner {
+        async fn run(&self, bin: &str, _args: &[String]) -> Result<CommandOutput, String> {
+            if bin == "ssh" {
+                self.ssh_called.store(true, Ordering::SeqCst);
+                return Ok(CommandOutput {
+                    stdout: self.sample_yaml.clone(),
+                    stderr: String::new(),
+                    success: true,
+                });
             }
             Err(format!("unexpected command {bin}"))
         }
@@ -1347,16 +1274,15 @@ users:
             trusted_cas: Vec::new(),
         };
 
-        let runner = FakeScpRunner {
-            should_succeed: true,
+        let runner = FakeSshRunner {
             sample_yaml: SAMPLE.to_string(),
-            scp_called: AtomicBool::new(false),
+            ssh_called: AtomicBool::new(false),
         };
 
         let summary = fetch_and_store(&runner, &paths, &profile).await.unwrap();
         assert_eq!(summary.cluster_name, "cka");
         assert_eq!(summary.context_name, "cka");
-        assert!(runner.scp_called.load(Ordering::SeqCst));
+        assert!(runner.ssh_called.load(Ordering::SeqCst));
 
         let stored_yaml = std::fs::read_to_string(paths.kubeconfig_file("cka")).unwrap();
         let value: serde_yaml::Value = serde_yaml::from_str(&stored_yaml).unwrap();
@@ -1394,10 +1320,9 @@ users:
             trusted_cas: Vec::new(),
         };
 
-        let runner = FakeScpRunner {
-            should_succeed: true,
+        let runner = FakeSshRunner {
             sample_yaml: SAMPLE.to_string(),
-            scp_called: AtomicBool::new(false),
+            ssh_called: AtomicBool::new(false),
         };
 
         fetch_and_store(&runner, &paths, &profile).await.unwrap();
@@ -1434,42 +1359,14 @@ users:
         );
     }
 
-    struct FakeFallbackRunner {
-        sample_yaml: String,
-        ssh_called: AtomicBool,
-    }
-
-    #[async_trait]
-    impl CommandRunner for FakeFallbackRunner {
-        async fn run(&self, bin: &str, _args: &[String]) -> Result<CommandOutput, String> {
-            if bin == "scp" {
-                // scp fails e.g. permission denied on root 0600 file
-                Ok(CommandOutput {
-                    stdout: String::new(),
-                    stderr: "remote open: Permission denied".to_string(),
-                    success: false,
-                })
-            } else if bin == "ssh" {
-                self.ssh_called.store(true, Ordering::SeqCst);
-                Ok(CommandOutput {
-                    stdout: self.sample_yaml.clone(),
-                    stderr: String::new(),
-                    success: true,
-                })
-            } else {
-                Err(format!("unexpected command {bin}"))
-            }
-        }
-    }
-
     #[tokio::test]
-    async fn fetch_and_store_falls_back_to_ssh_when_scp_fails() {
+    async fn fetch_and_store_probes_later_candidate_when_configured_path_fails() {
         let temp_dir =
             std::env::temp_dir().join(format!("clusterdeck-kc-fallback-{}", std::process::id()));
         let paths = ClusterDeckPaths::at(temp_dir.clone());
         let profile = Profile {
-            id: "fallback-test".to_string(),
-            name: "Fallback Test".to_string(),
+            id: "candidate-test".to_string(),
+            name: "Candidate Test".to_string(),
             hosts: vec![Host {
                 name: "m1".to_string(),
                 address: "192.0.2.10".to_string(),
@@ -1480,27 +1377,62 @@ users:
             bastion: None,
             bootstrap: BootstrapPolicy::default(),
             kubeconfig: Some(KubeconfigSource {
-                remote_path: "/etc/kubernetes/admin.conf".to_string(),
+                remote_path: "/missing/config".to_string(),
                 control_plane: "m1".to_string(),
                 local_path: "".to_string(),
-                context: "fallback-test".to_string(),
+                context: "candidate-test".to_string(),
             }),
             manage_hosts_file: false,
             trusted_cas: Vec::new(),
         };
 
-        let runner = FakeFallbackRunner {
+        struct CandidateRunner {
+            successful_candidate: &'static str,
+            sample_yaml: String,
+            probed_paths: std::sync::Mutex<Vec<String>>,
+        }
+
+        #[async_trait]
+        impl CommandRunner for CandidateRunner {
+            async fn run(&self, bin: &str, args: &[String]) -> Result<CommandOutput, String> {
+                if bin != "ssh" {
+                    return Err(format!("unexpected command {bin}"));
+                }
+                let command = args.last().expect("ssh command argument");
+                self.probed_paths.lock().unwrap().push(command.clone());
+                let success = command.contains(self.successful_candidate);
+                Ok(CommandOutput {
+                    stdout: if success {
+                        self.sample_yaml.clone()
+                    } else {
+                        String::new()
+                    },
+                    stderr: if success {
+                        String::new()
+                    } else {
+                        "cat: /missing/config: No such file or directory".to_string()
+                    },
+                    success,
+                })
+            }
+        }
+
+        let runner = CandidateRunner {
+            successful_candidate: "/etc/rancher/k3s/k3s.yaml",
             sample_yaml: SAMPLE.to_string(),
-            ssh_called: AtomicBool::new(false),
+            probed_paths: std::sync::Mutex::new(Vec::new()),
         };
 
         let summary = fetch_and_store(&runner, &paths, &profile).await.unwrap();
-        assert_eq!(summary.cluster_name, "fallback-test");
-        assert!(runner.ssh_called.load(Ordering::SeqCst));
+        assert_eq!(summary.cluster_name, "candidate-test");
+        let probed_paths = runner.probed_paths.lock().unwrap();
+        assert_eq!(probed_paths.len(), 2);
+        assert!(probed_paths[0].contains("/missing/config"));
+        assert!(probed_paths[1].contains("/etc/rancher/k3s/k3s.yaml"));
 
-        let stored_yaml = std::fs::read_to_string(paths.kubeconfig_file("fallback-test")).unwrap();
+        let stored_yaml = std::fs::read_to_string(paths.kubeconfig_file("candidate-test")).unwrap();
         let value: serde_yaml::Value = serde_yaml::from_str(&stored_yaml).unwrap();
-        assert_eq!(value["current-context"].as_str().unwrap(), "fallback-test");
+        assert_eq!(value["current-context"].as_str().unwrap(), "candidate-test");
 
         std::fs::remove_dir_all(&temp_dir).ok();
     }

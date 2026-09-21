@@ -1,4 +1,4 @@
-# ADR-0004: `/etc/hosts` TOCTOU mitigation scope, and kubeconfig scp temp-file permissions deferred
+# ADR-0004: `/etc/hosts` TOCTOU mitigation scope, and kubeconfig fetch permissions
 
 - Status: Accepted
 - Date: 2026-09-17
@@ -45,12 +45,9 @@ allows as an alternative but which materially increases the risk of reintroducin
 injection into a script string already built from user-influenced profile data; that
 trade-off was rejected in favor of the safer, partial mitigation.
 
-**Problem 2 (deferred, tracked separately):** No code change. A full fix means fetching
-kubeconfigs via SSH exec + local write instead of shelling out to `scp`, so ClusterDeck
-controls the destination file's permissions directly instead of relying on `scp`'s
-behavior. That is a materially larger change than this issue's scope (it touches the
-kubeconfig fetch transport, not just a permissions call), so it is being split into its own
-follow-up issue rather than bundled here: #23.
+**Problem 2 (completed in issue #23):** Kubeconfigs are now fetched
+via SSH exec + local write instead of shelling out to `scp`, so ClusterDeck controls the
+destination file's permissions directly and no longer relies on `scp`'s behavior.
 
 ## Consequences
 
@@ -65,11 +62,9 @@ Trade-offs:
 
 - The window is narrowed, not closed, for problem 1. A determined local attacker with tight
   timing could still race the final privileged copy.
-- Problem 2 remains open; the kubeconfig temp file may briefly hold non-`0600` permissions
-  during an `scp` transfer until the SSH-exec-based rewrite ships.
+- Problem 2 is closed by issue #23's SSH-exec-based kubeconfig fetch rewrite.
 
 ## Non-goals
 
-This ADR does not decide the design of the SSH-exec-based kubeconfig fetch. That belongs to
-its own issue and, if it changes `CommandRunner` usage patterns or removes the `scp`
-dependency, its own ADR.
+The SSH-exec-based kubeconfig fetch is tracked by issue #23; this ADR records its completion
+because it closes the deferred permissions concern described above.

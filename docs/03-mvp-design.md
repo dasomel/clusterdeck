@@ -97,7 +97,7 @@ src/components/
 
 ## 5. Rust backend structure
 
-Rust is the system boundary. Frontend code must not execute SSH, SCP, kubectl, filesystem writes, or credential handling directly.
+Rust is the system boundary. Frontend code must not execute SSH, kubectl, filesystem writes, or credential handling directly.
 
 ```text
 commands/
@@ -126,7 +126,6 @@ The existing process helper intentionally searches common macOS paths because bu
 For MVP, prefer mature system tools:
 
 - `ssh`
-- `scp`
 - `ssh-copy-id` when available
 - `kubectl`
 
@@ -226,4 +225,3 @@ ClusterDeck should not copy KubeMetal-specific infrastructure logic, commands, o
 8. Implement Kubernetes verification. — implemented
 9. Add Bastion/ProxyJump workflow. — implemented
 10. Add IP discovery and richer status refresh.
-

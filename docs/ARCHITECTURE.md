@@ -42,12 +42,12 @@ The first implementation should prioritize native macOS behavior, Keychain integ
 | UI | shadcn/ui-style components | Simple, compact interface |
 | Configuration | YAML | Human-readable ClusterDeck profile definitions |
 | Local state | Files first | Keep MVP simple; evaluate SQLite later |
-| SSH | Native `ssh` / `scp` / `ssh-copy-id` first | Reuse mature OpenSSH behavior during MVP |
+| SSH | Native `ssh` / `ssh-copy-id` first | Reuse mature OpenSSH behavior during MVP |
 | Kubernetes | `kubectl` + kubeconfig parsing | Reuse the standard Kubernetes client configuration model |
 
 ### Why Rust + Tauri
 
-The product is primarily a local systems tool. Its important operations are filesystem access, SSH/SCP execution, configuration generation, kubeconfig processing, and local command execution. Tauri keeps the UI lightweight while Rust provides a strong backend boundary for privileged and security-sensitive operations.
+The product is primarily a local systems tool. Its important operations are filesystem access, SSH execution, configuration generation, kubeconfig processing, and local command execution. Tauri keeps the UI lightweight while Rust provides a strong backend boundary for privileged and security-sensitive operations.
 
 The MVP should avoid implementing a complete SSH client unless there is a concrete requirement. Existing OpenSSH commands provide mature support for keys, ProxyJump, known-host behavior, and enterprise SSH configurations.
 
@@ -75,7 +75,7 @@ The MVP should avoid implementing a complete SSH client unless there is a concre
                 │               │
         ┌───────▼──────┐  ┌────▼──────────┐
         │ OpenSSH      │  │ kubectl       │
-        │ ssh/scp/etc. │  │ kubeconfig    │
+        │ ssh/etc.     │  │ kubeconfig    │
         └──────────────┘  └───────────────┘
 ```
 
@@ -208,7 +208,7 @@ Profile
   ↓
 Control-plane candidate
   ↓
-SSH / SCP
+SSH exec
   ↓
 Remote kubeconfig
   ↓
@@ -224,7 +224,7 @@ The source may be a conventional path such as `/etc/kubernetes/admin.conf`, or a
 The implementation should support:
 
 - Selecting the kubeconfig source host.
-- Fetching kubeconfig over SSH/SCP.
+- Fetching kubeconfig over SSH exec.
 - Parsing and validating kubeconfig data.
 - Embedding certificate/key material when necessary.
 - Replacing loopback or internal API endpoints with a reachable endpoint when the Profile provides one.
