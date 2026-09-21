@@ -36,6 +36,7 @@ pub fn run() {
             commands::ca_trust::discover_cluster_cas_cmd,
             commands::ca_trust::trust_ca_cmd,
             commands::ca_trust::replace_ca_cmd,
+            commands::ca_trust::remove_ca_cmd,
             commands::kube_import::list_local_kube_contexts_cmd,
             commands::local_runtime::detect_local_hosts,
         ])

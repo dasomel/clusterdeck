@@ -133,3 +133,23 @@ pub async fn replace_ca_cmd(profile_id: String, secret_ref: String) -> Result<Tr
         }
     }
 }
+
+#[tauri::command]
+pub async fn remove_ca_cmd(profile_id: String, secret_ref: String) -> Result<(), String> {
+    let paths = ClusterDeckPaths::resolve()?;
+    let mut profile = store::get_profile(&paths, &profile_id)?;
+    let runner = SystemRunner;
+
+    if let Some(record) = profile
+        .trusted_cas
+        .iter()
+        .find(|c| c.secret_ref == secret_ref)
+    {
+        // Best-effort, same precedent as replace_ca_cmd: the keychain entry may already be
+        // gone (removed by hand, or by a prior operation), which must not block clearing our
+        // own bookkeeping -- the user's intent is "stop tracking this as trusted".
+        let _ = ca_trust::untrust_ca(&runner, &record.fingerprint_sha1).await;
+    }
+    profile.trusted_cas.retain(|c| c.secret_ref != secret_ref);
+    store::upsert_profile(&paths, profile)
+}
