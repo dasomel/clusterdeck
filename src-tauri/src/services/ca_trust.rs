@@ -234,6 +234,26 @@ pub struct TrustedCa {
     pub trusted_at: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CaTrustStatus {
+    New,
+    Trusted,
+    Rotated,
+}
+
+pub fn compute_trust_status(discovered: &DiscoveredCa, trusted: &[TrustedCa]) -> CaTrustStatus {
+    match trusted
+        .iter()
+        .find(|t| t.secret_ref == discovered.secret_ref)
+    {
+        None => CaTrustStatus::New,
+        Some(existing) if existing.fingerprint_sha256 == discovered.meta.fingerprint_sha256 => {
+            CaTrustStatus::Trusted
+        }
+        Some(_) => CaTrustStatus::Rotated,
+    }
+}
+
 pub struct DiscoveredCaMeta {
     pub pem: String,
     pub fingerprint_sha256: String,
@@ -1266,6 +1286,79 @@ mod tests {
             delete.success,
             "delete-certificate failed: {}",
             delete.stderr
+        );
+    }
+
+    fn sample_discovered_ca(secret_ref: &str) -> DiscoveredCa {
+        DiscoveredCa {
+            secret_ref: secret_ref.to_string(),
+            source_hosts: vec!["argocd.local.beluga.internal".to_string()],
+            meta: DiscoveredCaMeta {
+                pem: TEST_CA_PEM.to_string(),
+                fingerprint_sha256:
+                    "8b75bf97e19ce7efe9bb4d6c76b4f10e072a9d6ea89d8f438f423afea7156246".to_string(),
+                fingerprint_sha1: "67fc8cc8df72476829ecd88d188331a6d29baabb".to_string(),
+                subject_cn: "clusterdeck-test-ca.invalid".to_string(),
+                not_after: "Sep 18 05:40:47 2036 GMT".to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn compute_trust_status_transitions() {
+        let discovered = sample_discovered_ca("platform-system/apisix-gateway-tls-secret");
+
+        assert_eq!(compute_trust_status(&discovered, &[]), CaTrustStatus::New);
+
+        let matching = TrustedCa {
+            secret_ref: discovered.secret_ref.clone(),
+            fingerprint_sha256: discovered.meta.fingerprint_sha256.clone(),
+            fingerprint_sha1: discovered.meta.fingerprint_sha1.clone(),
+            subject_cn: discovered.meta.subject_cn.clone(),
+            not_after: discovered.meta.not_after.clone(),
+            trusted_at: "2026-01-01T00:00:00+00:00".to_string(),
+        };
+        assert_eq!(
+            compute_trust_status(&discovered, &[matching]),
+            CaTrustStatus::Trusted
+        );
+
+        let stale = TrustedCa {
+            secret_ref: discovered.secret_ref.clone(),
+            fingerprint_sha256: "0".repeat(64),
+            fingerprint_sha1: "0".repeat(40),
+            subject_cn: "old-ca.invalid".to_string(),
+            not_after: "Sep 18 05:40:47 2030 GMT".to_string(),
+            trusted_at: "2026-01-01T00:00:00+00:00".to_string(),
+        };
+        assert_eq!(
+            compute_trust_status(&discovered, &[stale]),
+            CaTrustStatus::Rotated
+        );
+    }
+
+    #[test]
+    fn compute_trust_status_matches_by_secret_ref_not_position() {
+        let discovered = sample_discovered_ca("ns-b/secret-b");
+        let other = TrustedCa {
+            secret_ref: "ns-a/secret-a".to_string(),
+            fingerprint_sha256: "1".repeat(64),
+            fingerprint_sha1: "1".repeat(40),
+            subject_cn: "unrelated.invalid".to_string(),
+            not_after: "Sep 18 05:40:47 2030 GMT".to_string(),
+            trusted_at: "2026-01-01T00:00:00+00:00".to_string(),
+        };
+        let matching = TrustedCa {
+            secret_ref: "ns-b/secret-b".to_string(),
+            fingerprint_sha256: discovered.meta.fingerprint_sha256.clone(),
+            fingerprint_sha1: discovered.meta.fingerprint_sha1.clone(),
+            subject_cn: discovered.meta.subject_cn.clone(),
+            not_after: discovered.meta.not_after.clone(),
+            trusted_at: "2026-01-01T00:00:00+00:00".to_string(),
+        };
+        assert_eq!(
+            compute_trust_status(&discovered, &[other, matching]),
+            CaTrustStatus::Trusted
         );
     }
 }
