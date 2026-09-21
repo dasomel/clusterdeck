@@ -14,6 +14,16 @@ The supported first-time path is development from source with Tauri. Do not trea
 
 A GitHub Actions release pipeline now exists (`.github/workflows/release.yml`): pushing a `v*` tag builds a macOS `.dmg` (ad-hoc signed — there is no Apple Developer ID certificate yet, so macOS shows an "unidentified developer" warning on first launch) and opens it as a **draft** GitHub Release. No release has been published from this pipeline yet, so packaged-app distribution is still not an established path — development from source remains how to run ClusterDeck today.
 
+## What ClusterDeck Changes on Your Mac
+
+ClusterDeck asks macOS for permission before touching anything outside its own data directory (`~/.clusterdeck/`). It never overwrites a file it doesn't own — it only ever writes inside a clearly marked block and leaves everything else in that file untouched. Specifically:
+
+- **Login Keychain (CA certificates)** — when you choose to trust a cluster's internal CA (an opt-in action per discovered endpoint, or from Settings → Trusted CAs), ClusterDeck adds that certificate to your **login keychain** (never the System keychain), scoped only to the SSL/TLS trust policy. macOS will show its own authorization prompt (password or Touch ID) each time. You can inspect what's trusted in Keychain Access.app at any time, or remove it from ClusterDeck itself (Settings → Trusted CAs, or the "Remove" action on a trusted endpoint) — both properly untrust the certificate rather than just forgetting it locally.
+- **`/etc/hosts`** — off by default, opt-in per Profile. When enabled, ClusterDeck writes cluster-internal domain entries inside a single marked block (`# >>> ClusterDeck BEGIN (profile: <id>) >>>` … `# <<< ClusterDeck END (profile: <id>) <<<`) via a macOS admin-privileged prompt. It only ever edits its own block for that profile.
+- **`~/.ssh/config`** — ClusterDeck adds one `Include ~/.clusterdeck/ssh/*.conf` line and keeps its own per-profile SSH options in that included directory, rather than writing directly into your config.
+
+If you ever want to remove everything ClusterDeck has added: untrust its CAs from Keychain Access.app (or ClusterDeck's own Settings), delete the marked block(s) from `/etc/hosts` if you opted in, remove the `Include` line from `~/.ssh/config`, and delete `~/.clusterdeck/`.
+
 ## Core Flow
 
 ```text

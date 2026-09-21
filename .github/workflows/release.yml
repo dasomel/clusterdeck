@@ -49,6 +49,24 @@ jobs:
         with:
           tagName: ${{ github.ref_name }}
           releaseName: 'ClusterDeck ${{ github.ref_name }}'
-          releaseBody: 'See CHANGELOG.md for details. Unsigned build (ad-hoc identity): macOS will show an "unidentified developer" warning on first launch -- right-click the app and choose Open, or see the README for details.'
+          releaseBody: |
+            See CHANGELOG.md for details.
+
+            **Unsigned build (ad-hoc identity):** there is no Apple Developer ID certificate for
+            this project yet, so macOS will show an "unidentified developer" warning on first
+            launch -- right-click the app and choose Open to run it anyway.
+
+            **What ClusterDeck changes on your Mac:** it asks for macOS permission before
+            touching anything outside `~/.clusterdeck/`, and only ever writes inside a clearly
+            marked block it owns.
+            - Trusting a cluster's CA adds it to your **login keychain** (never System), scoped
+              to the SSL/TLS policy only -- you'll see a macOS authorization prompt each time.
+            - `/etc/hosts` is only touched if you opt in per profile, inside one marked block per
+              profile, via an admin-privileged prompt.
+            - `~/.ssh/config` gets one `Include ~/.clusterdeck/ssh/*.conf` line; your own config
+              is never edited directly.
+
+            See the README's "What ClusterDeck Changes on Your Mac" section for how to remove
+            everything it's added.
           releaseDraft: true
           prerelease: false
