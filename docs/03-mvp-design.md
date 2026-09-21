@@ -104,13 +104,14 @@ commands/
   app.rs             app metadata
   profiles.rs        profile CRUD/load/save
   connection.rs      high-level connection workflow (SSH, kubeconfig fetch/backup/merge)
-  local_runtime.rs   detect_local_hosts (Colima/Lima/Vagrant prefill)
+  local_runtime.rs   detect_local_hosts (Colima/Lima/Vagrant: Profile prefill + Settings dashboard)
   ca_trust.rs        discover/trust/replace/remove CA trust status (private CA local trust)
 
 services/
   process.rs         executable discovery + async command runner
   config.rs          Profile/Host/Bastion/kubeconfig domain types
-  local_runtime.rs   local VM detection (Colima/Lima/Vagrant) for Profile-editor prefill
+  local_runtime.rs   local VM detection (Colima/Lima/Vagrant), incl. arch/CPU/memory/disk/Docker
+                      context, for Profile-editor prefill and the read-only Settings dashboard
   k8s_endpoints.rs   Kubernetes API endpoint discovery (APISIX/Ingress/Istio/Gateway API/Service)
   ca_trust.rs        CA discovery, fingerprinting, and macOS login-keychain trust (private CA local trust)
 ```

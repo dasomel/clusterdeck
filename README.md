@@ -12,6 +12,8 @@ ClusterDeck is an **early MVP / source-first project**. The repository currently
 
 The supported first-time path is development from source with Tauri. Do not treat packaged-app distribution, broad fleet management, or a general Kubernetes administration console as established product capabilities unless a release or repository documentation explicitly says so.
 
+A GitHub Actions release pipeline now exists (`.github/workflows/release.yml`): pushing a `v*` tag builds a macOS `.dmg` (ad-hoc signed — there is no Apple Developer ID certificate yet, so macOS shows an "unidentified developer" warning on first launch) and opens it as a **draft** GitHub Release. No release has been published from this pipeline yet, so packaged-app distribution is still not an established path — development from source remains how to run ClusterDeck today.
+
 ## Core Flow
 
 ```text

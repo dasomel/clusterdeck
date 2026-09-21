@@ -314,25 +314,34 @@ The main interaction should require as few clicks as possible. Detailed configur
 - Make destructive actions explicit and reversible where possible.
 - Keep all network and filesystem operations in the Rust backend rather than the frontend.
 
-## 14. Local Runtime Detection (Profile Prefill)
+## 14. Local Runtime Detection (Profile Prefill + Settings Dashboard)
 
 `services/local_runtime.rs` and `commands/local_runtime.rs` expose one Tauri command,
 `detect_local_hosts`, that concurrently probes Colima, Lima, and Vagrant on the local machine
-and returns a vendor-neutral `Vec<DiscoveredLocalHost>`. It is not a standing observation
-surface: it runs only when the user clicks "Detect local VM" inside the Profile editor, and
-detected hosts are held in editor component state only, never persisted, until the user applies
-a host to the in-progress form and presses Save. `Profile` gains no schema for this; a saved
-host is an ordinary SSH host entry. See [ADR-0005](adr/0005-local-host-detection-prefills-profiles.md)
-for the full design and its relationship to the earlier, differently-scoped
+and returns a vendor-neutral `Vec<DiscoveredLocalHost>` (including `arch`, `cpus`,
+`memory_bytes`, `disk_bytes`, and an associated `docker_context` where one can be resolved;
+Vagrant has no equivalent metadata and stays `None`). It is not a standing observation surface
+in the sense of a background poll, but it now has two triggers: the Profile editor calls it only
+when the user clicks "Detect local VM", and detected hosts there are held in editor component
+state only, never persisted, until the user applies a host to the in-progress form and presses
+Save (`Profile` gains no schema for this; a saved host is an ordinary SSH host entry). Settings
+(`KubeconfigManager`'s read-only "Local Runtime" section) additionally calls the same command
+on load, purely for display — its results are never persisted or offered as prefill. See
+[ADR-0005](adr/0005-local-host-detection-prefills-profiles.md) for the full prefill design and
+its relationship to the earlier, differently-scoped
 [ADR-0003](adr/0003-colima-lima-local-runtime-provider.md).
 
 ## 15. Kubernetes Endpoint Discovery
 
 `services/k8s_endpoints.rs` queries a profile's cluster (via `kubectl --kubeconfig` or a `curl`
-fallback) to discover reachable API endpoints exposed through APISIX, Ingress, Istio, Gateway
+fallback, the latter needed when `kubectl` itself fails, e.g. macOS Sequoia Local Network
+Privacy) to discover reachable API endpoints exposed through APISIX, Ingress, Istio, Gateway
 API, or plain Services, for use when normalizing a fetched kubeconfig's server endpoint. TLS
 client certificate/key material extracted during this process is written to owner-only (0600)
-temporary files and unconditionally cleaned up, including on failure paths.
+temporary files and unconditionally cleaned up, including on failure paths. The `curl` fallback
+verifies the API server's TLS certificate using `--cacert` against the kubeconfig's
+`certificate-authority-data`/`certificate-authority` when present, or curl's system trust store
+otherwise — it never passes `-k`/`--insecure`.
 
 ## 16. Private CA Local Trust
 
@@ -350,6 +359,14 @@ ever touches keychain trust entries it created itself. The endpoints view and th
 "Trusted CAs" list (`KubeconfigManager`, cross-profile) both surface trust/replace/remove actions.
 `istio`/`gateway-api`-sourced endpoints are not yet resolved (v1 gap, not a design constraint —
 see [ADR-0006](adr/0006-private-ca-local-trust.md) for the full design and security rationale).
+
+Each discovered CA also carries a `warnings: Vec<String>` computed from `openssl x509 -noout
+-text`/`-checkend` (macOS's LibreSSL has no `-ext` flag, hence text-parsing): missing `serverAuth`
+EKU, leaf/CA expiry within 14/30 days respectively (with a distinct already-expired message), a
+leaf SAN that does not cover a discovered host, and a CA that is structurally invalid (missing
+CA:TRUE or keyCertSign). A genuine `-checkend` result is always silent on stdout/stderr — only
+the exit code carries it — so a non-zero exit *with* stderr output (e.g. an unreadable temp file)
+is treated as a tooling failure rather than expiry, avoiding a prior false-positive.
 
 ## 17. MVP Boundaries
 

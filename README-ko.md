@@ -12,6 +12,8 @@ ClusterDeck은 현재 **초기 MVP / 소스 중심 프로젝트**다. 저장소�
 
 현재 신규 사용자의 기본 경로는 Tauri 기반 소스 실행이다. 패키지 앱 배포, 대규모 Fleet 관리, 일반적인 Kubernetes 관리자 콘솔 기능은 Release나 저장소 문서에서 명시적으로 검증되기 전까지 구현 완료 기능으로 간주하지 않는다.
 
+GitHub Actions release pipeline(`.github/workflows/release.yml`)이 추가되었다: `v*` tag를 push하면 macOS `.dmg`를 빌드(ad-hoc 서명 — 아직 Apple Developer ID 인증서가 없어 최초 실행 시 "unidentified developer" 경고가 표시됨)하고 **draft** GitHub Release로 연다. 이 파이프라인으로 아직 실제 Release가 게시된 적은 없으므로, 패키지 앱 배포는 여전히 확립된 경로가 아니며 현재는 소스 실행이 유일하게 지원되는 방법이다.
+
 ## 핵심 흐름
 
 ```text
