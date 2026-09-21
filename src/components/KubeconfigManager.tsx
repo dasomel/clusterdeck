@@ -27,9 +27,10 @@ import ConfirmModal from './ConfirmModal';
 type KubeconfigManagerProps = {
   onClose: () => void;
   onStatusMessage: (msg: StatusMessage) => void;
+  onCaRemoved?: (profileId: string) => void;
 };
 
-export default function KubeconfigManager({ onClose, onStatusMessage }: KubeconfigManagerProps) {
+export default function KubeconfigManager({ onClose, onStatusMessage, onCaRemoved }: KubeconfigManagerProps) {
   const [userConfig, setUserConfig] = useState<UserKubeconfigDetails | null>(null);
   const [backups, setBackups] = useState<KubeconfigBackupInfo[]>([]);
   const [managedConfigs, setManagedConfigs] = useState<ManagedProfileKubeconfig[]>([]);
@@ -344,7 +345,7 @@ export default function KubeconfigManager({ onClose, onStatusMessage }: Kubeconf
                   <button
                     type="button"
                     className="icon-button"
-                    style={{ width: '24px', height: '24px', padding: 0 }}
+                    style={{ width: '24px', height: '24px', padding: 0, color: 'var(--danger)' }}
                     title="Remove local trust"
                     onClick={() =>
                       setRemovingCa({
@@ -467,6 +468,7 @@ export default function KubeconfigManager({ onClose, onStatusMessage }: Kubeconf
                 time: new Date().toLocaleTimeString(),
               });
               reload();
+              onCaRemoved?.(removingCa.profileId);
             } catch (err) {
               onStatusMessage({
                 type: 'error',

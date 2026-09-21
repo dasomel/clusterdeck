@@ -707,6 +707,14 @@ export default function App() {
           <KubeconfigManager
             onClose={() => setKubeconfigManagerOpen(false)}
             onStatusMessage={setStatusMessage}
+            onCaRemoved={(profileId) => {
+              if (selected?.id === profileId) {
+                api
+                  .discoverClusterCas(profileId, lastResult?.endpoints ?? [])
+                  .then(setCaViews)
+                  .catch(() => setCaViews([]));
+              }
+            }}
           />
         ) : editorState.open ? (
           <ProfileEditor
