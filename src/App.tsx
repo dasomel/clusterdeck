@@ -126,7 +126,8 @@ export default function App() {
       // a successful connect into a reported error.
       try {
         setCaViews(await api.discoverClusterCas(selected.id, result.endpoints ?? []));
-      } catch {
+      } catch (caErr) {
+        console.error('[ClusterDeck] discoverClusterCas failed during connect:', caErr);
         setCaViews([]);
       }
 
@@ -275,7 +276,8 @@ export default function App() {
       // scan into a reported error -- it just means the CA summary stays empty.
       try {
         setCaViews(await api.discoverClusterCas(selected.id, eps));
-      } catch {
+      } catch (caErr) {
+        console.error('[ClusterDeck] discoverClusterCas failed during endpoint scan:', caErr);
         setCaViews([]);
       }
       setStatusMessage({
