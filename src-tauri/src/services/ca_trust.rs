@@ -112,6 +112,26 @@ pub async fn extract_cert_metadata(runner: &dyn CommandRunner, pem: &str) -> (St
     )
 }
 
+/// A wildcard SNI covers exactly one label (standard TLS cert semantics): `*.example.com`
+/// matches `foo.example.com` but not `example.com` itself or `a.b.example.com`.
+pub fn sni_matches_host(sni: &str, host: &str) -> bool {
+    if sni == host {
+        return true;
+    }
+    let suffix = match sni.strip_prefix("*.") {
+        Some(s) => s,
+        None => return false,
+    };
+    let remainder = match host.strip_suffix(suffix) {
+        Some(r) => r,
+        None => return false,
+    };
+    match remainder.strip_suffix('.') {
+        Some(label) => !label.is_empty() && !label.contains('.'),
+        None => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -224,5 +244,15 @@ mod tests {
         let (cn, not_after) = extract_cert_metadata(&FailingRunner, TEST_CA_PEM).await;
         assert_eq!(cn, "");
         assert_eq!(not_after, "");
+    }
+
+    #[test]
+    fn sni_matches_host_handles_exact_and_wildcard() {
+        assert!(sni_matches_host("local.beluga.internal", "local.beluga.internal"));
+        assert!(sni_matches_host("*.local.beluga.internal", "argocd.local.beluga.internal"));
+        assert!(!sni_matches_host("*.local.beluga.internal", "local.beluga.internal"));
+        assert!(!sni_matches_host("*.local.beluga.internal", "a.b.local.beluga.internal"));
+        assert!(!sni_matches_host("*.local.beluga.internal", "evillocal.beluga.internal"));
+        assert!(!sni_matches_host("*.local.beluga.internal", "argocd.other.internal"));
     }
 }
