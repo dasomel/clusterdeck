@@ -673,8 +673,130 @@ mod tests {
         }
         let temp_kc = std::env::temp_dir().join("test-ca-trust-dummy-kc-3.yaml");
         let _ = std::fs::write(&temp_kc, "dummy");
+
+        // Unsafe namespace, otherwise-safe name.
         let result = fetch_ca(&UnusedRunner, &temp_kc, "../../etc", "passwd").await;
-        let _ = std::fs::remove_file(&temp_kc);
         assert!(result.is_err());
+
+        // Safe namespace, unsafe name -- proves the `name` half of the `||` check is enforced
+        // independently, not merely short-circuited past because `namespace` already failed.
+        let result = fetch_ca(&UnusedRunner, &temp_kc, "default", "../../etc").await;
+        assert!(result.is_err());
+
+        let _ = std::fs::remove_file(&temp_kc);
+    }
+
+    #[tokio::test]
+    async fn discover_cluster_cas_skips_secret_fetch_failure_without_failing_the_batch() {
+        struct FakePartialFailureRunner;
+
+        #[async_trait::async_trait]
+        impl CommandRunner for FakePartialFailureRunner {
+            async fn run(
+                &self,
+                bin: &str,
+                args: &[String],
+            ) -> Result<crate::services::process::CommandOutput, String> {
+                if bin == "kubectl" {
+                    if let Some(path_idx) = args.iter().position(|a| a == "--raw") {
+                        let raw_path = &args[path_idx + 1];
+                        if raw_path == "/apis/networking.k8s.io/v1/ingresses" {
+                            return Ok(ok_output(r#"{"items": []}"#));
+                        }
+                        if raw_path == "/apis/apisix.apache.org/v2/apisixtlses" {
+                            return Ok(ok_output(
+                                r#"{
+                                "items": [
+                                    {
+                                        "metadata": { "name": "apisix-gateway-tls", "namespace": "platform-system" },
+                                        "spec": {
+                                            "snis": ["*.local.beluga.internal"],
+                                            "secret": { "name": "apisix-gateway-tls-secret", "namespace": "platform-system" }
+                                        }
+                                    },
+                                    {
+                                        "metadata": { "name": "forbidden-tls", "namespace": "restricted-ns" },
+                                        "spec": {
+                                            "snis": ["forbidden.example.internal"],
+                                            "secret": { "name": "forbidden-secret", "namespace": "restricted-ns" }
+                                        }
+                                    }
+                                ]
+                            }"#,
+                            ));
+                        }
+                        if raw_path
+                            == "/api/v1/namespaces/platform-system/secrets/apisix-gateway-tls-secret"
+                        {
+                            let ca_crt_b64 = BASE64_STANDARD.encode(TEST_CA_PEM.as_bytes());
+                            return Ok(ok_output(&format!(
+                                r#"{{"data": {{"ca.crt": "{ca_crt_b64}", "tls.crt": "unused", "tls.key": "unused"}}}}"#
+                            )));
+                        }
+                        // Simulates an RBAC-denied `kubectl get --raw` on this one secret: a
+                        // non-2xx API response, surfaced by kubectl as a failed exit status.
+                        if raw_path == "/api/v1/namespaces/restricted-ns/secrets/forbidden-secret" {
+                            return Ok(crate::services::process::CommandOutput {
+                                stdout: r#"{"code":403,"reason":"Forbidden"}"#.to_string(),
+                                stderr: "Forbidden".to_string(),
+                                success: false,
+                            });
+                        }
+                    }
+                    return Ok(crate::services::process::CommandOutput {
+                        stdout: "{}".to_string(),
+                        stderr: "NotFound".to_string(),
+                        success: false,
+                    });
+                }
+                if bin == "openssl" {
+                    if args.contains(&"-subject".to_string()) {
+                        return Ok(ok_output("subject=CN = clusterdeck-test-ca.invalid"));
+                    }
+                    if args.contains(&"-enddate".to_string()) {
+                        return Ok(ok_output("notAfter=Sep 18 05:40:47 2036 GMT"));
+                    }
+                }
+                Ok(crate::services::process::CommandOutput {
+                    stdout: String::new(),
+                    stderr: format!("unexpected command: {bin}"),
+                    success: false,
+                })
+            }
+        }
+
+        let endpoints = vec![
+            DiscoveredEndpoint {
+                host: "argocd.local.beluga.internal".to_string(),
+                ip: "192.168.77.200".to_string(),
+                source: "apisix".to_string(),
+                resource_name: "platform-system/argocd".to_string(),
+            },
+            DiscoveredEndpoint {
+                host: "forbidden.example.internal".to_string(),
+                ip: "192.168.77.201".to_string(),
+                source: "apisix".to_string(),
+                resource_name: "restricted-ns/secret-app".to_string(),
+            },
+        ];
+        let temp_kc = std::env::temp_dir().join("test-ca-trust-dummy-kc-5.yaml");
+        let _ = std::fs::write(&temp_kc, "dummy");
+
+        let result = discover_cluster_cas(&FakePartialFailureRunner, &temp_kc, &endpoints)
+            .await
+            .unwrap();
+        let _ = std::fs::remove_file(&temp_kc);
+
+        // The forbidden secret's fetch failure (`Err(_) => continue`) must not fail the whole
+        // batch -- the CA behind the still-fetchable secret is present, and only that one.
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result[0].secret_ref,
+            "platform-system/apisix-gateway-tls-secret"
+        );
+        assert_eq!(
+            result[0].source_hosts,
+            vec!["argocd.local.beluga.internal".to_string()]
+        );
     }
 }
