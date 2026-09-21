@@ -300,14 +300,21 @@ export default function App() {
       setCaActionTarget(null);
       setStatusMessage({
         type: 'success',
-        title: 'CA Trusted',
+        title: target.status === 'rotated' ? 'CA Trust Updated' : 'CA Trusted',
         details: [
           `${target.subject_cn || target.secret_ref} is now trusted for ${target.source_hosts.length} host(s). Safari/Chrome will stop warning on them.`,
         ],
         time: new Date().toLocaleTimeString(),
       });
-      const cas = await api.discoverClusterCas(selected.id, lastResult?.endpoints ?? []);
-      setCaViews(cas);
+      // Best-effort: this refresh is a nice-to-have UI sync after a successful mutation, so a
+      // failure here must not overwrite the success message just queued above with a false
+      // "CA Trust failed" -- mirrors the same pattern discoverEndpoints uses for its own
+      // best-effort CA overlay.
+      try {
+        setCaViews(await api.discoverClusterCas(selected.id, lastResult?.endpoints ?? []));
+      } catch {
+        // ignore: caViews just stays stale until the next successful scan/action
+      }
     } catch (err) {
       setStatusMessage({
         type: 'error',
@@ -483,6 +490,8 @@ export default function App() {
       if (selectedId === profile.id) {
         setSelectedId(remaining[0]?.id ?? null);
         setLastResult(null);
+        setCaViews([]);
+        setCaActionTarget(null);
       }
       setStatusMessage({
         type: 'success',
@@ -545,6 +554,8 @@ export default function App() {
                   onClick={() => {
                     setSelectedId(profile.id);
                     setLastResult(null);
+                    setCaViews([]);
+                    setCaActionTarget(null);
                     setStatusMessage(null);
                     setEditorState({ open: false, profile: null });
                   }}
@@ -552,6 +563,8 @@ export default function App() {
                     if (e.key === 'Enter' || e.key === ' ') {
                       setSelectedId(profile.id);
                       setLastResult(null);
+                      setCaViews([]);
+                      setCaActionTarget(null);
                       setStatusMessage(null);
                       setEditorState({ open: false, profile: null });
                     }
