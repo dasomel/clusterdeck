@@ -1,0 +1,54 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build macOS .dmg and create draft release
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 11.22.0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install frontend dependencies
+        run: pnpm install --no-frozen-lockfile
+
+      - name: Build and release
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Ad-hoc signing (see src-tauri/tauri.conf.json bundle.macOS.signingIdentity: "-")
+          # avoids the hard "app is damaged" Gatekeeper block on Apple Silicon. It does not
+          # remove the standard unsigned-app warning -- there is no Apple Developer ID
+          # certificate configured for this project. Document this for end users until one is.
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: 'ClusterDeck ${{ github.ref_name }}'
+          releaseBody: 'See CHANGELOG.md for details. Unsigned build (ad-hoc identity): macOS will show an "unidentified developer" warning on first launch -- right-click the app and choose Open, or see the README for details.'
+          releaseDraft: true
+          prerelease: false

@@ -25,6 +25,9 @@
     "active": true,
     "targets": ["app", "dmg"],
     "category": "DeveloperTool",
-    "shortDescription": "Switch, bootstrap, and verify Kubernetes environments on macOS"
+    "shortDescription": "Switch, bootstrap, and verify Kubernetes environments on macOS",
+    "macOS": {
+      "signingIdentity": "-"
+    }
   }
 }

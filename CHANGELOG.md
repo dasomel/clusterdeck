@@ -6,6 +6,8 @@ The format follows the principles of Keep a Changelog and uses semantic versioni
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-09-22
+
 - Initial OSS repository bootstrap
 - Define macOS-first Tauri/Rust/React architecture
 - Add multi-VM SSH bootstrap design
@@ -17,3 +19,7 @@ The format follows the principles of Keep a Changelog and uses semantic versioni
 - Add `StatusBanner`, `KubeconfigManager`, and `ConfirmModal` UI components
 - Add private cluster CA discovery and local trust via the macOS login keychain, with CA-rotation detection (ADR-0006)
 - Add CA trust removal from the endpoints view and a cross-profile Trusted CAs list in Settings
+- Add CA/leaf certificate health warnings (missing `serverAuth` EKU, expiry, SAN coverage, CA structural validity) surfaced per discovered CA
+- Fix kubeconfig fetch to read over SSH exec instead of shelling out to `scp`, closing a temp-file permission window (#23)
+- Finish local runtime discovery dashboard: architecture/CPU/memory/disk display and Docker context association for Colima/Lima instances (#14 Phase 1)
+- Re-verify the `clusterdeck-connection-workflow` Agent Skill via real-target fresh-session replay (#22)
