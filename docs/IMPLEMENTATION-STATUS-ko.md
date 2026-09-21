@@ -15,6 +15,7 @@ Last verified: 2026-09-21 against `main`
 - 향후 autonomous mutation surface에 exact resolved-operation approval을 요구하는 OpenForge reduced local-tool security profile.
 - Profile editor를 prefill하는 on-demand local VM detection(Colima/Lima/Vagrant). Detected 상태는 editor component state에만 유지되며 사용자가 profile을 저장하기 전까지 persist되지 않습니다 (ADR-0005 참조).
 - 가져온 kubeconfig의 server endpoint를 정규화하기 위한 Kubernetes API endpoint discovery(APISIX/Ingress/Istio/Gateway API/Service), 그리고 기본/kubeconfig-manager/profile-editor 화면에 노출되는 status banner UI.
+- Ingress/ApisixTls → Secret의 `ca.crt`를 discovery하여 CA별 New/Trusted/Rotated 상태를 계산하고, macOS login keychain에 대해 `security(1)`로 trust/replace/remove를 수행하며, Settings에 프로필 전체를 아우르는 Trusted CAs 목록을 제공합니다 (ADR-0006 참조).
 
 ## 부분적 / 환경 의존
 
@@ -37,3 +38,5 @@ Last verified: 2026-09-21 against `main`
 - PR #16 (`e7daf5bcf64786c3d253674f6f0486882d040d70`)
 - commit `d4d143a` (local runtime provider, kubeconfig endpoint fetch, status banner UI)
 - `docs/adr/0005-local-host-detection-prefills-profiles.md`
+- `docs/adr/0006-private-ca-local-trust.md`
+- commit `cee7aea` (private CA local trust merge) and commit `066f720` (CA remove/manage fast-follow)

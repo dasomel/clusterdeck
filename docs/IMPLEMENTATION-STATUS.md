@@ -15,6 +15,7 @@ This file records current default-branch behavior, not future product direction.
 - OpenForge reduced local-tool execution-security profile requiring exact resolved-operation approval before any future autonomous mutation surface.
 - On-demand local VM detection (Colima/Lima/Vagrant) that prefills the Profile editor form; detected state is held in editor component state only and never persisted unless the user saves the profile (see ADR-0005).
 - Kubernetes API endpoint discovery (APISIX/Ingress/Istio/Gateway API/Service) used to normalize a fetched kubeconfig's server endpoint, plus a status banner UI surfaced on the default, kubeconfig-manager, and profile-editor views.
+- Private cluster CA discovery (Ingress/ApisixTls → Secret `ca.crt`) with per-CA New/Trusted/Rotated status, trust/replace/remove actions against the macOS login keychain via `security(1)`, and a cross-profile Trusted CAs list in Settings (see ADR-0006).
 
 ## Partial / environment-dependent
 
@@ -37,3 +38,5 @@ This file records current default-branch behavior, not future product direction.
 - PR #16 (`e7daf5bcf64786c3d253674f6f0486882d040d70`)
 - commit `d4d143a` (local runtime provider, kubeconfig endpoint fetch, status banner UI)
 - `docs/adr/0005-local-host-detection-prefills-profiles.md`
+- `docs/adr/0006-private-ca-local-trust.md`
+- commit `cee7aea` (private CA local trust merge) and commit `066f720` (CA remove/manage fast-follow)

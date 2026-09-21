@@ -334,7 +334,24 @@ API, or plain Services, for use when normalizing a fetched kubeconfig's server e
 client certificate/key material extracted during this process is written to owner-only (0600)
 temporary files and unconditionally cleaned up, including on failure paths.
 
-## 16. MVP Boundaries
+## 16. Private CA Local Trust
+
+`services/ca_trust.rs` and `commands/ca_trust.rs` resolve the Kubernetes `Secret` backing a
+discovered Ingress/ApisixTls endpoint's TLS termination, fetch its `ca.crt` only (`tls.key` and
+any other Secret field are discarded server-side and never cross the Tauri IPC boundary), and
+fingerprint it natively (SHA-256/SHA-1). Each `Profile` persists a `trusted_cas` record keyed by
+the originating Secret ref; on each discovery pass the freshly-fetched CA's fingerprint is
+compared against that record to compute a `New` / `Trusted` / `Rotated` status per CA, since these
+clusters are frequently torn down and recreated with a new self-signed bootstrap CA. Trusting,
+replacing (untrust-then-trust, for a `Rotated` CA), and removing a CA all go through `security(1)`
+against the macOS **login** keychain (never System), scoped to the `ssl` policy and to that CA's
+SHA-1 fingerprint, so the user always confirms a macOS authorization prompt and ClusterDeck only
+ever touches keychain trust entries it created itself. The endpoints view and the Settings
+"Trusted CAs" list (`KubeconfigManager`, cross-profile) both surface trust/replace/remove actions.
+`istio`/`gateway-api`-sourced endpoints are not yet resolved (v1 gap, not a design constraint —
+see [ADR-0006](adr/0006-private-ca-local-trust.md) for the full design and security rationale).
+
+## 17. MVP Boundaries
 
 The first implementation should focus on:
 
