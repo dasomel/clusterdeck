@@ -1,9 +1,14 @@
 #![allow(dead_code)]
 
+use std::collections::BTreeMap;
+use std::path::Path;
+
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
 
 use crate::services::k8s_endpoints::decode_base64;
+use crate::services::k8s_endpoints::{query_k8s_api_json, DiscoveredEndpoint};
+use crate::services::validate::is_safe_host_domain;
 
 pub fn pem_to_der(pem: &str) -> Result<Vec<u8>, String> {
     let body: String = pem
@@ -218,9 +223,132 @@ pub fn resolve_apisixtls_secret_ref(
     None
 }
 
+pub struct DiscoveredCaMeta {
+    pub pem: String,
+    pub fingerprint_sha256: String,
+    pub fingerprint_sha1: String,
+    pub subject_cn: String,
+    pub not_after: String,
+}
+
+pub struct DiscoveredCa {
+    pub secret_ref: String,
+    pub source_hosts: Vec<String>,
+    pub meta: DiscoveredCaMeta,
+}
+
+pub async fn fetch_ca(
+    runner: &dyn CommandRunner,
+    kubeconfig_path: &Path,
+    namespace: &str,
+    name: &str,
+) -> Result<DiscoveredCaMeta, String> {
+    // Defensive re-check at this sink before the values reach a `kubectl get --raw` API path
+    // string, per AGENTS.md -- even though namespace/name here came from a prior cluster API
+    // response, not raw user input.
+    if !is_safe_host_domain(namespace) || !is_safe_host_domain(name) {
+        return Err(format!("unsafe secret ref: {namespace}/{name}"));
+    }
+
+    let api_path = format!("/api/v1/namespaces/{namespace}/secrets/{name}");
+    let secret_json = query_k8s_api_json(runner, kubeconfig_path, &api_path)
+        .await?
+        .ok_or_else(|| format!("secret {namespace}/{name} not found"))?;
+
+    // Block-scoped: the borrow on `secret_json` ends here, before `drop(secret_json)` below.
+    // Nothing past this point can reach `tls.key` or any other field of the Secret.
+    let pem = {
+        let ca_crt_b64 = secret_json
+            .get("data")
+            .and_then(|d| d.get("ca.crt"))
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("secret {namespace}/{name} has no ca.crt key"))?;
+        let ca_crt_bytes = decode_base64(ca_crt_b64)
+            .ok_or_else(|| format!("secret {namespace}/{name}: ca.crt is not valid base64"))?;
+        String::from_utf8(ca_crt_bytes)
+            .map_err(|_| format!("secret {namespace}/{name}: ca.crt is not valid UTF-8 PEM"))?
+    };
+    drop(secret_json);
+
+    let der = pem_to_der(&pem)?;
+    let fingerprint_sha256 = fingerprint_hex_sha256(&der);
+    let fingerprint_sha1 = fingerprint_hex_sha1(&der);
+    let (subject_cn, not_after) = extract_cert_metadata(runner, &pem).await;
+
+    Ok(DiscoveredCaMeta {
+        pem,
+        fingerprint_sha256,
+        fingerprint_sha1,
+        subject_cn,
+        not_after,
+    })
+}
+
+pub async fn discover_cluster_cas(
+    runner: &dyn CommandRunner,
+    kubeconfig_path: &Path,
+    endpoints: &[DiscoveredEndpoint],
+) -> Result<Vec<DiscoveredCa>, String> {
+    let ingress_json = query_k8s_api_json(
+        runner,
+        kubeconfig_path,
+        "/apis/networking.k8s.io/v1/ingresses",
+    )
+    .await
+    .ok()
+    .flatten();
+    let apisixtls_json = query_k8s_api_json(
+        runner,
+        kubeconfig_path,
+        "/apis/apisix.apache.org/v2/apisixtlses",
+    )
+    .await
+    .ok()
+    .flatten();
+
+    // Dedupe by (namespace, name) before fetching -- cheaper than fetching+fingerprinting
+    // every host individually, and in practice one secret backs every host behind a shared
+    // gateway (confirmed against a live cluster: 10 endpoints, 1 apisix-gateway-tls-secret).
+    let mut secret_refs: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
+    for ep in endpoints {
+        let found = match ep.source.as_str() {
+            "ingress" => ingress_json
+                .as_ref()
+                .and_then(|v| resolve_ingress_secret_ref(v, &ep.host)),
+            "apisix" => apisixtls_json
+                .as_ref()
+                .and_then(|v| resolve_apisixtls_secret_ref(v, &ep.host)),
+            // istio/gateway-api sources are deferred -- D5 in the design spec.
+            _ => None,
+        };
+        if let Some(r) = found {
+            secret_refs
+                .entry((r.namespace, r.name))
+                .or_default()
+                .push(ep.host.clone());
+        }
+    }
+
+    let mut result = Vec::new();
+    for ((namespace, name), source_hosts) in secret_refs {
+        match fetch_ca(runner, kubeconfig_path, &namespace, &name).await {
+            Ok(meta) => result.push(DiscoveredCa {
+                secret_ref: format!("{namespace}/{name}"),
+                source_hosts,
+                meta,
+            }),
+            // RBAC denial, a missing ca.crt key, or a malformed cert must not fail endpoint
+            // discovery as a whole -- skip this one secret, keep the rest.
+            Err(_) => continue,
+        }
+    }
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::prelude::*;
 
     // Locally generated throwaway self-signed cert (`openssl req -x509 -newkey rsa:2048 -nodes
     // -subj "/CN=clusterdeck-test-ca.invalid" -days 3650`) -- NOT real infrastructure data.
@@ -398,5 +526,155 @@ mod tests {
         assert_eq!(found.namespace, "platform-system");
         assert_eq!(found.name, "apisix-gateway-tls-secret");
         assert!(resolve_apisixtls_secret_ref(&json, "unrelated.example.com").is_none());
+    }
+
+    fn ok_output(stdout: &str) -> crate::services::process::CommandOutput {
+        crate::services::process::CommandOutput {
+            stdout: stdout.to_string(),
+            stderr: String::new(),
+            success: true,
+        }
+    }
+
+    struct FakeDiscoverCaRunner;
+
+    #[async_trait::async_trait]
+    impl CommandRunner for FakeDiscoverCaRunner {
+        async fn run(
+            &self,
+            bin: &str,
+            args: &[String],
+        ) -> Result<crate::services::process::CommandOutput, String> {
+            if bin == "kubectl" {
+                if let Some(path_idx) = args.iter().position(|a| a == "--raw") {
+                    let raw_path = &args[path_idx + 1];
+                    if raw_path == "/apis/networking.k8s.io/v1/ingresses" {
+                        return Ok(ok_output(r#"{"items": []}"#));
+                    }
+                    if raw_path == "/apis/apisix.apache.org/v2/apisixtlses" {
+                        return Ok(ok_output(
+                            r#"{
+                            "items": [{
+                                "metadata": { "name": "apisix-gateway-tls", "namespace": "platform-system" },
+                                "spec": {
+                                    "snis": ["*.local.beluga.internal", "local.beluga.internal"],
+                                    "secret": { "name": "apisix-gateway-tls-secret", "namespace": "platform-system" }
+                                }
+                            }]
+                        }"#,
+                        ));
+                    }
+                    if raw_path
+                        == "/api/v1/namespaces/platform-system/secrets/apisix-gateway-tls-secret"
+                    {
+                        let ca_crt_b64 = BASE64_STANDARD.encode(TEST_CA_PEM.as_bytes());
+                        return Ok(ok_output(&format!(
+                            r#"{{"data": {{"ca.crt": "{ca_crt_b64}", "tls.crt": "unused", "tls.key": "unused"}}}}"#
+                        )));
+                    }
+                }
+                return Ok(crate::services::process::CommandOutput {
+                    stdout: "{}".to_string(),
+                    stderr: "NotFound".to_string(),
+                    success: false,
+                });
+            }
+            if bin == "openssl" {
+                if args.contains(&"-subject".to_string()) {
+                    return Ok(ok_output("subject=CN = clusterdeck-test-ca.invalid"));
+                }
+                if args.contains(&"-enddate".to_string()) {
+                    return Ok(ok_output("notAfter=Sep 18 05:40:47 2036 GMT"));
+                }
+            }
+            Ok(crate::services::process::CommandOutput {
+                stdout: String::new(),
+                stderr: format!("unexpected command: {bin}"),
+                success: false,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn discover_cluster_cas_dedupes_apisix_endpoints_to_one_secret() {
+        let endpoints = vec![
+            DiscoveredEndpoint {
+                host: "argocd.local.beluga.internal".to_string(),
+                ip: "192.168.77.200".to_string(),
+                source: "apisix".to_string(),
+                resource_name: "platform-system/argocd".to_string(),
+            },
+            DiscoveredEndpoint {
+                host: "sso.local.beluga.internal".to_string(),
+                ip: "192.168.77.200".to_string(),
+                source: "apisix".to_string(),
+                resource_name: "iam/keycloak".to_string(),
+            },
+        ];
+        let temp_kc = std::env::temp_dir().join("test-ca-trust-dummy-kc.yaml");
+        let _ = std::fs::write(&temp_kc, "dummy");
+
+        let result = discover_cluster_cas(&FakeDiscoverCaRunner, &temp_kc, &endpoints)
+            .await
+            .unwrap();
+        let _ = std::fs::remove_file(&temp_kc);
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result[0].secret_ref,
+            "platform-system/apisix-gateway-tls-secret"
+        );
+        assert_eq!(result[0].source_hosts.len(), 2);
+        assert!(result[0]
+            .source_hosts
+            .contains(&"argocd.local.beluga.internal".to_string()));
+        assert!(result[0]
+            .source_hosts
+            .contains(&"sso.local.beluga.internal".to_string()));
+        assert_eq!(
+            result[0].meta.fingerprint_sha256,
+            "8b75bf97e19ce7efe9bb4d6c76b4f10e072a9d6ea89d8f438f423afea7156246"
+        );
+        assert_eq!(result[0].meta.subject_cn, "clusterdeck-test-ca.invalid");
+    }
+
+    #[tokio::test]
+    async fn fetch_ca_errors_when_secret_missing() {
+        struct EmptyRunner;
+        #[async_trait::async_trait]
+        impl CommandRunner for EmptyRunner {
+            async fn run(
+                &self,
+                _bin: &str,
+                _args: &[String],
+            ) -> Result<crate::services::process::CommandOutput, String> {
+                Ok(ok_output(r#"{"code": 404, "reason": "NotFound"}"#))
+            }
+        }
+        let temp_kc = std::env::temp_dir().join("test-ca-trust-dummy-kc-2.yaml");
+        let _ = std::fs::write(&temp_kc, "dummy");
+        let result = fetch_ca(&EmptyRunner, &temp_kc, "platform-system", "missing-secret").await;
+        let _ = std::fs::remove_file(&temp_kc);
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn fetch_ca_rejects_unsafe_namespace_or_name_before_running_any_command() {
+        struct UnusedRunner;
+        #[async_trait::async_trait]
+        impl CommandRunner for UnusedRunner {
+            async fn run(
+                &self,
+                _bin: &str,
+                _args: &[String],
+            ) -> Result<crate::services::process::CommandOutput, String> {
+                panic!("should not be called -- validation must reject before any command runs");
+            }
+        }
+        let temp_kc = std::env::temp_dir().join("test-ca-trust-dummy-kc-3.yaml");
+        let _ = std::fs::write(&temp_kc, "dummy");
+        let result = fetch_ca(&UnusedRunner, &temp_kc, "../../etc", "passwd").await;
+        let _ = std::fs::remove_file(&temp_kc);
+        assert!(result.is_err());
     }
 }
