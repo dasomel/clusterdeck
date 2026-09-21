@@ -122,6 +122,11 @@ export type DiscoveredLocalHost = {
   runtime: string | null;
   kube_context: string | null;
   kube_remote_path: string | null;
+  arch: string | null;
+  cpus: number | null;
+  memory_bytes: number | null;
+  disk_bytes: number | null;
+  docker_context: string | null;
 };
 
 export type BackupKubeconfigResult = {
@@ -235,4 +240,3 @@ export const api = {
   removeCa: (profileId: string, secretRef: string) =>
     invoke<void>('remove_ca_cmd', { profileId, secretRef }),
 };
-

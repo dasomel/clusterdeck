@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Archive, Boxes, CheckCircle2, CircleAlert, Copy, ExternalLink, FilePlus, FileText, Globe, Moon, Pencil, Plus, RefreshCw, Server, Settings, Sun, Terminal, Trash2 } from 'lucide-react';
-import { api, type ConnectionResult, type DiscoveredCaView, type HostsFileStatus, type Profile, type VerificationResult } from './api/tauri';
+import { api, type ConnectionResult, type DiscoveredCaView, type DiscoveredLocalHost, type HostsFileStatus, type Profile, type VerificationResult } from './api/tauri';
 import ProfileEditor from './components/ProfileEditor';
 import KubeconfigManager from './components/KubeconfigManager';
 import StatusBanner, { type StatusMessage } from './components/StatusBanner';
@@ -35,6 +35,8 @@ export default function App() {
   const [lastResult, setLastResult] = useState<ConnectionResult | null>(null);
   const [statusMessage, setStatusMessage] = useState<StatusMessage | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [localHosts, setLocalHosts] = useState<DiscoveredLocalHost[]>([]);
+  const [discoveringLocalHosts, setDiscoveringLocalHosts] = useState(false);
 
   const [editorState, setEditorState] = useState<{ open: boolean; profile: Profile | null }>({
     open: false,
@@ -92,7 +94,21 @@ export default function App() {
 
   useEffect(() => {
     loadProfiles();
+    void loadLocalHosts();
   }, []);
+
+  const loadLocalHosts = async () => {
+    setDiscoveringLocalHosts(true);
+    try {
+      setLocalHosts(await api.detectLocalHosts());
+    } catch {
+      setLocalHosts([]);
+    } finally {
+      setDiscoveringLocalHosts(false);
+    }
+  };
+
+  const formatBytes = (bytes: number | null) => bytes == null ? '—' : `${(bytes / (1024 ** 3)).toFixed(1)} GiB`;
 
   const loadHostsStatus = async (profileId: string) => {
     try {
@@ -774,6 +790,31 @@ export default function App() {
               <StatusBanner message={statusMessage} onDismiss={() => setStatusMessage(null)} />
             )}
 
+            <section className="panel-card" style={{ marginTop: '16px' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
+                <div>
+                  <div className="panel-title" style={{ margin: 0 }}><Server size={16} /> Local Runtime</div>
+                  <div style={{ marginTop: '4px', fontSize: '11.5px', color: 'var(--text-secondary)' }}>Read-only discovery for Colima, Lima, and Vagrant.</div>
+                </div>
+                <button type="button" className="secondary-button" style={{ width: 'auto', marginTop: 0, padding: '5px 10px', fontSize: '11px' }} onClick={loadLocalHosts} disabled={discoveringLocalHosts}>
+                  <RefreshCw size={12} className={discoveringLocalHosts ? 'spin' : ''} /> Refresh
+                </button>
+              </div>
+              {localHosts.length > 0 ? <div className="host-list">
+                {localHosts.map((host) => <div className="host-row" key={`${host.provider}-${host.instance_name}`}>
+                  <div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                      <span className="host-name mono">{host.instance_name}</span>
+                      <span className={`pill ${host.status.toLowerCase() === 'running' ? 'success' : 'warning'}`}>{host.status}</span>
+                      <span className="pill">{host.provider}</span>
+                    </div>
+                    <div className="host-address">{host.arch ?? 'arch unknown'} · {host.cpus == null ? 'CPU —' : `${host.cpus} CPU`} · {formatBytes(host.memory_bytes)} memory · {formatBytes(host.disk_bytes)} disk</div>
+                    <div className="host-address">Runtime: {host.runtime ?? '—'} · Docker: {host.docker_context ?? '—'} · Kube: {host.kube_context ?? '—'}</div>
+                  </div>
+                </div>)}
+              </div> : <div style={{ padding: '14px', borderRadius: '8px', background: 'var(--bg-sunken)', border: '1px dashed var(--border-strong)', color: 'var(--text-secondary)', fontSize: '12px', textAlign: 'center' }}>{discoveringLocalHosts ? 'Discovering local runtimes…' : 'No local runtimes discovered.'}</div>}
+            </section>
+
             <section className="grid-two">
               <div className="panel-card">
                 <div className="panel-title"><Server size={16} /> Hosts</div>
@@ -1166,4 +1207,3 @@ export default function App() {
     </div>
   );
 }
-

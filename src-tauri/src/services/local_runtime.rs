@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::Path;
 
 use crate::services::process::CommandRunner;
@@ -18,6 +19,11 @@ pub struct DiscoveredLocalHost {
     pub runtime: Option<String>,
     pub kube_context: Option<String>,
     pub kube_remote_path: Option<String>,
+    pub arch: Option<String>,
+    pub cpus: Option<u32>,
+    pub memory_bytes: Option<u64>,
+    pub disk_bytes: Option<u64>,
+    pub docker_context: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -89,9 +95,46 @@ struct ColimaListRow {
     name: String,
     status: Option<String>,
     runtime: Option<String>,
+    arch: Option<String>,
+    cpus: Option<u32>,
+    memory: Option<u64>,
+    disk: Option<u64>,
 }
 
-async fn detect_colima(runner: &dyn CommandRunner) -> Vec<DiscoveredLocalHost> {
+#[derive(Deserialize)]
+struct DockerContextRow {
+    #[serde(rename = "Name")]
+    name: String,
+}
+
+async fn detect_docker_contexts(runner: &dyn CommandRunner) -> HashSet<String> {
+    let output = match runner
+        .run(
+            "docker",
+            &[
+                "context".into(),
+                "ls".into(),
+                "--format".into(),
+                "json".into(),
+            ],
+        )
+        .await
+    {
+        Ok(res) if res.success => res.stdout,
+        _ => return HashSet::new(),
+    };
+
+    output
+        .lines()
+        .filter_map(|line| serde_json::from_str::<DockerContextRow>(line.trim()).ok())
+        .map(|row| row.name)
+        .collect()
+}
+
+async fn detect_colima(
+    runner: &dyn CommandRunner,
+    docker_contexts: &HashSet<String>,
+) -> Vec<DiscoveredLocalHost> {
     let mut out = Vec::new();
     let list_output = match runner
         .run("colima", &["list".to_string(), "--json".to_string()])
@@ -173,6 +216,15 @@ async fn detect_colima(runner: &dyn CommandRunner) -> Vec<DiscoveredLocalHost> {
             None
         };
 
+        let docker_context = {
+            let context = if entry.name == "default" {
+                "colima".to_string()
+            } else {
+                format!("colima-{}", entry.name)
+            };
+            docker_contexts.contains(&context).then_some(context)
+        };
+
         out.push(DiscoveredLocalHost {
             provider: "Colima".to_string(),
             instance_name: entry.name,
@@ -185,6 +237,11 @@ async fn detect_colima(runner: &dyn CommandRunner) -> Vec<DiscoveredLocalHost> {
             runtime: entry.runtime,
             kube_context,
             kube_remote_path,
+            arch: entry.arch,
+            cpus: entry.cpus,
+            memory_bytes: entry.memory,
+            disk_bytes: entry.disk,
+            docker_context,
         });
     }
     out
@@ -211,6 +268,10 @@ struct LimaListRow {
     #[serde(rename = "IdentityFile")]
     identity_file: Option<String>,
     config: Option<LimaConfig>,
+    arch: Option<String>,
+    cpus: Option<u32>,
+    memory: Option<u64>,
+    disk: Option<u64>,
 }
 
 async fn detect_lima(runner: &dyn CommandRunner) -> Vec<DiscoveredLocalHost> {
@@ -256,6 +317,11 @@ async fn detect_lima(runner: &dyn CommandRunner) -> Vec<DiscoveredLocalHost> {
             runtime: None,
             kube_context: None,
             kube_remote_path: None,
+            arch: entry.arch,
+            cpus: entry.cpus,
+            memory_bytes: entry.memory,
+            disk_bytes: entry.disk,
+            docker_context: None,
         });
     }
     out
@@ -722,6 +788,11 @@ async fn detect_vagrant(runner: &dyn CommandRunner) -> Vec<DiscoveredLocalHost> 
             runtime: Some(format!("vagrant ({})", entry.provider)),
             kube_context,
             kube_remote_path,
+            arch: None,
+            cpus: None,
+            memory_bytes: None,
+            disk_bytes: None,
+            docker_context: None,
         });
     }
     out
@@ -731,8 +802,9 @@ pub async fn detect_local_hosts(
     runner: &dyn CommandRunner,
 ) -> Result<Vec<DiscoveredLocalHost>, String> {
     // Colima, Lima, and Vagrant detection are independent of each other - run concurrently.
+    let docker_contexts = detect_docker_contexts(runner).await;
     let (colima, lima, vagrant) = tokio::join!(
-        detect_colima(runner),
+        detect_colima(runner, &docker_contexts),
         detect_lima(runner),
         detect_vagrant(runner)
     );
@@ -754,6 +826,7 @@ mod tests {
         colima_list: &'static str,
         colima_ssh: &'static str,
         lima_list: &'static str,
+        docker_contexts: &'static str,
         vagrant_status: &'static str,
         vagrant_ssh: &'static str,
         calls: Mutex<Vec<(String, Vec<String>)>>,
@@ -800,6 +873,12 @@ mod tests {
                         success: true,
                     });
                 }
+            } else if bin == "docker" {
+                return Ok(CommandOutput {
+                    stdout: self.docker_contexts.into(),
+                    stderr: String::new(),
+                    success: true,
+                });
             }
             Err(format!("unknown command {bin}"))
         }
@@ -850,7 +929,7 @@ The above shows information...
 
     #[tokio::test]
     async fn detect_local_hosts_parses_colima_lima_and_vagrant() {
-        let colima_list = r#"{"name":"default","status":"Running","runtime":"docker+k3s"}
+        let colima_list = r#"{"name":"default","status":"Running","arch":"aarch64","cpus":6,"memory":12884901888,"disk":107374182400,"runtime":"docker+k3s"}
 malformed line that must be skipped
 {"name":"other","status":"Stopped","runtime":"docker"}"#;
 
@@ -860,7 +939,9 @@ malformed line that must be skipped
   Hostname 127.0.0.1
   Port 56260"#;
 
-        let lima_list = r#"{"name":"k8s","status":"Running","sshAddress":"127.0.0.1","sshLocalPort":50326,"IdentityFile":"/path/to/lima/key","config":{"user":{"name":"limauser"}}}"#;
+        let lima_list = r#"{"name":"k8s","status":"Running","arch":"aarch64","cpus":4,"memory":4294967296,"disk":21474836480,"sshAddress":"127.0.0.1","sshLocalPort":50326,"IdentityFile":"/path/to/lima/key","config":{"user":{"name":"limauser"}}}"#;
+        let docker_contexts = r#"{"Name":"colima"}
+{"Name":"other-context"}"#;
 
         let vagrant_status = r#"
 id       name     provider       state   directory
@@ -881,6 +962,7 @@ Host master-1
             colima_list,
             colima_ssh,
             lima_list,
+            docker_contexts,
             vagrant_status,
             vagrant_ssh,
             calls: Mutex::new(Vec::new()),
@@ -897,15 +979,25 @@ Host master-1
         assert_eq!(result[0].port, 56260);
         assert_eq!(result[0].user, "testuser");
         assert_eq!(result[0].kube_context.as_deref(), Some("colima"));
+        assert_eq!(result[0].arch.as_deref(), Some("aarch64"));
+        assert_eq!(result[0].cpus, Some(6));
+        assert_eq!(result[0].memory_bytes, Some(12884901888));
+        assert_eq!(result[0].disk_bytes, Some(107374182400));
+        assert_eq!(result[0].docker_context.as_deref(), Some("colima"));
 
-        // Second Colima instance
+        // Second Colima instance: derived context "colima-other" is not in the fixture's
+        // discovered docker_contexts set ("colima", "other-context"), so it must gate to None
+        // rather than being synthesized.
         assert_eq!(result[1].provider, "Colima");
         assert_eq!(result[1].instance_name, "other");
+        assert_eq!(result[1].docker_context, None);
 
         // Lima instance
         assert_eq!(result[2].provider, "Lima");
         assert_eq!(result[2].instance_name, "k8s");
         assert_eq!(result[2].port, 50326);
+        assert_eq!(result[2].memory_bytes, Some(4294967296));
+        assert_eq!(result[2].docker_context, None);
 
         // Vagrant instance
         assert_eq!(result[3].provider, "Vagrant");
@@ -1053,12 +1145,13 @@ K8S_VERSION="1.36" # k3s channel
             colima_list,
             colima_ssh,
             lima_list: "",
+            docker_contexts: "",
             vagrant_status: "",
             vagrant_ssh: "",
             calls: Mutex::new(Vec::new()),
         };
 
-        let result = detect_colima(&runner).await;
+        let result = detect_colima(&runner, &HashSet::new()).await;
         // The hostile row is dropped; only "default" survives.
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].instance_name, "default");
@@ -1094,6 +1187,7 @@ Host master-1
             colima_list: "",
             colima_ssh: "",
             lima_list: "",
+            docker_contexts: "",
             vagrant_status,
             vagrant_ssh,
             calls: Mutex::new(Vec::new()),
