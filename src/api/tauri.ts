@@ -231,5 +231,7 @@ export const api = {
     invoke<TrustedCa>('trust_ca_cmd', { profileId, secretRef }),
   replaceCa: (profileId: string, secretRef: string) =>
     invoke<TrustedCa>('replace_ca_cmd', { profileId, secretRef }),
+  removeCa: (profileId: string, secretRef: string) =>
+    invoke<void>('remove_ca_cmd', { profileId, secretRef }),
 };
 

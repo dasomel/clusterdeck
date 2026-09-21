@@ -29,6 +29,8 @@ export default function App() {
   const [caViews, setCaViews] = useState<DiscoveredCaView[]>([]);
   const [caActionTarget, setCaActionTarget] = useState<DiscoveredCaView | null>(null);
   const [caActionBusy, setCaActionBusy] = useState(false);
+  const [caRemoveTarget, setCaRemoveTarget] = useState<DiscoveredCaView | null>(null);
+  const [caRemoveBusy, setCaRemoveBusy] = useState(false);
   const [hostsStatus, setHostsStatus] = useState<HostsFileStatus | null>(null);
   const [lastResult, setLastResult] = useState<ConnectionResult | null>(null);
   const [statusMessage, setStatusMessage] = useState<StatusMessage | null>(null);
@@ -337,6 +339,37 @@ export default function App() {
     }
   };
 
+  const executeCaRemoveAction = async (target: DiscoveredCaView) => {
+    if (!selected) return;
+    setCaRemoveBusy(true);
+    try {
+      await api.removeCa(selected.id, target.secret_ref);
+      setCaRemoveTarget(null);
+      setStatusMessage({
+        type: 'success',
+        title: 'CA Trust Removed',
+        details: [
+          `${target.subject_cn || target.secret_ref} is no longer trusted locally. You can re-trust it later if the cluster is rebuilt with a new CA.`,
+        ],
+        time: new Date().toLocaleTimeString(),
+      });
+      try {
+        setCaViews(await api.discoverClusterCas(selected.id, lastResult?.endpoints ?? []));
+      } catch {
+        // best-effort refresh only
+      }
+    } catch (err) {
+      setStatusMessage({
+        type: 'error',
+        title: 'CA Remove failed',
+        details: [String(err)],
+        time: new Date().toLocaleTimeString(),
+      });
+    } finally {
+      setCaRemoveBusy(false);
+    }
+  };
+
   const syncHosts = async () => {
     if (!selected) return;
     setSyncingHosts(true);
@@ -502,6 +535,7 @@ export default function App() {
         setLastResult(null);
         setCaViews([]);
         setCaActionTarget(null);
+        setCaRemoveTarget(null);
       }
       setStatusMessage({
         type: 'success',
@@ -566,6 +600,7 @@ export default function App() {
                     setLastResult(null);
                     setCaViews([]);
                     setCaActionTarget(null);
+                    setCaRemoveTarget(null);
                     setStatusMessage(null);
                     setEditorState({ open: false, profile: null });
                   }}
@@ -575,6 +610,7 @@ export default function App() {
                       setLastResult(null);
                       setCaViews([]);
                       setCaActionTarget(null);
+                      setCaRemoveTarget(null);
                       setStatusMessage(null);
                       setEditorState({ open: false, profile: null });
                     }
@@ -989,6 +1025,16 @@ export default function App() {
                               {ca.status === 'rotated' ? 'Update Trust' : 'Trust CA'}
                             </button>
                           )}
+                          {ca.status === 'trusted' && (
+                            <button
+                              type="button"
+                              className="secondary-button"
+                              style={{ width: 'auto', marginTop: 0, padding: '5px 10px', fontSize: '11px' }}
+                              onClick={() => setCaRemoveTarget(ca)}
+                            >
+                              Remove
+                            </button>
+                          )}
                         </div>
                       </div>
                     ))}
@@ -1078,6 +1124,21 @@ export default function App() {
           onConfirm={() => executeCaTrustAction(caActionTarget)}
           onCancel={() => {
             if (!caActionBusy) setCaActionTarget(null);
+          }}
+        />
+      )}
+
+      {caRemoveTarget && (
+        <ConfirmModal
+          title={`Remove local trust for "${caRemoveTarget.subject_cn || caRemoveTarget.secret_ref}"?`}
+          message={`This removes the CA from your login keychain and stops ClusterDeck from tracking it as trusted for ${caRemoveTarget.source_hosts.length} host(s). Safari/Chrome will warn on these hosts again until you re-trust the CA. macOS will ask you to confirm in a system dialog.`}
+          confirmLabel="Remove"
+          cancelLabel="Cancel"
+          isDanger={true}
+          busy={caRemoveBusy}
+          onConfirm={() => executeCaRemoveAction(caRemoveTarget)}
+          onCancel={() => {
+            if (!caRemoveBusy) setCaRemoveTarget(null);
           }}
         />
       )}

@@ -18,9 +18,11 @@ import {
   type KubeconfigBackupInfo,
   type KubeContextInfo,
   type ManagedProfileKubeconfig,
+  type Profile,
   type UserKubeconfigDetails,
 } from '../api/tauri';
 import { type StatusMessage } from './StatusBanner';
+import ConfirmModal from './ConfirmModal';
 
 type KubeconfigManagerProps = {
   onClose: () => void;
@@ -31,22 +33,27 @@ export default function KubeconfigManager({ onClose, onStatusMessage }: Kubeconf
   const [userConfig, setUserConfig] = useState<UserKubeconfigDetails | null>(null);
   const [backups, setBackups] = useState<KubeconfigBackupInfo[]>([]);
   const [managedConfigs, setManagedConfigs] = useState<ManagedProfileKubeconfig[]>([]);
+  const [profiles, setProfiles] = useState<Profile[]>([]);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [expandedBackups, setExpandedBackups] = useState(false);
   const [expandedManaged, setExpandedManaged] = useState(false);
+  const [expandedCas, setExpandedCas] = useState(false);
+  const [removingCa, setRemovingCa] = useState<{ profileId: string; profileName: string; secretRef: string; subjectCn: string } | null>(null);
 
   const reload = useCallback(async () => {
     setLoading(true);
     try {
-      const [config, baks, managed] = await Promise.all([
+      const [config, baks, managed, profs] = await Promise.all([
         api.getUserKubeconfigDetails(false),
         api.listKubeconfigBackups(),
         api.listManagedProfileKubeconfigs(),
+        api.listProfiles(),
       ]);
       setUserConfig(config);
       setBackups(baks);
       setManagedConfigs(managed);
+      setProfiles(profs);
     } catch (err) {
       onStatusMessage({
         type: 'error',
@@ -128,6 +135,8 @@ export default function KubeconfigManager({ onClose, onStatusMessage }: Kubeconf
     if (bytes < 1024) return `${bytes} B`;
     return `${(bytes / 1024).toFixed(1)} KB`;
   };
+
+  const allTrustedCas = profiles.flatMap((p) => p.trusted_cas.map((ca) => ({ ...ca, profileId: p.id, profileName: p.name })));
 
   if (loading) {
     return (
@@ -300,6 +309,64 @@ export default function KubeconfigManager({ onClose, onStatusMessage }: Kubeconf
         )}
       </section>
 
+      {/* Trusted CAs across all profiles */}
+      <section className="panel-card">
+        <button
+          type="button"
+          className="panel-title"
+          style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer', background: 'none', border: 'none', padding: 0, color: 'inherit', width: '100%', textAlign: 'left' }}
+          onClick={() => setExpandedCas(!expandedCas)}
+        >
+          {expandedCas ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+          <span>Trusted CAs ({allTrustedCas.length})</span>
+        </button>
+
+        {expandedCas && (
+          <div style={{ marginTop: '8px', display: 'flex', flexDirection: 'column', gap: '1px' }}>
+            {allTrustedCas.map((ca) => (
+              <div
+                key={`${ca.profileId}-${ca.secret_ref}`}
+                style={{
+                  display: 'flex',
+                  justifyContent: 'space-between',
+                  alignItems: 'center',
+                  padding: '8px 0',
+                  borderTop: '1px solid var(--border)',
+                }}
+              >
+                <div style={{ minWidth: 0, flex: 1 }}>
+                  <div style={{ fontSize: '13px', fontWeight: 500 }}>{ca.subject_cn || ca.secret_ref}</div>
+                  <div className="mono" style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '2px' }}>
+                    {ca.profileName} · expires {ca.not_after || 'unknown'} · trusted {new Date(ca.trusted_at).toLocaleDateString()}
+                  </div>
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '6px', flexShrink: 0, marginLeft: '8px' }}>
+                  <button
+                    type="button"
+                    className="icon-button"
+                    style={{ width: '24px', height: '24px', padding: 0 }}
+                    title="Remove local trust"
+                    onClick={() =>
+                      setRemovingCa({
+                        profileId: ca.profileId,
+                        profileName: ca.profileName,
+                        secretRef: ca.secret_ref,
+                        subjectCn: ca.subject_cn,
+                      })
+                    }
+                  >
+                    <Trash2 size={12} />
+                  </button>
+                </div>
+              </div>
+            ))}
+            {allTrustedCas.length === 0 && (
+              <div style={{ color: 'var(--text-tertiary)', fontSize: '12px', padding: '8px 0' }}>No CAs trusted yet</div>
+            )}
+          </div>
+        )}
+      </section>
+
       {/* Backups */}
       <section className="panel-card">
         <button
@@ -381,6 +448,37 @@ export default function KubeconfigManager({ onClose, onStatusMessage }: Kubeconf
           </div>
         )}
       </section>
+
+      {removingCa && (
+        <ConfirmModal
+          title={`Remove local trust for "${removingCa.subjectCn || removingCa.secretRef}"?`}
+          message={`This removes the CA from your login keychain for profile "${removingCa.profileName}". Safari/Chrome will warn on its hosts again until you re-trust the CA from that profile's endpoint scan.`}
+          confirmLabel="Remove"
+          cancelLabel="Cancel"
+          isDanger={true}
+          onConfirm={async () => {
+            try {
+              await api.removeCa(removingCa.profileId, removingCa.secretRef);
+              setRemovingCa(null);
+              onStatusMessage({
+                type: 'success',
+                title: 'CA Trust Removed',
+                details: [`${removingCa.subjectCn || removingCa.secretRef} removed from profile "${removingCa.profileName}".`],
+                time: new Date().toLocaleTimeString(),
+              });
+              reload();
+            } catch (err) {
+              onStatusMessage({
+                type: 'error',
+                title: 'CA Remove failed',
+                details: [String(err)],
+                time: new Date().toLocaleTimeString(),
+              });
+            }
+          }}
+          onCancel={() => setRemovingCa(null)}
+        />
+      )}
     </div>
   );
 }
