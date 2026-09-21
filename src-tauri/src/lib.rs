@@ -33,6 +33,9 @@ pub fn run() {
             commands::connection::get_hosts_file_status,
             commands::connection::remove_hosts_file_cmd,
             commands::connection::open_url_in_browser,
+            commands::ca_trust::discover_cluster_cas_cmd,
+            commands::ca_trust::trust_ca_cmd,
+            commands::ca_trust::replace_ca_cmd,
             commands::kube_import::list_local_kube_contexts_cmd,
             commands::local_runtime::detect_local_hosts,
         ])
