@@ -345,6 +345,101 @@ pub async fn discover_cluster_cas(
     Ok(result)
 }
 
+pub async fn resolve_login_keychain_path(runner: &dyn CommandRunner) -> Result<String, String> {
+    let output = runner
+        .run(
+            "security",
+            &[
+                "default-keychain".to_string(),
+                "-d".to_string(),
+                "user".to_string(),
+            ],
+        )
+        .await?;
+    if !output.success {
+        return Err(format!(
+            "security default-keychain failed: {}",
+            output.stderr
+        ));
+    }
+    let trimmed = output.stdout.trim();
+    let unquoted = trimmed
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .unwrap_or(trimmed);
+    if unquoted.is_empty() {
+        return Err("security default-keychain returned an empty path".to_string());
+    }
+    Ok(unquoted.to_string())
+}
+
+pub async fn trust_ca(runner: &dyn CommandRunner, pem: &str) -> Result<String, String> {
+    let der = pem_to_der(pem)?;
+    let fingerprint_sha1 = fingerprint_hex_sha1(&der);
+    let keychain_path = resolve_login_keychain_path(runner).await?;
+
+    let now_nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let seq = crate::services::k8s_endpoints::TEMP_FILE_SEQ
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let temp_pem = std::env::temp_dir().join(format!("cd_ca_trust_{now_nanos}_{seq}.pem"));
+    write_owner_only_file(&temp_pem, pem.as_bytes())
+        .map_err(|e| format!("failed to write temp CA file: {e}"))?;
+
+    let result = runner
+        .run(
+            "security",
+            &[
+                "add-trusted-cert".to_string(),
+                "-r".to_string(),
+                "trustRoot".to_string(),
+                "-k".to_string(),
+                keychain_path,
+                temp_pem.to_string_lossy().to_string(),
+            ],
+        )
+        .await;
+
+    // Unconditional: the temp PEM must never linger, whether add-trusted-cert succeeded,
+    // failed, or the user dismissed the macOS authorization prompt.
+    let _ = std::fs::remove_file(&temp_pem);
+
+    let output = result?;
+    if !output.success {
+        return Err(format!(
+            "security add-trusted-cert failed: {}",
+            output.stderr
+        ));
+    }
+    Ok(fingerprint_sha1)
+}
+
+pub async fn untrust_ca(runner: &dyn CommandRunner, fingerprint_sha1: &str) -> Result<(), String> {
+    let keychain_path = resolve_login_keychain_path(runner).await?;
+    let output = runner
+        .run(
+            "security",
+            &[
+                "delete-certificate".to_string(),
+                "-Z".to_string(),
+                fingerprint_sha1.to_string(),
+                "-t".to_string(),
+                "-k".to_string(),
+                keychain_path,
+            ],
+        )
+        .await?;
+    if !output.success {
+        return Err(format!(
+            "security delete-certificate failed: {}",
+            output.stderr
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -798,5 +893,292 @@ mod tests {
             result[0].source_hosts,
             vec!["argocd.local.beluga.internal".to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn resolve_login_keychain_path_strips_quotes() {
+        struct FakeSecurityRunner;
+        #[async_trait::async_trait]
+        impl CommandRunner for FakeSecurityRunner {
+            async fn run(
+                &self,
+                bin: &str,
+                args: &[String],
+            ) -> Result<crate::services::process::CommandOutput, String> {
+                assert_eq!(bin, "security");
+                assert_eq!(
+                    args,
+                    &[
+                        "default-keychain".to_string(),
+                        "-d".to_string(),
+                        "user".to_string()
+                    ]
+                );
+                Ok(ok_output(
+                    "\"/Users/m/Library/Keychains/login.keychain-db\"",
+                ))
+            }
+        }
+        let path = resolve_login_keychain_path(&FakeSecurityRunner)
+            .await
+            .unwrap();
+        assert_eq!(path, "/Users/m/Library/Keychains/login.keychain-db");
+    }
+
+    #[tokio::test]
+    async fn trust_ca_builds_expected_argv_and_cleans_up_temp_file() {
+        use std::sync::{Arc, Mutex};
+
+        #[allow(clippy::type_complexity)]
+        struct RecordingRunner {
+            calls: Arc<Mutex<Vec<(String, Vec<String>)>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl CommandRunner for RecordingRunner {
+            async fn run(
+                &self,
+                bin: &str,
+                args: &[String],
+            ) -> Result<crate::services::process::CommandOutput, String> {
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push((bin.to_string(), args.to_vec()));
+                if bin == "security" && args.first().map(String::as_str) == Some("default-keychain")
+                {
+                    return Ok(ok_output(
+                        "\"/Users/m/Library/Keychains/login.keychain-db\"",
+                    ));
+                }
+                Ok(ok_output(""))
+            }
+        }
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let runner = RecordingRunner {
+            calls: calls.clone(),
+        };
+
+        let fingerprint = trust_ca(&runner, TEST_CA_PEM).await.unwrap();
+        assert_eq!(fingerprint, "67fc8cc8df72476829ecd88d188331a6d29baabb");
+
+        let recorded = calls.lock().unwrap();
+        let add_call = recorded
+            .iter()
+            .find(|(bin, args)| {
+                bin == "security" && args.first().map(String::as_str) == Some("add-trusted-cert")
+            })
+            .expect("add-trusted-cert should have been called");
+        assert!(add_call.1.contains(&"-r".to_string()));
+        assert!(add_call.1.contains(&"trustRoot".to_string()));
+        assert!(add_call
+            .1
+            .contains(&"/Users/m/Library/Keychains/login.keychain-db".to_string()));
+        let temp_path = add_call.1.last().unwrap();
+        assert!(
+            !Path::new(temp_path).exists(),
+            "temp PEM file must be cleaned up after trust_ca returns"
+        );
+    }
+
+    #[tokio::test]
+    async fn trust_ca_cleans_up_temp_file_even_when_security_fails() {
+        use std::sync::{Arc, Mutex};
+
+        struct FailingSecurityRunner {
+            last_temp_path: Arc<Mutex<Option<String>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl CommandRunner for FailingSecurityRunner {
+            async fn run(
+                &self,
+                bin: &str,
+                args: &[String],
+            ) -> Result<crate::services::process::CommandOutput, String> {
+                if bin == "security" && args.first().map(String::as_str) == Some("default-keychain")
+                {
+                    return Ok(ok_output(
+                        "\"/Users/m/Library/Keychains/login.keychain-db\"",
+                    ));
+                }
+                if bin == "security" && args.first().map(String::as_str) == Some("add-trusted-cert")
+                {
+                    *self.last_temp_path.lock().unwrap() = args.last().cloned();
+                    return Ok(crate::services::process::CommandOutput {
+                        stdout: String::new(),
+                        stderr: "user cancelled the authorization request".to_string(),
+                        success: false,
+                    });
+                }
+                Ok(ok_output(""))
+            }
+        }
+
+        let last_temp_path = Arc::new(Mutex::new(None));
+        let runner = FailingSecurityRunner {
+            last_temp_path: last_temp_path.clone(),
+        };
+
+        let result = trust_ca(&runner, TEST_CA_PEM).await;
+        assert!(result.is_err());
+
+        let temp_path = last_temp_path
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("add-trusted-cert should have been called");
+        assert!(
+            !Path::new(&temp_path).exists(),
+            "temp PEM file must be cleaned up even on failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn untrust_ca_builds_expected_argv() {
+        use std::sync::{Arc, Mutex};
+
+        #[allow(clippy::type_complexity)]
+        struct RecordingRunner {
+            calls: Arc<Mutex<Vec<(String, Vec<String>)>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl CommandRunner for RecordingRunner {
+            async fn run(
+                &self,
+                bin: &str,
+                args: &[String],
+            ) -> Result<crate::services::process::CommandOutput, String> {
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push((bin.to_string(), args.to_vec()));
+                if bin == "security" && args.first().map(String::as_str) == Some("default-keychain")
+                {
+                    return Ok(ok_output(
+                        "\"/Users/m/Library/Keychains/login.keychain-db\"",
+                    ));
+                }
+                Ok(ok_output(""))
+            }
+        }
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let runner = RecordingRunner {
+            calls: calls.clone(),
+        };
+
+        untrust_ca(&runner, "67fc8cc8df72476829ecd88d188331a6d29baabb")
+            .await
+            .unwrap();
+
+        let recorded = calls.lock().unwrap();
+        let delete_call = recorded
+            .iter()
+            .find(|(bin, args)| {
+                bin == "security" && args.first().map(String::as_str) == Some("delete-certificate")
+            })
+            .expect("delete-certificate should have been called");
+        assert!(delete_call.1.contains(&"-Z".to_string()));
+        assert!(delete_call
+            .1
+            .contains(&"67fc8cc8df72476829ecd88d188331a6d29baabb".to_string()));
+        assert!(delete_call.1.contains(&"-t".to_string()));
+    }
+
+    // Manual-only: `security add-trusted-cert` blocks on a GUI authorization prompt even for a
+    // throwaway keychain (confirmed while writing this plan -- it hangs forever in a headless
+    // shell). Run from a real, logged-in Terminal and approve the prompt when it appears:
+    //   cargo test --lib services::ca_trust::tests::real_trust_and_untrust_cycle_on_test_keychain -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn real_trust_and_untrust_cycle_on_test_keychain() {
+        use crate::services::process::SystemRunner;
+
+        let runner = SystemRunner;
+        let test_keychain = std::env::temp_dir().join("clusterdeck-ca-trust-test.keychain-db");
+        let temp_pem = std::env::temp_dir().join("clusterdeck-ca-trust-test.pem");
+        let _ = std::fs::remove_file(&test_keychain);
+        write_owner_only_file(&temp_pem, TEST_CA_PEM.as_bytes()).unwrap();
+
+        let create = runner
+            .run(
+                "security",
+                &[
+                    "create-keychain".to_string(),
+                    "-p".to_string(),
+                    "clusterdeck-test-only".to_string(),
+                    test_keychain.to_string_lossy().to_string(),
+                ],
+            )
+            .await
+            .unwrap();
+        assert!(create.success, "create-keychain failed: {}", create.stderr);
+
+        let add = runner
+            .run(
+                "security",
+                &[
+                    "add-trusted-cert".to_string(),
+                    "-k".to_string(),
+                    test_keychain.to_string_lossy().to_string(),
+                    "-r".to_string(),
+                    "trustRoot".to_string(),
+                    temp_pem.to_string_lossy().to_string(),
+                ],
+            )
+            .await
+            .unwrap();
+        assert!(add.success, "add-trusted-cert failed: {}", add.stderr);
+
+        let find = runner
+            .run(
+                "security",
+                &[
+                    "find-certificate".to_string(),
+                    "-c".to_string(),
+                    "clusterdeck-test-ca.invalid".to_string(),
+                    test_keychain.to_string_lossy().to_string(),
+                ],
+            )
+            .await
+            .unwrap();
+        assert!(
+            find.success,
+            "the trusted cert should be findable by its CN"
+        );
+
+        let delete = runner
+            .run(
+                "security",
+                &[
+                    "delete-certificate".to_string(),
+                    "-Z".to_string(),
+                    "67fc8cc8df72476829ecd88d188331a6d29baabb".to_string(),
+                    "-t".to_string(),
+                    "-k".to_string(),
+                    test_keychain.to_string_lossy().to_string(),
+                ],
+            )
+            .await
+            .unwrap();
+        assert!(
+            delete.success,
+            "delete-certificate failed: {}",
+            delete.stderr
+        );
+
+        let _ = std::fs::remove_file(&temp_pem);
+        let _ = runner
+            .run(
+                "security",
+                &[
+                    "delete-keychain".to_string(),
+                    test_keychain.to_string_lossy().to_string(),
+                ],
+            )
+            .await;
     }
 }
