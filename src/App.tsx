@@ -122,6 +122,14 @@ export default function App() {
       setLastResult(result);
       loadHostsStatus(selected.id);
 
+      // Best-effort, same reasoning as discoverEndpoints: a CA-discovery failure must not turn
+      // a successful connect into a reported error.
+      try {
+        setCaViews(await api.discoverClusterCas(selected.id, result.endpoints ?? []));
+      } catch {
+        setCaViews([]);
+      }
+
       const failedHosts = result.hosts.filter((h) => !h.reachable);
       const hasErrors = result.errors.length > 0;
       const k8sVerified = result.verification.kubernetes;
@@ -1014,8 +1022,8 @@ export default function App() {
                             type="button"
                             className="icon-button"
                             style={{ width: '26px', height: '26px', padding: 0, display: 'inline-flex', alignItems: 'center', justifyContent: 'center' }}
-                            title={`Open http://${ep.host} in browser`}
-                            onClick={() => openUrl(`http://${ep.host}`)}
+                            title={`Open https://${ep.host} in browser`}
+                            onClick={() => openUrl(`https://${ep.host}`)}
                           >
                             <ExternalLink size={13} />
                           </button>
