@@ -6,7 +6,7 @@ compatibility: Requires the ClusterDeck checkout and project Rust/Tauri/pnpm too
 metadata:
   openforge-scope: project
   openforge-owner: dasomel/clusterdeck
-  openforge-maturity: draft
+  openforge-maturity: verified
   openforge-version: "1"
 ---
 
@@ -43,6 +43,8 @@ metadata:
 ## Verification
 
 Report static/build/unit evidence separately from real SSH/Tauri/Kubernetes evidence. `FakeRunner` proves the code path, not the behavior of an actual SSH server, known_hosts interaction, filesystem permission, or kubectl context.
+
+A fresh-session replay of this skill's Workflow against a real SSH/k3s target, including a deliberate candidate-path fallback regression, is recorded in `research/issue-22-connection-workflow-replay-2026-09-22.md`.
 
 ## Stop / Escalate When
 
