@@ -8,6 +8,7 @@ import {
   FilePlus,
   FolderOpen,
   RefreshCw,
+  Server,
   Star,
   Trash2,
   Undo2,
@@ -15,6 +16,7 @@ import {
 } from 'lucide-react';
 import {
   api,
+  type DiscoveredLocalHost,
   type KubeconfigBackupInfo,
   type KubeContextInfo,
   type ManagedProfileKubeconfig,
@@ -35,26 +37,30 @@ export default function KubeconfigManager({ onClose, onStatusMessage, onCaRemove
   const [backups, setBackups] = useState<KubeconfigBackupInfo[]>([]);
   const [managedConfigs, setManagedConfigs] = useState<ManagedProfileKubeconfig[]>([]);
   const [profiles, setProfiles] = useState<Profile[]>([]);
+  const [localHosts, setLocalHosts] = useState<DiscoveredLocalHost[]>([]);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [expandedBackups, setExpandedBackups] = useState(false);
   const [expandedManaged, setExpandedManaged] = useState(false);
   const [expandedCas, setExpandedCas] = useState(false);
+  const [expandedLocalRuntime, setExpandedLocalRuntime] = useState(false);
   const [removingCa, setRemovingCa] = useState<{ profileId: string; profileName: string; secretRef: string; subjectCn: string } | null>(null);
 
   const reload = useCallback(async () => {
     setLoading(true);
     try {
-      const [config, baks, managed, profs] = await Promise.all([
+      const [config, baks, managed, profs, hosts] = await Promise.all([
         api.getUserKubeconfigDetails(false),
         api.listKubeconfigBackups(),
         api.listManagedProfileKubeconfigs(),
         api.listProfiles(),
+        api.detectLocalHosts().catch(() => [] as DiscoveredLocalHost[]),
       ]);
       setUserConfig(config);
       setBackups(baks);
       setManagedConfigs(managed);
       setProfiles(profs);
+      setLocalHosts(hosts);
     } catch (err) {
       onStatusMessage({
         type: 'error',
@@ -136,6 +142,8 @@ export default function KubeconfigManager({ onClose, onStatusMessage, onCaRemove
     if (bytes < 1024) return `${bytes} B`;
     return `${(bytes / 1024).toFixed(1)} KB`;
   };
+
+  const formatRuntimeBytes = (bytes: number | null) => (bytes == null ? '—' : `${(bytes / 1024 ** 3).toFixed(1)} GiB`);
 
   const allTrustedCas = profiles.flatMap((p) => p.trusted_cas.map((ca) => ({ ...ca, profileId: p.id, profileName: p.name })));
 
@@ -445,6 +453,47 @@ export default function KubeconfigManager({ onClose, onStatusMessage, onCaRemove
             ))}
             {backups.length === 0 && (
               <div style={{ color: 'var(--text-tertiary)', fontSize: '12px', padding: '8px 0' }}>No backups yet</div>
+            )}
+          </div>
+        )}
+      </section>
+
+      {/* Local runtime discovery (Colima/Lima/Vagrant) */}
+      <section className="panel-card">
+        <button
+          type="button"
+          className="panel-title"
+          style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer', background: 'none', border: 'none', padding: 0, color: 'inherit', width: '100%', textAlign: 'left' }}
+          onClick={() => setExpandedLocalRuntime(!expandedLocalRuntime)}
+        >
+          {expandedLocalRuntime ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+          <Server size={14} />
+          <span>Local Runtime ({localHosts.length})</span>
+        </button>
+
+        {expandedLocalRuntime && (
+          <div style={{ marginTop: '8px' }}>
+            <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginBottom: '8px' }}>
+              Read-only discovery for Colima, Lima, and Vagrant.
+            </div>
+            {localHosts.length > 0 ? (
+              <div className="host-list">
+                {localHosts.map((host) => (
+                  <div className="host-row" key={`${host.provider}-${host.instance_name}`}>
+                    <div>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                        <span className="host-name mono">{host.instance_name}</span>
+                        <span className={`pill ${host.status.toLowerCase() === 'running' ? 'success' : 'warning'}`}>{host.status}</span>
+                        <span className="pill">{host.provider}</span>
+                      </div>
+                      <div className="host-address">{host.arch ?? 'arch unknown'} · {host.cpus == null ? 'CPU —' : `${host.cpus} CPU`} · {formatRuntimeBytes(host.memory_bytes)} memory · {formatRuntimeBytes(host.disk_bytes)} disk</div>
+                      <div className="host-address">Runtime: {host.runtime ?? '—'} · Docker: {host.docker_context ?? '—'} · Kube: {host.kube_context ?? '—'}</div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div style={{ color: 'var(--text-tertiary)', fontSize: '12px', padding: '8px 0' }}>No local runtimes discovered.</div>
             )}
           </div>
         )}
