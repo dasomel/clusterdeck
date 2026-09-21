@@ -358,15 +358,23 @@ async fn run_openssl_text(runner: &dyn CommandRunner, pem_path: &str) -> Option<
 }
 
 /// Returns `Some(true)` when the cert is still valid at least `seconds` from now (exit 0),
-/// `Some(false)` when it will have expired by then (exit 1), or `None` when openssl could not be
-/// run at all -- best-effort, same as every other check here: a tooling failure must never
-/// produce a false health warning.
+/// `Some(false)` when it will genuinely expire by then, or `None` when openssl could not run, or
+/// ran but couldn't evaluate the cert at all -- best-effort, same as every other check here: a
+/// tooling/parse failure must never be misreported as a confident "will expire" claim.
+///
+/// A bare non-zero exit is NOT by itself "will expire": verified directly against a real LibreSSL
+/// `openssl x509 -noout -checkend` (macOS system openssl -- see AGENTS.md) that a genuine
+/// checkend result, true or false, is always silent on both stdout and stderr -- only the exit
+/// code carries the answer. Every load/parse failure tried (non-PEM input, truncated PEM, missing
+/// file, an out-of-range `-checkend` argument) instead exits 1 *and* prints `"unable to load
+/// certificate"` (or, for a bad argument, `"checkend unusable: ..."`) to stderr. So exit-1-with-
+/// output means "openssl couldn't evaluate this", not "it will expire" -- treat it as `None`.
 async fn openssl_checkend(
     runner: &dyn CommandRunner,
     pem_path: &str,
     seconds: &str,
 ) -> Option<bool> {
-    runner
+    let output = runner
         .run(
             "openssl",
             &[
@@ -379,8 +387,14 @@ async fn openssl_checkend(
             ],
         )
         .await
-        .ok()
-        .map(|o| o.success)
+        .ok()?;
+    if output.success {
+        Some(true)
+    } else if output.stderr.is_empty() {
+        Some(false)
+    } else {
+        None
+    }
 }
 
 /// Leaf-cert health checks (EKU + expiry) plus its parsed SAN list, all from one `openssl -text`
@@ -403,28 +417,29 @@ async fn leaf_health_warnings(
     let temp_pem_str = temp_pem.to_string_lossy().to_string();
 
     let mut warnings = Vec::new();
+    let mut leaf_sans = Vec::new();
 
     let text_out = run_openssl_text(runner, &temp_pem_str).await;
-    let leaf_sans = text_out
-        .as_deref()
-        .map(parse_openssl_sans)
-        .unwrap_or_default();
+    // Checkend is nested inside this `if let`, not run unconditionally: if `-text` couldn't even
+    // parse the cert, openssl can't evaluate its expiry either, so there's no signal for any
+    // check here -- matching how the EKU check below already skips silently in that case.
     if let Some(text) = text_out.as_deref() {
+        leaf_sans = parse_openssl_sans(text);
         if !has_server_auth_eku(text) {
             warnings.push(
                 "이 인증서엔 server auth 용도가 없어 CA를 신뢰해도 브라우저 경고가 계속될 수 있음"
                     .to_string(),
             );
         }
-    }
 
-    let leaf_not_expired = openssl_checkend(runner, &temp_pem_str, "0").await;
-    if leaf_not_expired == Some(false) {
-        warnings.push("leaf 인증서가 이미 만료됨".to_string());
-    } else if leaf_not_expired == Some(true)
-        && openssl_checkend(runner, &temp_pem_str, "1209600").await == Some(false)
-    {
-        warnings.push("leaf 인증서가 14일 이내에 만료 예정".to_string());
+        let leaf_not_expired = openssl_checkend(runner, &temp_pem_str, "0").await;
+        if leaf_not_expired == Some(false) {
+            warnings.push("leaf 인증서가 이미 만료됨".to_string());
+        } else if leaf_not_expired == Some(true)
+            && openssl_checkend(runner, &temp_pem_str, "1209600").await == Some(false)
+        {
+            warnings.push("leaf 인증서가 14일 이내에 만료 예정".to_string());
+        }
     }
 
     // Unconditional: these checks are best-effort, but the temp PEM must never linger.
@@ -451,6 +466,8 @@ async fn ca_health_warnings(runner: &dyn CommandRunner, ca_pem: &str) -> Vec<Str
     let mut warnings = Vec::new();
 
     let text_out = run_openssl_text(runner, &temp_pem_str).await;
+    // Checkend is nested inside this `if let`, same rationale as leaf_health_warnings: no parsed
+    // text means no signal for the expiry check either.
     if let Some(text) = text_out.as_deref() {
         if !has_ca_true_basic_constraint(text) || !has_cert_sign_key_usage(text) {
             warnings.push(
@@ -458,10 +475,18 @@ async fn ca_health_warnings(runner: &dyn CommandRunner, ca_pem: &str) -> Vec<Str
                     .to_string(),
             );
         }
-    }
 
-    if openssl_checkend(runner, &temp_pem_str, "2592000").await == Some(false) {
-        warnings.push("CA 인증서가 30일 이내에 만료 예정".to_string());
+        // Already-expired first, same as leaf: a CA that's already expired is more severe than
+        // one merely approaching expiry (it affects every host behind it) and deserves its own
+        // message, not the milder "30 days" wording.
+        let ca_not_expired = openssl_checkend(runner, &temp_pem_str, "0").await;
+        if ca_not_expired == Some(false) {
+            warnings.push("CA 인증서가 이미 만료됨".to_string());
+        } else if ca_not_expired == Some(true)
+            && openssl_checkend(runner, &temp_pem_str, "2592000").await == Some(false)
+        {
+            warnings.push("CA 인증서가 30일 이내에 만료 예정".to_string());
+        }
     }
 
     let _ = std::fs::remove_file(&temp_pem);
@@ -1089,6 +1114,19 @@ mod tests {
         );
     }
 
+    /// MEDIUM fix (independent review of a0045c0): an already-expired CA must get its own
+    /// message, not the milder "expiring within 30 days" wording -- mirrors
+    /// `leaf_health_warnings_flags_already_expired_and_suppresses_the_14_day_message`.
+    #[tokio::test]
+    async fn ca_health_warnings_flags_already_expired_and_suppresses_the_30_day_message() {
+        let runner = FakeCertHealthRunner {
+            text_output: VALID_CA_TEXT.to_string(),
+            seconds_until_expiry: -3600, // expired 1 hour ago
+        };
+        let warnings = ca_health_warnings(&runner, TEST_CA_PEM).await;
+        assert_eq!(warnings, vec!["CA 인증서가 이미 만료됨".to_string()]);
+    }
+
     #[tokio::test]
     async fn leaf_and_ca_health_checks_produce_no_warnings_when_openssl_cannot_run() {
         struct UnavailableOpensslRunner;
@@ -1108,6 +1146,106 @@ mod tests {
 
         let warnings = ca_health_warnings(&UnavailableOpensslRunner, TEST_CA_PEM).await;
         assert!(warnings.is_empty());
+    }
+
+    /// HIGH regression (independent review of a0045c0): `openssl_checkend` must not treat a bare
+    /// non-zero exit as "genuinely expiring" -- verified directly against a real LibreSSL
+    /// `openssl x509 -noout -checkend` (see the function's doc comment for the exact evidence)
+    /// that a genuine result is always silent on stderr, while a load/parse failure always prints
+    /// to it. This is the function-level version of that contract; the two tests below cover it
+    /// at the `leaf_health_warnings`/`ca_health_warnings` level and through `discover_cluster_cas`
+    /// (see the added assertion in
+    /// `discover_cluster_cas_collapses_different_secrets_sharing_one_fingerprint`).
+    #[tokio::test]
+    async fn openssl_checkend_distinguishes_genuine_expiry_from_a_load_failure() {
+        struct FakeCheckendRunner {
+            success: bool,
+            stderr: &'static str,
+        }
+        #[async_trait::async_trait]
+        impl CommandRunner for FakeCheckendRunner {
+            async fn run(
+                &self,
+                bin: &str,
+                args: &[String],
+            ) -> Result<crate::services::process::CommandOutput, String> {
+                assert_eq!(bin, "openssl");
+                assert!(args.contains(&"-checkend".to_string()));
+                Ok(crate::services::process::CommandOutput {
+                    stdout: String::new(),
+                    stderr: self.stderr.to_string(),
+                    success: self.success,
+                })
+            }
+        }
+
+        // Genuine "not expiring": exit 0, silent.
+        let genuinely_valid = FakeCheckendRunner {
+            success: true,
+            stderr: "",
+        };
+        assert_eq!(
+            openssl_checkend(&genuinely_valid, "/tmp/x.pem", "0").await,
+            Some(true)
+        );
+
+        // Genuine "will expire": exit 1, still silent -- this is the case the HIGH bug got wrong.
+        let genuinely_expiring = FakeCheckendRunner {
+            success: false,
+            stderr: "",
+        };
+        assert_eq!(
+            openssl_checkend(&genuinely_expiring, "/tmp/x.pem", "0").await,
+            Some(false)
+        );
+
+        // A load/parse failure: exit 1 WITH stderr output -- must be "no signal", never
+        // "expiring".
+        let load_failure = FakeCheckendRunner {
+            success: false,
+            stderr: "unable to load certificate",
+        };
+        assert_eq!(
+            openssl_checkend(&load_failure, "/tmp/x.pem", "0").await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn leaf_and_ca_health_checks_produce_no_warnings_when_openssl_exits_nonzero_with_stderr_output(
+    ) {
+        struct NoisyFailureRunner;
+        #[async_trait::async_trait]
+        impl CommandRunner for NoisyFailureRunner {
+            async fn run(
+                &self,
+                _bin: &str,
+                _args: &[String],
+            ) -> Result<crate::services::process::CommandOutput, String> {
+                // Mirrors a real openssl load/parse failure, and this file's other FakeRunners'
+                // catch-all branches: non-zero exit WITH stderr output, never silent. Before the
+                // openssl_checkend fix, this shape (an `Ok` response with `success: false`, as
+                // opposed to `run` itself returning `Err`) was misread as a genuine expiry
+                // result.
+                Ok(crate::services::process::CommandOutput {
+                    stdout: String::new(),
+                    stderr: "unexpected command".to_string(),
+                    success: false,
+                })
+            }
+        }
+        let (warnings, sans) = leaf_health_warnings(&NoisyFailureRunner, TEST_CA_PEM).await;
+        assert!(
+            warnings.is_empty(),
+            "expected no warnings, got {warnings:?}"
+        );
+        assert!(sans.is_empty());
+
+        let warnings = ca_health_warnings(&NoisyFailureRunner, TEST_CA_PEM).await;
+        assert!(
+            warnings.is_empty(),
+            "expected no warnings, got {warnings:?}"
+        );
     }
 
     #[test]
@@ -1406,6 +1544,16 @@ mod tests {
         assert!(result[0]
             .source_hosts
             .contains(&"apisix.example.internal".to_string()));
+        // Regression: this fixture's FakeRunner doesn't recognize `-text`/`-checkend` and falls
+        // through to a catch-all `success: false` response with non-empty stderr. Before the
+        // openssl_checkend fix, that was misread as a genuine "will expire" result, producing a
+        // false "CA 인증서가 30일 이내에 만료 예정" warning for TEST_CA_PEM, which is valid until
+        // 2036.
+        assert!(
+            result[0].meta.warnings.is_empty(),
+            "expected no warnings from an unrecognized-command openssl response, got {:?}",
+            result[0].meta.warnings
+        );
     }
 
     #[tokio::test]
