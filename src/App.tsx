@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Archive, Boxes, CheckCircle2, CircleAlert, Copy, ExternalLink, FilePlus, FileText, Globe, Moon, Pencil, Plus, RefreshCw, Server, Settings, Sun, Terminal, Trash2 } from 'lucide-react';
-import { api, type ConnectionResult, type HostsFileStatus, type Profile, type VerificationResult } from './api/tauri';
+import { api, type ConnectionResult, type DiscoveredCaView, type HostsFileStatus, type Profile, type VerificationResult } from './api/tauri';
 import ProfileEditor from './components/ProfileEditor';
 import KubeconfigManager from './components/KubeconfigManager';
 import StatusBanner, { type StatusMessage } from './components/StatusBanner';
@@ -26,6 +26,9 @@ export default function App() {
   const [syncingHosts, setSyncingHosts] = useState(false);
   const [clearingHosts, setClearingHosts] = useState(false);
   const [discoveringEndpoints, setDiscoveringEndpoints] = useState(false);
+  const [caViews, setCaViews] = useState<DiscoveredCaView[]>([]);
+  const [caActionTarget, setCaActionTarget] = useState<DiscoveredCaView | null>(null);
+  const [caActionBusy, setCaActionBusy] = useState(false);
   const [hostsStatus, setHostsStatus] = useState<HostsFileStatus | null>(null);
   const [lastResult, setLastResult] = useState<ConnectionResult | null>(null);
   const [statusMessage, setStatusMessage] = useState<StatusMessage | null>(null);
@@ -259,6 +262,14 @@ export default function App() {
         }
         return { ...prev, endpoints: eps };
       });
+      // Best-effort: CA status is a nice-to-have overlay on top of endpoint discovery, so a
+      // failure here (e.g. RBAC denies reading Secrets) must not turn a successful endpoint
+      // scan into a reported error -- it just means the CA summary stays empty.
+      try {
+        setCaViews(await api.discoverClusterCas(selected.id, eps));
+      } catch {
+        setCaViews([]);
+      }
       setStatusMessage({
         type: 'success',
         title: 'Endpoints Discovered',
@@ -274,6 +285,38 @@ export default function App() {
       });
     } finally {
       setDiscoveringEndpoints(false);
+    }
+  };
+
+  const executeCaTrustAction = async (target: DiscoveredCaView) => {
+    if (!selected) return;
+    setCaActionBusy(true);
+    try {
+      if (target.status === 'rotated') {
+        await api.replaceCa(selected.id, target.secret_ref);
+      } else {
+        await api.trustCa(selected.id, target.secret_ref);
+      }
+      setCaActionTarget(null);
+      setStatusMessage({
+        type: 'success',
+        title: 'CA Trusted',
+        details: [
+          `${target.subject_cn || target.secret_ref} is now trusted for ${target.source_hosts.length} host(s). Safari/Chrome will stop warning on them.`,
+        ],
+        time: new Date().toLocaleTimeString(),
+      });
+      const cas = await api.discoverClusterCas(selected.id, lastResult?.endpoints ?? []);
+      setCaViews(cas);
+    } catch (err) {
+      setStatusMessage({
+        type: 'error',
+        title: 'CA Trust failed',
+        details: [String(err)],
+        time: new Date().toLocaleTimeString(),
+      });
+    } finally {
+      setCaActionBusy(false);
     }
   };
 
@@ -888,6 +931,47 @@ export default function App() {
                   )}
                 </div>
 
+                {caViews.length > 0 && (
+                  <div className="host-list" style={{ marginBottom: '8px' }}>
+                    {caViews.map((ca) => (
+                      <div className="host-row" key={ca.secret_ref}>
+                        <div>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                            <span className="host-name mono" style={{ fontSize: '12px' }}>
+                              {ca.subject_cn || ca.secret_ref}
+                            </span>
+                            <span
+                              className="pill"
+                              style={{ fontSize: '10px', padding: '1px 6px', textTransform: 'uppercase' }}
+                            >
+                              {ca.status === 'trusted'
+                                ? 'CA Trusted'
+                                : ca.status === 'rotated'
+                                  ? 'CA Changed'
+                                  : 'CA Untrusted'}
+                            </span>
+                          </div>
+                          <div className="host-address">
+                            {ca.source_hosts.length} host(s) &middot; expires {ca.not_after || 'unknown'}
+                          </div>
+                        </div>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                          {ca.status !== 'trusted' && (
+                            <button
+                              type="button"
+                              className="secondary-button"
+                              style={{ width: 'auto', marginTop: 0, padding: '5px 10px', fontSize: '11px' }}
+                              onClick={() => setCaActionTarget(ca)}
+                            >
+                              {ca.status === 'rotated' ? 'Update Trust' : 'Trust CA'}
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
                 {lastResult?.endpoints && lastResult.endpoints.length > 0 ? (
                   <div className="host-list">
                     {lastResult.endpoints.map((ep) => (
@@ -948,6 +1032,29 @@ export default function App() {
           onConfirm={() => executeDeleteProfile(profileToDelete)}
           onCancel={() => {
             if (!deletingProfile) setProfileToDelete(null);
+          }}
+        />
+      )}
+
+      {caActionTarget && (
+        <ConfirmModal
+          title={
+            caActionTarget.status === 'rotated'
+              ? `Update trust for "${caActionTarget.subject_cn || caActionTarget.secret_ref}"?`
+              : `Trust CA "${caActionTarget.subject_cn || caActionTarget.secret_ref}"?`
+          }
+          message={
+            caActionTarget.status === 'rotated'
+              ? `This cluster's CA has changed since it was last trusted (likely a clean reinstall). Remove the old trust entry and trust the new certificate (SHA-256 ${caActionTarget.fingerprint_sha256.slice(0, 16)}..., expires ${caActionTarget.not_after || 'unknown'}) for ${caActionTarget.source_hosts.length} host(s)? macOS will ask you to confirm in a system dialog.`
+              : `Add this certificate (SHA-256 ${caActionTarget.fingerprint_sha256.slice(0, 16)}..., expires ${caActionTarget.not_after || 'unknown'}) to your login keychain so Safari/Chrome stop warning on ${caActionTarget.source_hosts.length} host(s) behind it? macOS will ask you to confirm in a system dialog.`
+          }
+          confirmLabel={caActionTarget.status === 'rotated' ? 'Update Trust' : 'Trust CA'}
+          cancelLabel="Cancel"
+          isDanger={false}
+          busy={caActionBusy}
+          onConfirm={() => executeCaTrustAction(caActionTarget)}
+          onCancel={() => {
+            if (!caActionBusy) setCaActionTarget(null);
           }}
         />
       )}
