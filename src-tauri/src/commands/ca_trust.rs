@@ -100,6 +100,14 @@ pub async fn replace_ca_cmd(profile_id: String, secret_ref: String) -> Result<Tr
     let profile = store::get_profile(&paths, &profile_id)?;
     let runner = SystemRunner;
 
+    // Validate preconditions before the destructive untrust step below, so the common
+    // not-connected / malformed-secret-ref case never removes the old trust entry for nothing.
+    split_secret_ref(&secret_ref)?;
+    let kubeconfig_path = paths.kubeconfig_file(&profile_id);
+    if !kubeconfig_path.exists() {
+        return Err("kubeconfig not found for profile; please connect first".to_string());
+    }
+
     if let Some(old) = profile
         .trusted_cas
         .iter()
@@ -110,5 +118,18 @@ pub async fn replace_ca_cmd(profile_id: String, secret_ref: String) -> Result<Tr
         let _ = ca_trust::untrust_ca(&runner, &old.fingerprint_sha1).await;
     }
 
-    trust_ca_cmd(profile_id, secret_ref).await
+    match trust_ca_cmd(profile_id.clone(), secret_ref.clone()).await {
+        Ok(record) => Ok(record),
+        Err(e) => {
+            // The old cert may already be out of the keychain (untrust above) while the new
+            // one failed to go in -- keeping the stale record would report a false "trusted"
+            // status on the next discover. Drop it so the CA correctly shows as untrusted
+            // again rather than lying about its state.
+            if let Ok(mut profile) = store::get_profile(&paths, &profile_id) {
+                profile.trusted_cas.retain(|c| c.secret_ref != secret_ref);
+                let _ = store::upsert_profile(&paths, profile);
+            }
+            Err(e)
+        }
+    }
 }
