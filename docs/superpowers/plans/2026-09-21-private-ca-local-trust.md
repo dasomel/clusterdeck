@@ -1023,10 +1023,12 @@ git commit -m "feat(ca-trust): fetch and fingerprint CAs for discovered endpoint
 - Modify: `src-tauri/src/services/ca_trust.rs`
 
 **Interfaces:**
-- Consumes: `pem_to_der`, `fingerprint_hex_sha1` (Task 1); `write_owner_only_file` (now `pub(crate)`, Task 2)
+- Consumes: `pem_to_der`, `fingerprint_hex_sha1` (Task 1); `write_owner_only_file` and `TEMP_FILE_SEQ` (now `pub(crate)`, Task 2)
 - Produces: `pub async fn resolve_login_keychain_path(runner: &dyn CommandRunner) -> Result<String, String>`, `pub async fn trust_ca(runner: &dyn CommandRunner, pem: &str) -> Result<String, String>` (returns the SHA-1 fingerprint it trusted), `pub async fn untrust_ca(runner: &dyn CommandRunner, fingerprint_sha1: &str) -> Result<(), String>`
 
-**Important — read before implementing:** `security add-trusted-cert` blocks on a macOS GUI authorization prompt (Touch ID/password), even against a throwaway non-login keychain. This was confirmed empirically while writing this plan: running it from a headless/agent shell hung indefinitely with no way to answer the prompt, and had to be force-killed. `trust_ca`/`untrust_ca` themselves are plain async functions with no special handling for this (the blocking happens inside the `security` subprocess, which `CommandRunner::run` already awaits correctly) — the implication is entirely for **Step 6** below (the real-exec test): it must be `#[ignore]`d and can only be run manually from a real, logged-in Terminal session, never from CI or an agent session.
+**Important — read before implementing:** `trust_ca`'s temp PEM filename appends `k8s_endpoints::TEMP_FILE_SEQ.fetch_add(1, Ordering::Relaxed)` to the nanosecond timestamp — do not drop this and go back to a nanosecond-only filename. Task 2's `extract_cert_metadata` originally did exactly that and it caused a real, reproduced test flake (3 of 7 `cargo test` runs failed) under default parallelism: two concurrent `#[tokio::test]`s computed the same timestamp and lost the `create_new` race on the same path. The fix made `TEMP_FILE_SEQ` (already used by `k8s_endpoints::curl_k8s_api` for this exact hazard) `pub(crate)` — reuse it here rather than inventing a second counter.
+
+**Important — read before implementing (2):** `security add-trusted-cert` blocks on a macOS GUI authorization prompt (Touch ID/password), even against a throwaway non-login keychain. This was confirmed empirically while writing this plan: running it from a headless/agent shell hung indefinitely with no way to answer the prompt, and had to be force-killed. `trust_ca`/`untrust_ca` themselves are plain async functions with no special handling for this (the blocking happens inside the `security` subprocess, which `CommandRunner::run` already awaits correctly) — the implication is entirely for **Step 6** below (the real-exec test): it must be `#[ignore]`d and can only be run manually from a real, logged-in Terminal session, never from CI or an agent session.
 
 - [ ] **Step 1: Write the failing unit tests (argv shape + keychain path parsing)**
 
@@ -1253,7 +1255,8 @@ pub async fn trust_ca(runner: &dyn CommandRunner, pem: &str) -> Result<String, S
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let temp_pem = std::env::temp_dir().join(format!("cd_ca_trust_{now_nanos}.pem"));
+    let seq = crate::services::k8s_endpoints::TEMP_FILE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let temp_pem = std::env::temp_dir().join(format!("cd_ca_trust_{now_nanos}_{seq}.pem"));
     write_owner_only_file(&temp_pem, pem.as_bytes())
         .map_err(|e| format!("failed to write temp CA file: {e}"))?;
 
