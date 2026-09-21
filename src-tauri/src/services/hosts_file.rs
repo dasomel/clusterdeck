@@ -183,6 +183,7 @@ mod tests {
             bootstrap: BootstrapPolicy::default(),
             kubeconfig: None,
             manage_hosts_file: true,
+            trusted_cas: Vec::new(),
         }
     }
 

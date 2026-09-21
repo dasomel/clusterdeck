@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use serde::{Deserialize, Serialize};
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
 
@@ -221,6 +222,16 @@ pub fn resolve_apisixtls_secret_ref(
         }
     }
     None
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrustedCa {
+    pub secret_ref: String,
+    pub fingerprint_sha256: String,
+    pub fingerprint_sha1: String,
+    pub subject_cn: String,
+    pub not_after: String,
+    pub trusted_at: String,
 }
 
 pub struct DiscoveredCaMeta {

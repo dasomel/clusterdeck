@@ -1344,6 +1344,7 @@ users:
                 context: "cka".to_string(),
             }),
             manage_hosts_file: false,
+            trusted_cas: Vec::new(),
         };
 
         let runner = FakeScpRunner {
@@ -1390,6 +1391,7 @@ users:
                 context: "cka-perms".to_string(),
             }),
             manage_hosts_file: false,
+            trusted_cas: Vec::new(),
         };
 
         let runner = FakeScpRunner {
@@ -1484,6 +1486,7 @@ users:
                 context: "fallback-test".to_string(),
             }),
             manage_hosts_file: false,
+            trusted_cas: Vec::new(),
         };
 
         let runner = FakeFallbackRunner {
@@ -1672,6 +1675,7 @@ users:
                 context: "cka-lab".to_string(),
             }),
             manage_hosts_file: false,
+            trusted_cas: Vec::new(),
         };
 
         let runner = DummyKubeRunner;
@@ -1769,6 +1773,7 @@ users:
                 context: "cka".to_string(),
             }),
             manage_hosts_file: false,
+            trusted_cas: Vec::new(),
         };
         let generated = generate_default_kubeconfig(&profile).unwrap();
         let expected = r#"apiVersion: v1
@@ -1804,6 +1809,7 @@ users:
             bootstrap: BootstrapPolicy::default(),
             kubeconfig: None,
             manage_hosts_file: false,
+            trusted_cas: Vec::new(),
         };
         let generated = generate_default_kubeconfig(&profile).unwrap();
         let expected = r#"apiVersion: v1
