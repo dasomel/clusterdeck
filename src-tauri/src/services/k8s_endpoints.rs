@@ -73,7 +73,7 @@ static TEMP_FILE_SEQ: AtomicU64 = AtomicU64::new(0);
 /// world-readable permissions even momentarily -- unlike a create-then-chmod sequence, which
 /// leaves that window open. Mirrors the temp-file idiom in kubeconfig.rs.
 #[cfg(unix)]
-fn write_owner_only_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_owner_only_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     use std::fs::OpenOptions;
     use std::io::Write;
     OpenOptions::new()
@@ -85,7 +85,7 @@ fn write_owner_only_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
 }
 
 #[cfg(not(unix))]
-fn write_owner_only_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_owner_only_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     std::fs::write(path, contents)
 }
 
