@@ -44,6 +44,20 @@ Local Profile
 Kubernetes Connectivity Check
 ```
 
+## Screenshots
+
+**Connected profile** — SSH/kubeconfig/Kubernetes status for a synced profile, plus discovered cluster endpoints with their CA trust status:
+
+![Connected profile dashboard showing host reachability, Kubernetes sync status, and discovered cluster endpoints](docs/screenshots/main-dashboard.png)
+
+**Settings** — trusted CAs and the read-only Local Runtime discovery section for Colima/Lima/Vagrant:
+
+![Settings view showing kubeconfig details, trusted CAs, and local runtime discovery](docs/screenshots/settings.png)
+
+**New profile** — host discovery and the opt-in bastion / bootstrap / kubeconfig / `/etc/hosts` settings:
+
+![Create Profile dialog showing host detection and per-profile options](docs/screenshots/create-profile.png)
+
 ## Initial Scope
 
 - macOS-first desktop application

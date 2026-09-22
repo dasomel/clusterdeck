@@ -44,6 +44,20 @@ kubeconfig 정규화
 Kubernetes 연결 확인
 ```
 
+## 스크린샷
+
+**연결된 Profile** — 동기화된 프로필의 SSH/kubeconfig/Kubernetes 상태와, 발견된 클러스터 엔드포인트 및 CA 신뢰 상태:
+
+![호스트 접속 가능 여부, Kubernetes 동기화 상태, 발견된 클러스터 엔드포인트를 보여주는 연결된 프로필 대시보드](docs/screenshots/main-dashboard.png)
+
+**설정** — 신뢰된 CA 목록과 Colima/Lima/Vagrant용 읽기 전용 Local Runtime 검색 섹션:
+
+![kubeconfig 상세 정보, 신뢰된 CA, local runtime 검색을 보여주는 설정 화면](docs/screenshots/settings.png)
+
+**새 Profile 생성** — 호스트 검색과 opt-in 방식의 bastion / bootstrap / kubeconfig / `/etc/hosts` 설정:
+
+![호스트 검색과 프로필별 옵션을 보여주는 Create Profile 대화상자](docs/screenshots/create-profile.png)
+
 ## 초기 범위
 
 - macOS 중심 데스크톱 앱
