@@ -184,6 +184,22 @@ fn tail_message(output: &CommandOutput) -> String {
     lines.join("\n")
 }
 
+/// Colima argv for starting `instance_name`. Always passes `--activate=false`: `colima start`
+/// defaults to `--activate=true` ("set as active Docker/Kubernetes/Incus context on startup",
+/// confirmed via `colima start --help` on 0.10.3), which would silently switch the user's
+/// *global* `docker context`/kube current-context out from under them — exactly what ADR-0007 D3
+/// and ADR-0002 forbid. `--activate=false` is a boolean flag and must be passed as a single
+/// `--activate=false` token, not `--activate false` — pflag/cobra bool flags do not consume a
+/// following bare argument as their value.
+fn colima_start_args(instance_name: &str) -> Vec<String> {
+    vec![
+        "start".to_string(),
+        "--activate=false".to_string(),
+        "--profile".to_string(),
+        instance_name.to_string(),
+    ]
+}
+
 pub async fn start_instance(
     runner: &dyn CommandRunner,
     provider: LocalRuntimeProvider,
@@ -192,18 +208,12 @@ pub async fn start_instance(
     find_fresh_instance(runner, provider, instance_name).await?;
     let output = match provider {
         LocalRuntimeProvider::Colima => {
-            run_with_timeout(
-                runner,
-                "colima",
-                &[
-                    "start".to_string(),
-                    "--profile".to_string(),
-                    instance_name.to_string(),
-                ],
-            )
-            .await?
+            run_with_timeout(runner, "colima", &colima_start_args(instance_name)).await?
         }
         LocalRuntimeProvider::Lima => {
+            // limactl has no context-switching flag or concept (confirmed: no "context" mention
+            // anywhere in `limactl --help`/`limactl start --help` on 2.2.0) — nothing here can
+            // mutate global Docker/kube state the way Colima's default `--activate=true` did.
             run_with_timeout(
                 runner,
                 "limactl",
@@ -252,63 +262,65 @@ pub async fn stop_instance(
     })
 }
 
-/// Colima has a native `restart` subcommand; Lima's CLI also has one, but ADR-0007 D1
-/// deliberately implements Lima restart as stop-then-start rather than a third CLI surface to
-/// reason about. If stop fails, start is not attempted. The combined stop+start runs under one
-/// `LIFECYCLE_TIMEOUT` deadline (not one per call) so the worst case stays 10 minutes instead of
-/// 20.
+/// Restart is stop-then-start for both providers, run under a single combined
+/// `LIFECYCLE_TIMEOUT` deadline (not one per call, so the worst case stays 10 minutes instead of
+/// 20). If stop fails, start is not attempted.
+///
+/// Neither provider uses its own native restart subcommand: `colima restart` has **no**
+/// `--activate` flag at all (confirmed via `colima restart --help` on 0.10.3), so it cannot be
+/// made to skip switching the global Docker/kube context the way `colima start --activate=false`
+/// can — stop-then-start-with-`--activate=false` is the only way to restart a Colima instance
+/// without that side effect. Lima's `limactl restart` was available but is not used, to keep both
+/// providers' restart implemented the same way rather than a third CLI surface to reason about
+/// (ADR-0007 D1); this is a low-cost consistency choice since Lima's start/stop are already
+/// idempotent and side-effect-free with respect to global context (see `start_instance`).
 pub async fn restart_instance(
     runner: &dyn CommandRunner,
     provider: LocalRuntimeProvider,
     instance_name: &str,
 ) -> Result<LifecycleActionResult, String> {
     find_fresh_instance(runner, provider, instance_name).await?;
-    match provider {
-        LocalRuntimeProvider::Colima => {
-            let output = run_with_timeout(
-                runner,
-                "colima",
-                &[
-                    "restart".to_string(),
-                    "--profile".to_string(),
-                    instance_name.to_string(),
-                ],
-            )
-            .await?;
-            Ok(LifecycleActionResult {
-                success: output.success,
-                message: tail_message(&output),
-            })
-        }
-        LocalRuntimeProvider::Lima => {
-            let combined = tokio::time::timeout(LIFECYCLE_TIMEOUT, async {
-                let stop_out = runner
-                    .run("limactl", &["stop".to_string(), instance_name.to_string()])
-                    .await?;
-                if !stop_out.success {
-                    return Ok(LifecycleActionResult {
-                        success: false,
-                        message: format!("stop failed: {}", tail_message(&stop_out)),
-                    });
-                }
-                let start_out = runner
-                    .run("limactl", &["start".to_string(), instance_name.to_string()])
-                    .await?;
-                Ok(LifecycleActionResult {
-                    success: start_out.success,
-                    message: tail_message(&start_out),
-                })
-            })
-            .await;
+    let (stop_bin, stop_args, start_bin, start_args) = match provider {
+        LocalRuntimeProvider::Colima => (
+            "colima",
+            vec![
+                "stop".to_string(),
+                "--profile".to_string(),
+                instance_name.to_string(),
+            ],
+            "colima",
+            colima_start_args(instance_name),
+        ),
+        LocalRuntimeProvider::Lima => (
+            "limactl",
+            vec!["stop".to_string(), instance_name.to_string()],
+            "limactl",
+            vec!["start".to_string(), instance_name.to_string()],
+        ),
+    };
 
-            match combined {
-                Ok(result) => result,
-                Err(_) => Err(format!(
-                    "limactl restart timed out after {}s",
-                    LIFECYCLE_TIMEOUT.as_secs()
-                )),
-            }
+    let combined = tokio::time::timeout(LIFECYCLE_TIMEOUT, async {
+        let stop_out = runner.run(stop_bin, &stop_args).await?;
+        if !stop_out.success {
+            return Ok(LifecycleActionResult {
+                success: false,
+                message: format!("stop failed: {}", tail_message(&stop_out)),
+            });
         }
+        let start_out = runner.run(start_bin, &start_args).await?;
+        Ok(LifecycleActionResult {
+            success: start_out.success,
+            message: tail_message(&start_out),
+        })
+    })
+    .await;
+
+    match combined {
+        Ok(result) => result,
+        Err(_) => Err(format!(
+            "{stop_bin} restart timed out after {}s",
+            LIFECYCLE_TIMEOUT.as_secs()
+        )),
     }
 }
 
@@ -480,6 +492,7 @@ mod tests {
             colima_calls.last().unwrap(),
             &vec![
                 "start".to_string(),
+                "--activate=false".to_string(),
                 "--profile".to_string(),
                 "default".to_string()
             ]
@@ -503,7 +516,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restart_colima_builds_expected_argv() {
+    async fn restart_colima_calls_stop_then_start_with_activate_false_in_order() {
         let runner = FakeRunner::new(COLIMA_LIST, "");
         restart_instance(&runner, LocalRuntimeProvider::Colima, "default")
             .await
@@ -511,10 +524,34 @@ mod tests {
 
         let calls = runner.calls.lock().unwrap();
         let colima_calls = args_for(&calls, "colima");
+        // Preceding calls are the fresh-discovery `list`/`ssh-config`; find the stop/start pair
+        // by their own first argv token rather than a fixed index, since the discovery call
+        // shape is local_runtime.rs's concern, not this test's. `colima restart` has no
+        // `--activate` flag (ADR-0007), so restart cannot use it and must go through the same
+        // stop+start path `start_instance` uses, stop strictly before start.
+        let stop_pos = colima_calls
+            .iter()
+            .position(|a| a.first().map(String::as_str) == Some("stop"))
+            .expect("expected a colima stop call");
+        let start_pos = colima_calls
+            .iter()
+            .position(|a| a.first().map(String::as_str) == Some("start"))
+            .expect("expected a colima start call");
+        assert!(stop_pos < start_pos, "stop must run before start");
+
         assert_eq!(
-            colima_calls.last().unwrap(),
-            &vec![
-                "restart".to_string(),
+            colima_calls[stop_pos],
+            vec![
+                "stop".to_string(),
+                "--profile".to_string(),
+                "default".to_string()
+            ]
+        );
+        assert_eq!(
+            colima_calls[start_pos],
+            vec![
+                "start".to_string(),
+                "--activate=false".to_string(),
                 "--profile".to_string(),
                 "default".to_string()
             ]

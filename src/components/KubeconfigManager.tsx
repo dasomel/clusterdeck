@@ -179,7 +179,10 @@ export default function KubeconfigManager({ onClose, onStatusMessage, onCaRemove
       onStatusMessage({
         type: result.success ? 'success' : 'error',
         title: `${host.instance_name}: ${action} ${result.success ? 'succeeded' : 'failed'}`,
-        details: [result.message],
+        // result.message is a raw stdout/stderr tail from the CLI (JSON blobs, k3s install logs
+        // on success). On success a concise confirmation is enough; the CLI tail is only useful
+        // as failure diagnostics, so it's shown only then.
+        details: result.success ? undefined : [result.message],
         time: new Date().toLocaleTimeString(),
       });
       await reload();
@@ -580,7 +583,7 @@ export default function KubeconfigManager({ onClose, onStatusMessage, onCaRemove
         {expandedLocalRuntime && (
           <div style={{ marginTop: '8px' }}>
             <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginBottom: '8px' }}>
-              Read-only discovery for Colima, Lima, and Vagrant.
+              Discovery for Colima, Lima, and Vagrant. Colima/Lima instances also support Start/Stop/Restart, opening a VM shell, and opening a shell scoped to the instance's Docker/kube context — Vagrant stays read-only.
             </div>
             {localHosts.length > 0 ? (
               <div className="host-list">

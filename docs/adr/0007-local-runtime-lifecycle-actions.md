@@ -33,16 +33,42 @@ real CLIs (`colima 0.10.3`, `limactl 2.2.0`, macOS arm64):
 
 | Action | Colima | Lima |
 | --- | --- | --- |
-| Start | `colima start --profile <name>` | `limactl start <name>` |
+| Start | `colima start --activate=false --profile <name>` | `limactl start <name>` |
 | Stop | `colima stop --profile <name>` | `limactl stop <name>` |
-| Restart | `colima restart --profile <name>` | `limactl stop <name>` then `limactl start <name>` |
+| Restart | `colima stop --profile <name>` then `colima start --activate=false --profile <name>` | `limactl stop <name>` then `limactl start <name>` |
 | Shell | `colima ssh --profile <name>` | `limactl shell <name>` |
 
-`limactl` has a native `restart` subcommand, but Lima restart is implemented as the same
-stop-then-start calls this module already validates and times out individually, rather than a third
-CLI surface to reason about — a deliberate simplicity trade-off, not a capability gap. `--profile`
-is always passed explicitly for Colima (including the `default` profile) for uniform, predictable
-argv, unlike `detect_colima`'s existing `ssh-config` call, which omits it for `default`.
+**`--activate=false` (Colima start/restart only).** `colima start` defaults to
+`--activate=true` ("set as active Docker/Kubernetes/Incus context on startup", confirmed via
+`colima start --help` on 0.10.3). Real-UI testing during review caught this: starting `nqa-node2`
+from the panel silently switched the user's **global** `docker context` from `desktop-linux` to
+`colima-nqa-node2` (stdout: `Current context is now "colima-nqa-node2"`) — a direct violation of D3
+and [ADR-0002](0002-kubeconfig-stays-isolated-from-user-kube-config.md)'s never-mutate-global-state
+rule, and one the original real-binary evidence run for this ADR didn't catch because that run never
+checked `docker context show`/`kubectl config current-context` before and after. Every Colima
+`start` argv this module builds now passes `--activate=false` explicitly (a boolean flag, so it
+must be one token, `--activate=false`, not two — pflag/cobra bool flags don't consume a following
+bare argument as their value).
+
+**Restart is stop-then-start for both providers, not either provider's native `restart`.**
+`colima restart` has **no** `--activate` flag at all (confirmed via `colima restart --help` on
+0.10.3), so it cannot be told to skip the same context switch — stop-then-start with
+`--activate=false` on the start half is the only way to restart a Colima instance without that side
+effect, so Colima restart was changed to use it. `limactl` does have a native `restart`, but Lima
+restart is kept as stop-then-start too, so both providers share one restart shape (ADR-0007 D1's
+original "deliberate simplicity trade-off, not a capability gap" reasoning, now also load-bearing
+for Colima). Both providers' combined stop+start run under one `LIFECYCLE_TIMEOUT` deadline, not one
+per call (worst case 10 minutes, not 20). `--profile` is always passed explicitly for Colima
+(including the `default` profile) for uniform, predictable argv, unlike `detect_colima`'s existing
+`ssh-config` call, which omits it for `default`.
+
+**Lima has no equivalent flag or concept to guard against**, confirmed by grepping for "context" in
+`limactl --help` and `limactl start --help` on 2.2.0 — no match in either. Lima's CLI has no
+Docker-context-like mechanism at all; `limactl start`/`stop`/`shell` cannot mutate global Docker/kube
+state, so no `--activate`-equivalent flag exists to pass. Net effect across both providers: this
+module never runs `docker context use` or `kubectl config use-context`, directly or as a side effect
+of a flag default — the "never mutate global state" half of D3 now holds for Start/Restart the same
+way it already held for Shell/Open-in-context.
 
 Provider dispatch is a new Rust enum, `LocalRuntimeProvider { Colima, Lima }`
 (`services/local_runtime_lifecycle.rs`), parsed from the wire string via `FromStr` and rejected
@@ -78,7 +104,10 @@ It never runs `docker context use` or `kubectl config use-context` — nothing h
 global Docker/kube state, consistent with [ADR-0002](0002-kubeconfig-stays-isolated-from-user-kube-config.md)'s
 spirit of not silently rewriting configuration the user owns outside a ClusterDeck-marked block. If
 neither context is available (or both fail validation — see Security), the command errors before
-opening a Terminal window at all, rather than opening an empty one.
+opening a Terminal window at all, rather than opening an empty one. D1's `--activate=false` fix
+closes the only other place in this module that could have mutated the same global state (Colima's
+own `start`/`restart` default), so this "never mutate global Docker/kube state" property now holds
+for every action in this module, not just D3's.
 
 ### D4 — Copy runtime info is frontend-only
 
@@ -189,6 +218,14 @@ Trade-offs:
    validated strings into an AppleScript string literal. If a future change relaxes
    `is_safe_local_runtime_instance_name` or `is_safe_shell_context_name`'s charset, the escaping in
    `open_terminal_with_command` must be re-reviewed for the newly allowed characters.
+3. **"Never mutate global state" is a CLI-default property, not a structural guarantee, and the
+   FakeRunner-only evidence gap that hid it once can hide a similar issue again.** The original
+   `--activate=true` default was only caught by real-UI testing (running the actual app and checking
+   `docker context show` before/after), not by this module's `FakeRunner` unit tests, which assert
+   argv shape but have no opinion on what the real CLI *does* with that argv — the same category of
+   gap AGENTS.md's SSH `BatchMode`/`accept-new` regression note describes. Any future CLI flag this
+   module starts passing needs the same real-binary, context-observed check, not just an argv
+   assertion.
 
 ## Evidence
 
