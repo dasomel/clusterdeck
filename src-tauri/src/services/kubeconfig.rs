@@ -804,6 +804,17 @@ pub fn merge_yaml_kubeconfigs(
     let overlay_val: serde_yaml::Value =
         serde_yaml::from_str(overlay_yaml).map_err(|e| format!("Invalid overlay YAML: {e}"))?;
 
+    // An empty/whitespace/comments-only base file parses as `Value::Null` rather than an empty
+    // mapping; treat that as "start from nothing" instead of silently no-op'ing every insert
+    // below via `as_mapping_mut() == None`. Any other non-mapping top-level (a sequence, a
+    // scalar, ...) is not a kubeconfig shape we can merge into, so fail before writing anything
+    // rather than reporting success while dropping the overlay entries.
+    if base_val.is_null() {
+        base_val = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+    } else if !base_val.is_mapping() {
+        return Err("Existing kubeconfig is not a YAML mapping; refusing to merge".to_string());
+    }
+
     for list_key in &["clusters", "contexts", "users"] {
         let key_val = serde_yaml::Value::String((*list_key).to_string());
         if let Some(overlay_list) = overlay_val.get(&key_val).and_then(|v| v.as_sequence()) {
@@ -1586,6 +1597,83 @@ users:
         assert_eq!(val["current-context"].as_str().unwrap(), "cka");
     }
 
+    #[test]
+    fn merge_yaml_kubeconfigs_treats_empty_base_as_empty_mapping() {
+        // Regression test: an existing ~/.kube/config that is 0 bytes, whitespace, or
+        // comments-only parses to `serde_yaml::Value::Null`, not an empty mapping. Without
+        // special-casing Null, `as_mapping_mut()` returns None, every insert silently no-ops,
+        // and the atomic write reports success while writing `null\n` and losing the profile
+        // entry entirely. The merge must start from an empty mapping instead.
+        let overlay = r#"
+apiVersion: v1
+clusters:
+- cluster:
+    server: https://fresh.example.com:6443
+  name: cka
+contexts:
+- context:
+    cluster: cka
+    user: cka
+  name: cka
+current-context: cka
+users:
+- name: cka
+  user:
+    token: fresh-token
+"#;
+
+        for empty_base in ["", "   \n", "# just a comment\n"] {
+            let merged = merge_yaml_kubeconfigs(empty_base, overlay, Some("cka")).unwrap();
+            let val: serde_yaml::Value = serde_yaml::from_str(&merged).unwrap();
+
+            assert_eq!(val["clusters"].as_sequence().unwrap().len(), 1);
+            assert_eq!(
+                val["clusters"][0]["cluster"]["server"].as_str().unwrap(),
+                "https://fresh.example.com:6443"
+            );
+            assert_eq!(val["contexts"][0]["name"].as_str().unwrap(), "cka");
+            assert_eq!(
+                val["users"][0]["user"]["token"].as_str().unwrap(),
+                "fresh-token"
+            );
+            assert_eq!(val["current-context"].as_str().unwrap(), "cka");
+        }
+    }
+
+    #[test]
+    fn merge_yaml_kubeconfigs_rejects_non_mapping_base() {
+        // A base that parses but isn't a mapping (a bare sequence, a scalar) isn't a kubeconfig
+        // shape we can merge into; must fail before any write rather than silently "succeeding"
+        // without merging anything.
+        let overlay = r#"
+apiVersion: v1
+clusters:
+- cluster:
+    server: https://fresh.example.com:6443
+  name: cka
+contexts:
+- context:
+    cluster: cka
+    user: cka
+  name: cka
+current-context: cka
+users:
+- name: cka
+  user:
+    token: fresh-token
+"#;
+
+        for non_mapping_base in [
+            "- just\n- a\n- list\n",
+            "\"just a scalar string\"\n",
+            "42\n",
+        ] {
+            let err = merge_yaml_kubeconfigs(non_mapping_base, overlay, Some("cka"))
+                .expect_err("non-mapping base must be rejected");
+            assert!(err.contains("mapping"), "unexpected error message: {err}");
+        }
+    }
+
     struct DummyKubeRunner;
     #[async_trait]
     impl CommandRunner for DummyKubeRunner {
@@ -1788,6 +1876,69 @@ users:
             .any(|c| c["name"].as_str() == Some("other-ctx")));
 
         assert_eq!(val["current-context"].as_str().unwrap(), "cka");
+
+        std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn merge_profile_kubeconfig_to_file_rejects_non_mapping_existing_config_without_writing()
+    {
+        // Regression test: if the existing ~/.kube/config parses as YAML but isn't a mapping
+        // (e.g. corrupted to a bare list), the merge must fail loudly instead of silently
+        // "succeeding" while dropping the overlay, and it must leave the file byte-for-byte
+        // untouched (no atomic write happens).
+        let temp_dir = std::env::temp_dir().join(format!(
+            "clusterdeck-merge-nonmapping-test-{}",
+            std::process::id()
+        ));
+        let paths = ClusterDeckPaths::at(temp_dir.clone());
+        paths.ensure_dirs().unwrap();
+
+        let profile_id = "cka";
+        let fresh_profile_kc = r#"
+apiVersion: v1
+kind: Config
+clusters:
+- name: cka
+  cluster:
+    server: https://fresh.example.com:6443
+contexts:
+- name: cka
+  context:
+    cluster: cka
+    user: cka
+current-context: cka
+users:
+- name: cka
+  user:
+    token: fresh-token
+"#;
+        std::fs::write(paths.kubeconfig_file(profile_id), fresh_profile_kc).unwrap();
+
+        let user_kube_dir = temp_dir.join(".kube");
+        let user_kc_file = user_kube_dir.join("config");
+        let bak_dir = user_kube_dir.join("bak");
+        std::fs::create_dir_all(&user_kube_dir).unwrap();
+
+        let non_mapping_existing = "- just\n- a\n- list\n";
+        std::fs::write(&user_kc_file, non_mapping_existing).unwrap();
+
+        let err = merge_profile_kubeconfig_to_file(
+            &paths,
+            profile_id,
+            &user_kc_file,
+            Some(&bak_dir),
+            true,
+        )
+        .await
+        .expect_err("non-mapping existing kubeconfig must be rejected");
+        assert!(err.contains("mapping"), "unexpected error message: {err}");
+
+        let raw_after = std::fs::read_to_string(&user_kc_file).unwrap();
+        assert_eq!(
+            raw_after, non_mapping_existing,
+            "file must be left untouched on error"
+        );
 
         std::fs::remove_dir_all(&temp_dir).ok();
     }
