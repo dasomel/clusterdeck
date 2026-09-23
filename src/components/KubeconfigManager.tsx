@@ -52,7 +52,10 @@ export default function KubeconfigManager({ onClose, onStatusMessage, onCaRemove
   const [expandedCas, setExpandedCas] = useState(false);
   const [expandedLocalRuntime, setExpandedLocalRuntime] = useState(false);
   const [removingCa, setRemovingCa] = useState<{ profileId: string; profileName: string; secretRef: string; subjectCn: string } | null>(null);
-  const [busyInstanceKey, setBusyInstanceKey] = useState<string | null>(null);
+  // A Set, not a single key: two different instances can each have an action in flight at once
+  // (e.g. start A, then start B while A is still running), and each op must only clear its own
+  // key when it finishes, not whichever one last started.
+  const [busyInstanceKeys, setBusyInstanceKeys] = useState<Set<string>>(new Set());
   const [lifecycleConfirm, setLifecycleConfirm] = useState<{ action: 'stop' | 'restart'; host: DiscoveredLocalHost } | null>(null);
 
   const reload = useCallback(async () => {
@@ -168,7 +171,7 @@ export default function KubeconfigManager({ onClose, onStatusMessage, onCaRemove
     const provider = toLifecycleProvider(host.provider);
     if (!provider) return;
     const key = instanceKey(host);
-    setBusyInstanceKey(key);
+    setBusyInstanceKeys((prev) => new Set(prev).add(key));
     try {
       const call =
         action === 'start' ? api.startLocalRuntime : action === 'stop' ? api.stopLocalRuntime : api.restartLocalRuntime;
@@ -188,7 +191,11 @@ export default function KubeconfigManager({ onClose, onStatusMessage, onCaRemove
         time: new Date().toLocaleTimeString(),
       });
     } finally {
-      setBusyInstanceKey(null);
+      setBusyInstanceKeys((prev) => {
+        const next = new Set(prev);
+        next.delete(key);
+        return next;
+      });
     }
   };
 
@@ -581,7 +588,7 @@ export default function KubeconfigManager({ onClose, onStatusMessage, onCaRemove
                   const key = instanceKey(host);
                   const isRunning = host.status.toLowerCase() === 'running';
                   const lifecycleProvider = toLifecycleProvider(host.provider);
-                  const isBusy = busyInstanceKey === key;
+                  const isBusy = busyInstanceKeys.has(key);
                   const hasContext = Boolean(host.docker_context || host.kube_context);
                   return (
                     <div className="host-row" key={key}>
@@ -685,7 +692,7 @@ export default function KubeconfigManager({ onClose, onStatusMessage, onCaRemove
           confirmLabel={lifecycleConfirm.action === 'stop' ? 'Stop' : 'Restart'}
           cancelLabel="Cancel"
           isDanger={lifecycleConfirm.action === 'stop'}
-          busy={busyInstanceKey === instanceKey(lifecycleConfirm.host)}
+          busy={busyInstanceKeys.has(instanceKey(lifecycleConfirm.host))}
           onConfirm={async () => {
             const { action, host } = lifecycleConfirm;
             await runLifecycleAction(host, action);

@@ -85,6 +85,11 @@ pub fn is_safe_shell_context_name(s: &str) -> bool {
     if s.is_empty() || s.len() > 253 {
         return false;
     }
+    let mut chars = s.chars();
+    let first = chars.next().unwrap();
+    if !first.is_ascii_alphanumeric() {
+        return false;
+    }
     s.chars()
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ':' | '/' | '@'))
 }
@@ -263,6 +268,7 @@ mod tests {
         assert!(!is_safe_shell_context_name("has\"quote"));
         assert!(!is_safe_shell_context_name("a;rm -rf /"));
         assert!(!is_safe_shell_context_name("-oProxyCommand=evil"));
+        assert!(!is_safe_shell_context_name("-foo"));
     }
 
     #[test]

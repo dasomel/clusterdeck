@@ -26,6 +26,13 @@ use crate::services::validate;
 /// mid-flight user cancellation is deferred (ADR-0007 D7).
 const LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(600);
 
+/// `find_fresh_instance`'s re-discovery re-runs the full `detect_local_hosts` sweep (Colima +
+/// Lima + Vagrant + `docker context ls`), which is a handful of local CLI calls, not a
+/// minutes-long VM operation — bounded separately from `LIFECYCLE_TIMEOUT` so a hung `vagrant`
+/// (the heaviest of the three, per ADR-0005) can't stall a Start/Stop/Restart/Shell/Context call
+/// indefinitely while `LifecycleGuard`'s per-instance lock is held.
+const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// The provider dispatch for lifecycle actions. Deliberately narrower than
 /// `DiscoveredLocalHost.provider: String` (which also carries "Vagrant") — Phase 2 only builds
 /// start/stop/restart/shell for Colima and Lima (ADR-0007 D1); routing a free string into argv
@@ -120,7 +127,18 @@ async fn find_fresh_instance(
     if !validate::is_safe_local_runtime_instance_name(instance_name) {
         return Err(format!("invalid instance name: {instance_name}"));
     }
-    let hosts = local_runtime::detect_local_hosts(runner).await?;
+    let hosts =
+        match tokio::time::timeout(DISCOVERY_TIMEOUT, local_runtime::detect_local_hosts(runner))
+            .await
+        {
+            Ok(res) => res?,
+            Err(_) => {
+                return Err(format!(
+                    "local runtime discovery timed out after {}s",
+                    DISCOVERY_TIMEOUT.as_secs()
+                ))
+            }
+        };
     hosts
         .into_iter()
         .find(|h| h.provider == provider.display_name() && h.instance_name == instance_name)
@@ -235,9 +253,10 @@ pub async fn stop_instance(
 }
 
 /// Colima has a native `restart` subcommand; Lima's CLI also has one, but ADR-0007 D1
-/// deliberately implements Lima restart as stop-then-start via the same two calls this module
-/// already validates and times out individually, rather than a third CLI surface to reason
-/// about. If stop fails, start is not attempted.
+/// deliberately implements Lima restart as stop-then-start rather than a third CLI surface to
+/// reason about. If stop fails, start is not attempted. The combined stop+start runs under one
+/// `LIFECYCLE_TIMEOUT` deadline (not one per call) so the worst case stays 10 minutes instead of
+/// 20.
 pub async fn restart_instance(
     runner: &dyn CommandRunner,
     provider: LocalRuntimeProvider,
@@ -262,28 +281,33 @@ pub async fn restart_instance(
             })
         }
         LocalRuntimeProvider::Lima => {
-            let stop_out = run_with_timeout(
-                runner,
-                "limactl",
-                &["stop".to_string(), instance_name.to_string()],
-            )
-            .await?;
-            if !stop_out.success {
-                return Ok(LifecycleActionResult {
-                    success: false,
-                    message: format!("stop failed: {}", tail_message(&stop_out)),
-                });
-            }
-            let start_out = run_with_timeout(
-                runner,
-                "limactl",
-                &["start".to_string(), instance_name.to_string()],
-            )
-            .await?;
-            Ok(LifecycleActionResult {
-                success: start_out.success,
-                message: tail_message(&start_out),
+            let combined = tokio::time::timeout(LIFECYCLE_TIMEOUT, async {
+                let stop_out = runner
+                    .run("limactl", &["stop".to_string(), instance_name.to_string()])
+                    .await?;
+                if !stop_out.success {
+                    return Ok(LifecycleActionResult {
+                        success: false,
+                        message: format!("stop failed: {}", tail_message(&stop_out)),
+                    });
+                }
+                let start_out = runner
+                    .run("limactl", &["start".to_string(), instance_name.to_string()])
+                    .await?;
+                Ok(LifecycleActionResult {
+                    success: start_out.success,
+                    message: tail_message(&start_out),
+                })
             })
+            .await;
+
+            match combined {
+                Ok(result) => result,
+                Err(_) => Err(format!(
+                    "limactl restart timed out after {}s",
+                    LIFECYCLE_TIMEOUT.as_secs()
+                )),
+            }
         }
     }
 }
@@ -305,19 +329,12 @@ pub async fn open_shell(
     process::open_terminal_with_command(runner, &command_line).await
 }
 
-/// Opens a Terminal window on the host (not the VM) with a session-scoped `DOCKER_CONTEXT`
-/// export and a `kubectl` alias bound to `--context` (D3). Never runs `docker context use` or
-/// `kubectl config use-context` — nothing here mutates the user's global Docker/kube state.
-/// Docker/kube context strings are read off the fresh discovery row, not any caller-supplied
-/// value, and each is independently re-checked by `validate::is_safe_shell_context_name`; a
-/// context that fails that check is omitted rather than quoted defensively (ADR-0007 D6).
-pub async fn open_context_shell(
-    runner: &dyn CommandRunner,
-    provider: LocalRuntimeProvider,
-    instance_name: &str,
-) -> Result<(), String> {
-    let instance = find_fresh_instance(runner, provider, instance_name).await?;
-
+/// Builds the D3 Terminal script (`export DOCKER_CONTEXT=...` / `alias kubectl=...`) from an
+/// already-freshly-discovered row. Split out from `open_context_shell` as a pure, synchronous
+/// seam so the "a context that fails validation is omitted" behavior can be unit-tested directly
+/// against a crafted `DiscoveredLocalHost`, without needing a `CommandRunner` or a live
+/// discovery pass.
+fn build_context_script(instance: &DiscoveredLocalHost) -> Result<String, String> {
     let mut lines = Vec::new();
     if let Some(ctx) = instance.docker_context.as_deref() {
         if validate::is_safe_shell_context_name(ctx) {
@@ -332,11 +349,28 @@ pub async fn open_context_shell(
 
     if lines.is_empty() {
         return Err(format!(
-            "no docker/kube context available for {instance_name}"
+            "no docker/kube context available for {}",
+            instance.instance_name
         ));
     }
 
-    process::open_terminal_with_command(runner, &lines.join("; ")).await
+    Ok(lines.join("; "))
+}
+
+/// Opens a Terminal window on the host (not the VM) with a session-scoped `DOCKER_CONTEXT`
+/// export and a `kubectl` alias bound to `--context` (D3). Never runs `docker context use` or
+/// `kubectl config use-context` — nothing here mutates the user's global Docker/kube state.
+/// Docker/kube context strings are read off the fresh discovery row, not any caller-supplied
+/// value, and each is independently re-checked by `validate::is_safe_shell_context_name`; a
+/// context that fails that check is omitted rather than quoted defensively (ADR-0007 D6).
+pub async fn open_context_shell(
+    runner: &dyn CommandRunner,
+    provider: LocalRuntimeProvider,
+    instance_name: &str,
+) -> Result<(), String> {
+    let instance = find_fresh_instance(runner, provider, instance_name).await?;
+    let script = build_context_script(&instance)?;
+    process::open_terminal_with_command(runner, &script).await
 }
 
 #[cfg(test)]
@@ -604,6 +638,47 @@ mod tests {
         // No Terminal window was opened.
         let calls = runner.calls.lock().unwrap();
         assert!(args_for(&calls, "osascript").is_empty());
+    }
+
+    fn fake_discovered_host(
+        docker_context: Option<&str>,
+        kube_context: Option<&str>,
+    ) -> DiscoveredLocalHost {
+        DiscoveredLocalHost {
+            provider: "Colima".to_string(),
+            instance_name: "default".to_string(),
+            status: "Running".to_string(),
+            host_name: "colima-vm".to_string(),
+            address: "127.0.0.1".to_string(),
+            port: 22,
+            user: "root".to_string(),
+            identity_file: None,
+            runtime: None,
+            kube_context: kube_context.map(str::to_string),
+            kube_remote_path: None,
+            arch: None,
+            cpus: None,
+            memory_bytes: None,
+            disk_bytes: None,
+            docker_context: docker_context.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn build_context_script_omits_context_that_fails_validation() {
+        // kube_context has a space and a semicolon, so it fails is_safe_shell_context_name and
+        // must be dropped rather than quoted defensively; docker_context is valid and kept.
+        let instance = fake_discovered_host(Some("colima"), Some("bad context; rm -rf /"));
+        let script = build_context_script(&instance).unwrap();
+        assert!(script.contains("export DOCKER_CONTEXT=colima"));
+        assert!(!script.contains("kubectl"));
+    }
+
+    #[test]
+    fn build_context_script_errors_when_all_contexts_fail_validation() {
+        let instance = fake_discovered_host(Some("bad docker"), Some("bad kube"));
+        let err = build_context_script(&instance).unwrap_err();
+        assert!(err.contains("no docker/kube context available"));
     }
 
     #[test]
