@@ -140,12 +140,21 @@ separate, ongoing setting from the bootstrap-only password above:
   Test Connection, and kubeconfig fetch all honor the selected mode. The password itself lives
   only in frontend React state for the duration of the action and is cleared afterward; it is
   never persisted to profile YAML, generated SSH config, or logs.
-- Password mode applies to the target host only. When a profile uses a bastion, the bastion hop
-  still authenticates with its own key (`Bastion.identity_file`); ClusterDeck does not support
-  password authentication for the ProxyJump hop itself.
+- Password mode is refused entirely when a profile uses a bastion (Connect, Test Connection, and
+  kubeconfig fetch all return a clear error rather than attempting the connection). The jump hop
+  to the bastion has no `BatchMode`, so if the bastion's own key auth ever failed, it would drop
+  into an interactive password prompt for the bastion -- not the target -- and `sshpass` would
+  answer that prompt with the target's password, leaking it to the wrong host. Password auth is
+  target-host-only; a bastion in the profile must use key auth, or the profile must drop the
+  bastion to use password auth on its host(s).
 - `BatchMode=yes` (used everywhere else to avoid hanging on an interactive prompt) is omitted for
   password-mode connections, since it would block the password prompt `sshpass` answers.
-  `StrictHostKeyChecking=accept-new` still applies in both modes.
+  `StrictHostKeyChecking=accept-new` still applies in both modes. Password-mode connections also
+  force `PubkeyAuthentication=no` and `PreferredAuthentications=password,keyboard-interactive`:
+  without this, ssh tries a configured/default identity file first, and if that key is
+  passphrase-protected, its "Enter passphrase" prompt has nothing to answer it (sshpass only
+  answers a *password* prompt) and the process hangs forever. Every password-mode SSH invocation
+  is additionally bounded by a 30s timeout as a last-resort guard against an unanticipated hang.
 
 ## 7. SSH Configuration Ownership
 

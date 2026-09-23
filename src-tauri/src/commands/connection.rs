@@ -7,7 +7,7 @@ use crate::services::config::{AuthMode, Profile};
 use crate::services::k8s_endpoints::DiscoveredEndpoint;
 use crate::services::kubeconfig::KubeconfigSummary;
 use crate::services::paths::ClusterDeckPaths;
-use crate::services::process::SystemRunner;
+use crate::services::process::{CommandRunner, SystemRunner};
 use crate::services::ssh::{self, BootstrapResult};
 use crate::services::ssh_config;
 use crate::services::state;
@@ -79,6 +79,44 @@ pub async fn probe_profile_hosts(
     Ok(results)
 }
 
+// Split out of `bootstrap_profile` so the password-mode-host skip can be unit tested against a
+// FakeRunner, the same way commands/profiles.rs's save_profile_with_paths is -- the tauri
+// command itself hardcodes SystemRunner/ClusterDeckPaths::resolve(), which a test should not
+// invoke for real.
+async fn bootstrap_profile_hosts(
+    runner: &dyn CommandRunner,
+    profile: &Profile,
+    password: &str,
+) -> Vec<BootstrapResult> {
+    let mut results = Vec::new();
+    for host in &profile.hosts {
+        // Bootstrap deploys a public key via a one-time password; that's meaningless for a host
+        // permanently configured for password auth (it already has a working, ongoing auth
+        // method), so skip it rather than pointlessly deploying an unused key. Same rule as
+        // connect_profile's bootstrap-to-key fallback.
+        if host.auth != AuthMode::Key {
+            results.push(BootstrapResult {
+                host: host.name.clone(),
+                key_deployed: false,
+                verified: false,
+                detail: "skipped: host uses password authentication".to_string(),
+            });
+            continue;
+        }
+        let boot = ssh::bootstrap_host(
+            runner,
+            host,
+            profile.bastion.as_ref(),
+            password,
+            profile.bootstrap.retries,
+            Duration::from_secs(profile.bootstrap.retry_delay_secs),
+        )
+        .await;
+        results.push(boot);
+    }
+    results
+}
+
 #[tauri::command]
 pub async fn bootstrap_profile(
     profile_id: String,
@@ -88,20 +126,7 @@ pub async fn bootstrap_profile(
     let profile = store::get_profile(&paths, &profile_id)?;
     let runner = SystemRunner;
 
-    let mut results = Vec::new();
-    for host in &profile.hosts {
-        let boot = ssh::bootstrap_host(
-            &runner,
-            host,
-            profile.bastion.as_ref(),
-            &password,
-            profile.bootstrap.retries,
-            Duration::from_secs(profile.bootstrap.retry_delay_secs),
-        )
-        .await;
-        results.push(boot);
-    }
-    Ok(results)
+    Ok(bootstrap_profile_hosts(&runner, &profile, &password).await)
 }
 
 #[tauri::command]
@@ -141,6 +166,44 @@ fn resolve_verify_context(profile: &Profile, kubeconfig_path: &Path) -> String {
     profile.id.clone()
 }
 
+// No password parameter on this command: it's a read-only/polling status check, so
+// password-auth hosts can't be probed here. Only probe key-auth hosts; if the profile has none
+// (all hosts are password-mode), keep whatever a prior Connect/Test Connection call (which do
+// take a password) last verified instead of overwriting it with a false "unreachable" just
+// because this command has nothing it can check. Split out for unit testing (same rationale as
+// bootstrap_profile_hosts above).
+async fn compute_ssh_reachability(
+    runner: &dyn CommandRunner,
+    profile: &Profile,
+    cached_ssh: bool,
+) -> bool {
+    let key_hosts: Vec<_> = profile
+        .hosts
+        .iter()
+        .filter(|h| h.auth == AuthMode::Key)
+        .collect();
+
+    if key_hosts.is_empty() {
+        return cached_ssh;
+    }
+
+    for host in key_hosts {
+        let probe = ssh::probe_with_retry(
+            runner,
+            host,
+            profile.bastion.as_ref(),
+            1,
+            Duration::from_secs(1),
+            None,
+        )
+        .await;
+        if probe.reachable {
+            return true;
+        }
+    }
+    false
+}
+
 #[tauri::command]
 pub async fn verify_profile(profile_id: String) -> Result<VerificationResult, String> {
     let paths = ClusterDeckPaths::resolve()?;
@@ -165,26 +228,12 @@ pub async fn verify_profile(profile_id: String) -> Result<VerificationResult, St
 
     result.kubeconfig = kubeconfig_path.exists();
 
-    // No password parameter on this command: it's a read-only/polling status check, so
-    // password-auth hosts can't be probed here and will simply report unreachable until a
-    // Connect or Test Connection call (which do take a password) refreshes the cached status.
-    let mut any_reachable = false;
-    for host in &profile.hosts {
-        let probe = ssh::probe_with_retry(
-            &runner,
-            host,
-            profile.bastion.as_ref(),
-            1,
-            Duration::from_secs(1),
-            None,
-        )
-        .await;
-        if probe.reachable {
-            any_reachable = true;
-            break;
-        }
-    }
-    result.ssh = any_reachable;
+    let cached_ssh = state::get_status(&paths, &profile_id)
+        .ok()
+        .flatten()
+        .map(|c| c.ssh)
+        .unwrap_or(false);
+    result.ssh = compute_ssh_reachability(&runner, &profile, cached_ssh).await;
 
     state::save_status(&paths, &profile_id, result.clone())?;
     Ok(result)
@@ -598,4 +647,129 @@ pub async fn open_url_in_browser(url: String) -> Result<(), String> {
     }
     let runner = SystemRunner;
     crate::services::process::open_with_system(&runner, &[url.trim().to_string()], "").await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::services::config::{BootstrapPolicy, Host};
+    use crate::services::process::CommandOutput;
+    use async_trait::async_trait;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct AlwaysSucceedsRunner {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl CommandRunner for AlwaysSucceedsRunner {
+        async fn run(&self, _bin: &str, _args: &[String]) -> Result<CommandOutput, String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(CommandOutput {
+                stdout: String::new(),
+                stderr: String::new(),
+                success: true,
+            })
+        }
+    }
+
+    struct NeverCalledRunner;
+
+    #[async_trait]
+    impl CommandRunner for NeverCalledRunner {
+        async fn run(&self, bin: &str, _args: &[String]) -> Result<CommandOutput, String> {
+            panic!("runner should not be invoked, but was called with bin={bin}");
+        }
+    }
+
+    fn key_host(name: &str) -> Host {
+        Host {
+            name: name.to_string(),
+            address: "192.0.2.10".to_string(),
+            port: 22,
+            user: "root".to_string(),
+            identity_file: None,
+            auth: AuthMode::Key,
+        }
+    }
+
+    fn password_host(name: &str) -> Host {
+        Host {
+            auth: AuthMode::Password,
+            ..key_host(name)
+        }
+    }
+
+    fn profile_with_hosts(hosts: Vec<Host>) -> Profile {
+        Profile {
+            id: "test".to_string(),
+            name: "Test".to_string(),
+            hosts,
+            bastion: None,
+            bootstrap: BootstrapPolicy::default(),
+            kubeconfig: None,
+            manage_hosts_file: false,
+            trusted_cas: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn bootstrap_profile_hosts_skips_password_auth_hosts() {
+        let runner = AlwaysSucceedsRunner {
+            calls: AtomicUsize::new(0),
+        };
+        let profile = profile_with_hosts(vec![key_host("m1"), password_host("m2")]);
+
+        let results = bootstrap_profile_hosts(&runner, &profile, "irrelevant").await;
+
+        assert_eq!(results.len(), 2);
+        let key_result = results.iter().find(|r| r.host == "m1").unwrap();
+        assert!(key_result.key_deployed);
+
+        let pwd_result = results.iter().find(|r| r.host == "m2").unwrap();
+        assert!(!pwd_result.key_deployed);
+        assert!(!pwd_result.verified);
+        assert_eq!(
+            pwd_result.detail,
+            "skipped: host uses password authentication"
+        );
+
+        // deploy_public_key (ssh-copy-id) + one successful probe for the key host only; the
+        // password host must never reach the runner at all.
+        assert_eq!(runner.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn bootstrap_profile_hosts_skips_every_host_when_all_are_password_auth() {
+        let runner = NeverCalledRunner;
+        let profile = profile_with_hosts(vec![password_host("m1"), password_host("m2")]);
+
+        let results = bootstrap_profile_hosts(&runner, &profile, "irrelevant").await;
+
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|r| !r.key_deployed && !r.verified));
+    }
+
+    #[tokio::test]
+    async fn compute_ssh_reachability_keeps_cached_value_when_profile_has_no_key_hosts() {
+        let runner = NeverCalledRunner;
+        let profile = profile_with_hosts(vec![password_host("m1")]);
+
+        assert!(compute_ssh_reachability(&runner, &profile, true).await);
+        assert!(!compute_ssh_reachability(&runner, &profile, false).await);
+    }
+
+    #[tokio::test]
+    async fn compute_ssh_reachability_probes_key_hosts_and_ignores_password_hosts() {
+        let runner = AlwaysSucceedsRunner {
+            calls: AtomicUsize::new(0),
+        };
+        let profile = profile_with_hosts(vec![password_host("m1"), key_host("m2")]);
+
+        // Starts from a false cached value to prove the `true` result comes from actually
+        // probing the key host, not from the cached fallback.
+        let reachable = compute_ssh_reachability(&runner, &profile, false).await;
+        assert!(reachable);
+        assert_eq!(runner.calls.load(Ordering::SeqCst), 1);
+    }
 }

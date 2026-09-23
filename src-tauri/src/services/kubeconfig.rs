@@ -182,6 +182,16 @@ async fn fetch_remote_kubeconfig_content(
 
     let pwd = match host.auth {
         AuthMode::Password => {
+            // Refuse rather than risk it: the jump hop to the bastion (rendered into the -F
+            // config without BatchMode) would drop into an interactive prompt if its own key
+            // auth failed, and sshpass would answer that prompt with the TARGET's password --
+            // leaking it to the bastion instead. Same reasoning as ssh::probe_password_auth.
+            if profile.bastion.is_some() {
+                return Err(
+                    "password auth is not supported through a bastion/ProxyJump; use key auth for this host or remove the bastion"
+                        .to_string(),
+                );
+            }
             Some(password.ok_or_else(|| "password required for password-auth host".to_string())?)
         }
         AuthMode::Key => None,
@@ -195,7 +205,9 @@ async fn fetch_remote_kubeconfig_content(
         // BatchMode disables the interactive password prompt that sshpass answers via SSHPASS
         // (same reasoning as ssh::probe_password_auth). StrictHostKeyChecking accept-new is
         // already baked into the generated -F config (ssh_config::render_profile_config), so it
-        // doesn't need to be repeated here for either mode.
+        // doesn't need to be repeated here for either mode. Password mode also forces
+        // password-only auth (ssh::push_password_auth_options) so a locked identity file never
+        // hangs the prompt sshpass is waiting to answer.
         let (bin, ssh_args, env): (&str, Vec<String>, Vec<(String, String)>) = match pwd {
             None => (
                 "ssh",
@@ -211,23 +223,27 @@ async fn fetch_remote_kubeconfig_content(
                 ],
                 Vec::new(),
             ),
-            Some(secret) => (
-                "sshpass",
-                vec![
+            Some(secret) => {
+                let mut args = vec![
                     "-e".to_string(),
                     "ssh".to_string(),
                     "-F".to_string(),
                     ssh_conf_path.to_string_lossy().to_string(),
                     "-o".to_string(),
                     "ConnectTimeout=5".to_string(),
-                    alias.clone(),
-                    read_cmd,
-                ],
-                vec![("SSHPASS".to_string(), secret.to_string())],
-            ),
+                ];
+                crate::services::ssh::push_password_auth_options(&mut args);
+                args.push(alias.clone());
+                args.push(read_cmd);
+                (
+                    "sshpass",
+                    args,
+                    vec![("SSHPASS".to_string(), secret.to_string())],
+                )
+            }
         };
 
-        let ssh_output = crate::services::ssh::run_with_host_key_retry(
+        let ssh_output = crate::services::ssh::run_with_host_key_retry_timed(
             runner,
             bin,
             &ssh_args,
@@ -243,6 +259,13 @@ async fn fetch_remote_kubeconfig_content(
                     return Ok(out.stdout);
                 } else if !out.stderr.is_empty() {
                     last_ssh_err = out.stderr;
+                    // Stop trying further candidate paths on an auth failure: each retry is
+                    // another failed login against the same host, and repeating it across
+                    // candidates risks tripping OpenSSH's PerSourcePenalties (or fail2ban-style
+                    // tooling) and getting the client blocked entirely.
+                    if crate::services::ssh::is_auth_failure_error(&last_ssh_err) {
+                        break;
+                    }
                 }
             }
             Err(e) => {
@@ -1398,8 +1421,96 @@ users:
             !args.contains(&"BatchMode=yes".to_string()),
             "BatchMode=yes would block the password prompt sshpass answers: {args:?}"
         );
+        assert!(args.contains(&"PubkeyAuthentication=no".to_string()));
+        assert!(
+            args.contains(&"PreferredAuthentications=password,keyboard-interactive".to_string())
+        );
         assert!(!args.contains(&secret.to_string()));
         assert!(env.contains(&("SSHPASS".to_string(), secret.to_string())));
+
+        std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn fetch_and_store_refuses_password_mode_with_a_bastion() {
+        use crate::services::config::Bastion;
+        let temp_dir = std::env::temp_dir().join(format!(
+            "clusterdeck-kc-test-pwd-bastion-{}",
+            std::process::id()
+        ));
+        let paths = ClusterDeckPaths::at(temp_dir.clone());
+        let mut profile = password_auth_profile("cka-pwd-bastion");
+        profile.bastion = Some(Bastion {
+            name: "b".to_string(),
+            address: "10.0.0.10".to_string(),
+            port: 22,
+            user: "ubuntu".to_string(),
+            identity_file: None,
+        });
+
+        let runner = CapturingSshRunner {
+            sample_yaml: SAMPLE.to_string(),
+            calls: std::sync::Mutex::new(Vec::new()),
+        };
+
+        let err = fetch_and_store(&runner, &paths, &profile, Some("irrelevant"))
+            .await
+            .unwrap_err();
+        assert!(err.contains("bastion"));
+        // Must refuse before ever touching the network/runner: a jump hop without BatchMode
+        // could otherwise leak the target's password to the bastion if its key auth failed.
+        assert_eq!(runner.calls.lock().unwrap().len(), 0);
+
+        std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn fetch_and_store_stops_candidate_loop_on_auth_failure() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "clusterdeck-kc-test-auth-fail-{}",
+            std::process::id()
+        ));
+        let paths = ClusterDeckPaths::at(temp_dir.clone());
+        let profile = password_auth_profile("cka-auth-fail");
+        let secret = "wrong_password";
+
+        struct AuthFailingRunner {
+            calls: std::sync::Mutex<usize>,
+        }
+
+        #[async_trait]
+        impl CommandRunner for AuthFailingRunner {
+            async fn run(&self, _bin: &str, _args: &[String]) -> Result<CommandOutput, String> {
+                *self.calls.lock().unwrap() += 1;
+                Ok(CommandOutput {
+                    stdout: String::new(),
+                    stderr: "root@192.0.2.10: Permission denied (password).".to_string(),
+                    success: false,
+                })
+            }
+
+            async fn run_with_env(
+                &self,
+                bin: &str,
+                args: &[String],
+                _env: &[(String, String)],
+            ) -> Result<CommandOutput, String> {
+                self.run(bin, args).await
+            }
+        }
+
+        let runner = AuthFailingRunner {
+            calls: std::sync::Mutex::new(0),
+        };
+
+        let err = fetch_and_store(&runner, &paths, &profile, Some(secret))
+            .await
+            .unwrap_err();
+        assert!(err.contains("Permission denied"));
+        // There are 5 candidate paths total; a real auth failure must stop after the first one
+        // rather than repeating a failed login 5x in a row (risks OpenSSH PerSourcePenalties or
+        // fail2ban-style client lockout).
+        assert_eq!(*runner.calls.lock().unwrap(), 1);
 
         std::fs::remove_dir_all(&temp_dir).ok();
     }

@@ -112,6 +112,10 @@ export default function App() {
     } else {
       setHostsStatus(null);
     }
+    // Switching profiles must never carry a typed-but-unsubmitted password over to a different
+    // profile's hosts: both fields are ephemeral UI state, not tied to any particular profile.
+    setSshPassword('');
+    setBootstrapPassword('');
   }, [selectedId]);
 
   const selected = useMemo(
