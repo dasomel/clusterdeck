@@ -588,6 +588,7 @@ export default function App() {
           <div>
             <div className="brand-name">ClusterDeck</div>
             <div className="brand-subtitle">macOS cluster access</div>
+            <div className="brand-version">v{__APP_VERSION__}</div>
           </div>
         </div>
 

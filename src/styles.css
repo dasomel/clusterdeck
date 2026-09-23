@@ -240,6 +240,13 @@ button:focus-visible,
   font-size: 11px;
 }
 
+.brand-version {
+  margin-top: 2px;
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 10px;
+}
+
 .section-label {
   padding: 0 8px 8px;
   color: var(--text-tertiary);
