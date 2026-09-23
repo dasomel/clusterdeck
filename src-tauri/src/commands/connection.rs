@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use serde::Serialize;
 
-use crate::services::config::Profile;
+use crate::services::config::{AuthMode, Profile};
 use crate::services::k8s_endpoints::DiscoveredEndpoint;
 use crate::services::kubeconfig::KubeconfigSummary;
 use crate::services::paths::ClusterDeckPaths;
@@ -49,10 +49,14 @@ pub struct HostsFileStatus {
 }
 
 #[tauri::command]
-pub async fn probe_profile_hosts(profile_id: String) -> Result<Vec<HostStageResult>, String> {
+pub async fn probe_profile_hosts(
+    profile_id: String,
+    password: Option<String>,
+) -> Result<Vec<HostStageResult>, String> {
     let paths = ClusterDeckPaths::resolve()?;
     let profile = store::get_profile(&paths, &profile_id)?;
     let runner = SystemRunner;
+    let pwd = password.as_deref();
 
     let host_futures = profile.hosts.iter().map(|host| async {
         let probe = ssh::probe_with_retry(
@@ -61,6 +65,7 @@ pub async fn probe_profile_hosts(profile_id: String) -> Result<Vec<HostStageResu
             profile.bastion.as_ref(),
             1,
             Duration::from_secs(1),
+            pwd,
         )
         .await;
         HostStageResult {
@@ -112,12 +117,16 @@ pub async fn generate_aliases(profile_id: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub async fn fetch_kubeconfig(profile_id: String) -> Result<KubeconfigSummary, String> {
+pub async fn fetch_kubeconfig(
+    profile_id: String,
+    password: Option<String>,
+) -> Result<KubeconfigSummary, String> {
     let paths = ClusterDeckPaths::resolve()?;
     let profile = store::get_profile(&paths, &profile_id)?;
     let runner = SystemRunner;
 
-    crate::services::kubeconfig::fetch_and_store(&runner, &paths, &profile).await
+    crate::services::kubeconfig::fetch_and_store(&runner, &paths, &profile, password.as_deref())
+        .await
 }
 
 fn resolve_verify_context(profile: &Profile, kubeconfig_path: &Path) -> String {
@@ -156,6 +165,9 @@ pub async fn verify_profile(profile_id: String) -> Result<VerificationResult, St
 
     result.kubeconfig = kubeconfig_path.exists();
 
+    // No password parameter on this command: it's a read-only/polling status check, so
+    // password-auth hosts can't be probed here and will simply report unreachable until a
+    // Connect or Test Connection call (which do take a password) refreshes the cached status.
     let mut any_reachable = false;
     for host in &profile.hosts {
         let probe = ssh::probe_with_retry(
@@ -164,6 +176,7 @@ pub async fn verify_profile(profile_id: String) -> Result<VerificationResult, St
             profile.bastion.as_ref(),
             1,
             Duration::from_secs(1),
+            None,
         )
         .await;
         if probe.reachable {
@@ -187,10 +200,12 @@ pub async fn get_profile_status(profile_id: String) -> Result<Option<Verificatio
 pub async fn connect_profile(
     profile_id: String,
     bootstrap_password: Option<String>,
+    password: Option<String>,
 ) -> Result<ConnectionResult, String> {
     let paths = ClusterDeckPaths::resolve()?;
     let profile = store::get_profile(&paths, &profile_id)?;
     let runner = SystemRunner;
+    let pwd = password.as_deref();
 
     let host_futures = profile.hosts.iter().map(|host| async {
         let mut probe = ssh::probe_with_retry(
@@ -199,16 +214,20 @@ pub async fn connect_profile(
             profile.bastion.as_ref(),
             profile.bootstrap.retries,
             Duration::from_secs(profile.bootstrap.retry_delay_secs),
+            pwd,
         )
         .await;
 
-        if !probe.reachable && profile.bootstrap.enabled {
-            if let Some(pwd) = bootstrap_password.as_ref() {
+        // The bootstrap-to-key flow only applies to key-auth hosts: it deploys a public key via
+        // a one-time password, which makes no sense for a host permanently configured for
+        // password auth (it already has a working, ongoing auth method).
+        if !probe.reachable && profile.bootstrap.enabled && host.auth == AuthMode::Key {
+            if let Some(bpwd) = bootstrap_password.as_ref() {
                 let boot_res = ssh::bootstrap_host(
                     &runner,
                     host,
                     profile.bastion.as_ref(),
-                    pwd,
+                    bpwd,
                     profile.bootstrap.retries,
                     Duration::from_secs(profile.bootstrap.retry_delay_secs),
                 )
@@ -261,7 +280,7 @@ pub async fn connect_profile(
     let mut kubeconfig_summary = None;
 
     if profile.kubeconfig.is_some() && any_host_reachable {
-        match crate::services::kubeconfig::fetch_and_store(&runner, &paths, &profile).await {
+        match crate::services::kubeconfig::fetch_and_store(&runner, &paths, &profile, pwd).await {
             Ok(summary) => {
                 kubeconfig_summary = Some(summary);
             }

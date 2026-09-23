@@ -117,7 +117,7 @@ pub fn ensure_ssh_include(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::services::config::{Bastion, BootstrapPolicy, Host, Profile};
+    use crate::services::config::{AuthMode, Bastion, BootstrapPolicy, Host, Profile};
 
     fn profile_with_bastion() -> Profile {
         Profile {
@@ -129,6 +129,7 @@ mod tests {
                 port: 22,
                 user: "vagrant".into(),
                 identity_file: Some("~/.ssh/cka".into()),
+                auth: AuthMode::Key,
             }],
             bastion: Some(Bastion {
                 name: "bastion01".into(),

@@ -726,6 +726,7 @@ async fn detect_vagrant(runner: &dyn CommandRunner) -> Vec<DiscoveredLocalHost> 
                     port,
                     user: user.clone(),
                     identity_file: identity_file.clone(),
+                    auth: crate::services::config::AuthMode::Key,
                 };
                 let probe_args = crate::services::ssh::build_ssh_target_args(
                     &probe_host,

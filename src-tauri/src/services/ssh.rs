@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use crate::services::config::{Bastion, Host};
+use crate::services::config::{AuthMode, Bastion, Host};
 use crate::services::process::{CommandOutput, CommandRunner};
 use crate::services::validate::{is_safe_known_hosts_path, is_safe_ssh_identifier};
 use serde::Serialize;
@@ -300,6 +300,28 @@ pub async fn probe_password_auth(
     }
 }
 
+/// Dispatches to `probe_key_auth` or `probe_password_auth` based on `host.auth` (Issue #26).
+/// `password` is only consulted for `AuthMode::Password`; a missing password in that mode is
+/// reported as unreachable rather than silently falling back to key auth.
+pub async fn probe_auth(
+    runner: &dyn CommandRunner,
+    host: &Host,
+    bastion: Option<&Bastion>,
+    password: Option<&str>,
+) -> ProbeResult {
+    match host.auth {
+        AuthMode::Key => probe_key_auth(runner, host, bastion).await,
+        AuthMode::Password => match password {
+            Some(pwd) => probe_password_auth(runner, host, bastion, pwd).await,
+            None => ProbeResult {
+                host: host.name.clone(),
+                reachable: false,
+                detail: "password required for password-auth host".to_string(),
+            },
+        },
+    }
+}
+
 pub async fn deploy_public_key(
     runner: &dyn CommandRunner,
     host: &Host,
@@ -354,6 +376,7 @@ pub async fn probe_with_retry(
     bastion: Option<&Bastion>,
     retries: u32,
     retry_delay: std::time::Duration,
+    password: Option<&str>,
 ) -> ProbeResult {
     let attempts = std::cmp::max(1, retries);
     let mut last_result = ProbeResult {
@@ -363,7 +386,7 @@ pub async fn probe_with_retry(
     };
 
     for attempt in 1..=attempts {
-        last_result = probe_key_auth(runner, host, bastion).await;
+        last_result = probe_auth(runner, host, bastion, password).await;
         if last_result.reachable {
             return last_result;
         }
@@ -385,7 +408,10 @@ pub async fn bootstrap_host(
 ) -> BootstrapResult {
     match deploy_public_key(runner, host, bastion, password).await {
         Ok(_) => {
-            let probe_res = probe_with_retry(runner, host, bastion, retries, retry_delay).await;
+            // Post-deploy verification is always key auth: bootstrap_host's whole purpose is
+            // deploying a public key, so the freshly-deployed key is what we're confirming here.
+            let probe_res =
+                probe_with_retry(runner, host, bastion, retries, retry_delay, None).await;
             BootstrapResult {
                 host: host.name.clone(),
                 key_deployed: true,
@@ -405,7 +431,7 @@ pub async fn bootstrap_host(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::services::config::Host;
+    use crate::services::config::{AuthMode, Host};
     use crate::services::process::CommandOutput;
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -439,6 +465,7 @@ mod tests {
             port: 22,
             user: "root".into(),
             identity_file: None,
+            auth: AuthMode::Key,
         }
     }
 
@@ -464,6 +491,7 @@ mod tests {
             None,
             3,
             std::time::Duration::from_millis(1),
+            None,
         )
         .await;
         assert!(result.reachable);
@@ -481,6 +509,7 @@ mod tests {
             None,
             2,
             std::time::Duration::from_millis(1),
+            None,
         )
         .await;
         assert!(!result.reachable);
@@ -605,6 +634,75 @@ mod tests {
             assert!(args.contains(&"StrictHostKeyChecking=accept-new".to_string()));
             assert!(args.contains(&"ConnectTimeout=5".to_string()));
         }
+    }
+
+    #[tokio::test]
+    async fn probe_auth_dispatches_key_hosts_to_key_auth_without_touching_env_runner() {
+        // Key mode (the default/unchanged path) must never go through run_with_env: no
+        // password exists to carry, so it should behave exactly like probe_key_auth.
+        let runner = EnvCapturingRunner {
+            calls: std::sync::Mutex::new(Vec::new()),
+        };
+        let result = probe_auth(&runner, &host(), None, None).await;
+        assert!(result.reachable);
+        assert_eq!(runner.calls.lock().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn probe_auth_dispatches_password_hosts_to_sshpass_with_no_batchmode() {
+        let mut h = host();
+        h.auth = AuthMode::Password;
+        let runner = EnvCapturingRunner {
+            calls: std::sync::Mutex::new(Vec::new()),
+        };
+        let secret = "super_secret_password_123";
+        let result = probe_auth(&runner, &h, None, Some(secret)).await;
+        assert!(result.reachable);
+
+        let calls = runner.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        let (args, env) = &calls[0];
+        // BatchMode=yes would block the interactive password prompt sshpass answers, so the
+        // password-mode argv must never include it (see push_connection_options's doc comment).
+        assert!(!args.contains(&"BatchMode=yes".to_string()));
+        assert!(args.contains(&"StrictHostKeyChecking=accept-new".to_string()));
+        assert!(args.contains(&"-e".to_string()));
+        assert!(!args.contains(&secret.to_string()));
+        assert!(env.contains(&("SSHPASS".to_string(), secret.to_string())));
+    }
+
+    #[tokio::test]
+    async fn probe_auth_reports_password_hosts_unreachable_without_a_password() {
+        let mut h = host();
+        h.auth = AuthMode::Password;
+        let runner = EnvCapturingRunner {
+            calls: std::sync::Mutex::new(Vec::new()),
+        };
+        let result = probe_auth(&runner, &h, None, None).await;
+        assert!(!result.reachable);
+        assert!(result.detail.contains("password"));
+        // No process should be spawned when there is nothing to authenticate with.
+        assert_eq!(runner.calls.lock().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn host_deserializes_default_auth_mode_as_key_for_legacy_yaml_without_the_field() {
+        // Regression: profile YAML persisted before Issue #26 has no `auth` field at all.
+        // #[serde(default)] on Host::auth must make that deserialize as Key, not fail.
+        let legacy_yaml =
+            "name: cka-m1\naddress: 192.0.2.10\nport: 22\nuser: root\nidentity_file: null\n";
+        let parsed: Host = serde_yaml::from_str(legacy_yaml).expect("legacy host YAML must parse");
+        assert_eq!(parsed.auth, AuthMode::Key);
+    }
+
+    #[test]
+    fn host_round_trips_password_auth_mode_through_yaml() {
+        let mut h = host();
+        h.auth = AuthMode::Password;
+        let yaml = serde_yaml::to_string(&h).unwrap();
+        assert!(yaml.contains("auth: password"));
+        let parsed: Host = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(parsed.auth, AuthMode::Password);
     }
 
     /// Real-process regression: FakeRunner tests above only prove build_ssh_target_args

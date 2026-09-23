@@ -160,7 +160,7 @@ pub fn get_profile_hosts_block(existing: &str, profile_id: &str) -> Option<Vec<S
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::services::config::{Bastion, BootstrapPolicy, Host, Profile};
+    use crate::services::config::{AuthMode, Bastion, BootstrapPolicy, Host, Profile};
 
     fn profile() -> Profile {
         Profile {
@@ -172,6 +172,7 @@ mod tests {
                 port: 22,
                 user: "root".into(),
                 identity_file: None,
+                auth: AuthMode::Key,
             }],
             bastion: Some(Bastion {
                 name: "bastion01".into(),

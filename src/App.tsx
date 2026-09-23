@@ -42,6 +42,9 @@ export default function App() {
   });
   const [kubeconfigManagerOpen, setKubeconfigManagerOpen] = useState(false);
   const [bootstrapPassword, setBootstrapPassword] = useState('');
+  // SSH password for hosts using AuthMode::Password. Stays in React state only, never
+  // persisted, and cleared after every Connect/Test Connection attempt (success or failure).
+  const [sshPassword, setSshPassword] = useState('');
   const [profileToDelete, setProfileToDelete] = useState<Profile | null>(null);
   const [deletingProfile, setDeletingProfile] = useState(false);
 
@@ -116,11 +119,16 @@ export default function App() {
     [profiles, selectedId],
   );
 
+  const needsSshPassword = useMemo(
+    () => selected?.hosts.some((h) => h.auth === 'password') ?? false,
+    [selected],
+  );
+
   const connect = async () => {
     if (!selected) return;
     setConnecting(true);
     try {
-      const result = await api.connectProfile(selected.id, bootstrapPassword || undefined);
+      const result = await api.connectProfile(selected.id, bootstrapPassword || undefined, sshPassword || undefined);
       setLastResult(result);
       loadHostsStatus(selected.id);
 
@@ -203,6 +211,7 @@ export default function App() {
     } finally {
       setConnecting(false);
       setBootstrapPassword('');
+      setSshPassword('');
     }
   };
 
@@ -210,7 +219,7 @@ export default function App() {
     if (!selected) return;
     setTesting(true);
     try {
-      const hosts = await api.probeProfileHosts(selected.id);
+      const hosts = await api.probeProfileHosts(selected.id, sshPassword || undefined);
       setLastResult({
         aliases_written: lastResult?.aliases_written ?? false,
         kubeconfig: lastResult?.kubeconfig ?? null,
@@ -252,6 +261,7 @@ export default function App() {
       });
     } finally {
       setTesting(false);
+      setSshPassword('');
     }
   };
 
@@ -732,6 +742,22 @@ export default function App() {
                 <p>Discover hosts, bootstrap SSH, fetch kubeconfig, and verify Kubernetes access from one profile.</p>
               </div>
               <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', alignItems: 'flex-end', flexShrink: 0 }}>
+                {needsSshPassword && (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '3px', width: '180px' }}>
+                    <label className="form-label" style={{ fontSize: '10px' }}>
+                      SSH Password
+                    </label>
+                    <input
+                      type="password"
+                      placeholder="Enter SSH password"
+                      value={sshPassword}
+                      onChange={(e) => setSshPassword(e.target.value)}
+                      className="form-input mono"
+                      style={{ padding: '5px 8px', fontSize: '11px' }}
+                      autoComplete="off"
+                    />
+                  </div>
+                )}
                 {selected?.bootstrap.enabled && (
                   <div style={{ display: 'flex', flexDirection: 'column', gap: '3px', width: '180px' }}>
                     <label className="form-label" style={{ fontSize: '10px' }}>
@@ -744,6 +770,7 @@ export default function App() {
                       onChange={(e) => setBootstrapPassword(e.target.value)}
                       className="form-input mono"
                       style={{ padding: '5px 8px', fontSize: '11px' }}
+                      autoComplete="off"
                     />
                   </div>
                 )}

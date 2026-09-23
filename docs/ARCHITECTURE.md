@@ -128,6 +128,25 @@ Capabilities:
 
 The initial password is bootstrap-only and must never be stored in the repository or included in diagnostic logs.
 
+### 6a. Explicit SSH Authentication Mode
+
+Each host also carries an explicit `auth` mode: `key` (default) or `password`. This is a
+separate, ongoing setting from the bootstrap-only password above:
+
+- `key` (default): the existing OpenSSH key-based flow. Profile YAML written before this field
+  existed has no `auth` key and deserializes as `key`, so no migration is required.
+- `password`: SSH connects using `sshpass -e` with the password carried through the `SSHPASS`
+  environment variable, never as a `-p <password>` argv element or written to disk. Connect,
+  Test Connection, and kubeconfig fetch all honor the selected mode. The password itself lives
+  only in frontend React state for the duration of the action and is cleared afterward; it is
+  never persisted to profile YAML, generated SSH config, or logs.
+- Password mode applies to the target host only. When a profile uses a bastion, the bastion hop
+  still authenticates with its own key (`Bastion.identity_file`); ClusterDeck does not support
+  password authentication for the ProxyJump hop itself.
+- `BatchMode=yes` (used everywhere else to avoid hanging on an interactive prompt) is omitted for
+  password-mode connections, since it would block the password prompt `sshpass` answers.
+  `StrictHostKeyChecking=accept-new` still applies in both modes.
+
 ## 7. SSH Configuration Ownership
 
 ClusterDeck must not rewrite an entire user-managed `~/.ssh/config` file.

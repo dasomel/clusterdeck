@@ -1,11 +1,14 @@
 import { invoke } from '@tauri-apps/api/core';
 
+export type AuthMode = 'key' | 'password';
+
 export type Host = {
   name: string;
   address: string;
   port: number;
   user: string;
   identity_file: string | null;
+  auth: AuthMode;
 };
 
 export type Bastion = {
@@ -192,14 +195,16 @@ export const api = {
   saveProfile: (profile: Profile) => invoke<void>('save_profile', { profile }),
   deleteProfile: (profileId: string) => invoke<void>('delete_profile_cmd', { profileId }),
   discoverHosts: (input: string, port?: number) => invoke<DiscoveredHost[]>('discover_hosts', { input, port }),
-  probeProfileHosts: (profileId: string) => invoke<HostStageResult[]>('probe_profile_hosts', { profileId }),
+  probeProfileHosts: (profileId: string, password?: string) =>
+    invoke<HostStageResult[]>('probe_profile_hosts', { profileId, password }),
   bootstrapProfile: (profileId: string, password: string) => invoke<BootstrapResult[]>('bootstrap_profile', { profileId, password }),
   generateAliases: (profileId: string) => invoke<void>('generate_aliases', { profileId }),
-  fetchKubeconfig: (profileId: string) => invoke<KubeconfigSummary>('fetch_kubeconfig', { profileId }),
+  fetchKubeconfig: (profileId: string, password?: string) =>
+    invoke<KubeconfigSummary>('fetch_kubeconfig', { profileId, password }),
   verifyProfile: (profileId: string) => invoke<VerificationResult>('verify_profile', { profileId }),
   getProfileStatus: (profileId: string) => invoke<VerificationResult | null>('get_profile_status', { profileId }),
-  connectProfile: (profileId: string, bootstrapPassword?: string) =>
-    invoke<ConnectionResult>('connect_profile', { profileId, bootstrapPassword }),
+  connectProfile: (profileId: string, bootstrapPassword?: string, password?: string) =>
+    invoke<ConnectionResult>('connect_profile', { profileId, bootstrapPassword, password }),
   openSshSession: (profileId: string, hostName: string) => invoke<void>('open_ssh_session', { profileId, hostName }),
   backupKubeconfig: (moveFile?: boolean) =>
     invoke<BackupKubeconfigResult>('backup_kubeconfig', { moveFile }),

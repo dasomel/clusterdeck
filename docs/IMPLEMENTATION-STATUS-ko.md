@@ -21,10 +21,12 @@ Last verified: 2026-09-22 against `main`
 - curl Kubernetes API fallback 경로(예: macOS Sequoia Local Network Privacy로 `kubectl` 자체가 실패하는 경우)에서 TLS 인증서를 검증합니다: kubeconfig의 CA 데이터로 `--cacert` 검증하거나, CA 데이터가 없으면 curl의 system trust store를 사용하며, `-k`/`--insecure`는 사용하지 않습니다 (#24).
 - Colima/Lima instance의 architecture/CPU/memory/disk 표시와 Docker context 연동을 포함한 local runtime discovery dashboard가 완성되어 Settings의 read-only "Local Runtime" 섹션으로 제공됩니다 (#14 Phase 1).
 - 실제 대상에 대한 fresh-session replay로 `clusterdeck-connection-workflow` Agent Skill을 재검증했습니다; `openforge-maturity`는 다시 `verified`입니다 (#22).
+- Host별 명시적 SSH 인증 모드(`key`, 기본값, 또는 `password`)를 추가했습니다: password 모드는 Connect, Test Connection, kubeconfig fetch 전 경로에서 일관되게 `sshpass -e`/`SSHPASS`를 사용하고, sshpass가 응답할 password prompt를 막는 `BatchMode=yes`는 생략하되 `StrictHostKeyChecking=accept-new`는 유지하며, password는 frontend state에만 존재하는 ephemeral 값입니다. 이 field가 없던 기존 profile YAML은 변경 없이 `key`로 역직렬화됩니다 (#26).
 
 ## 부분적 / 환경 의존
 
 - Unit/FakeRunner test는 application control flow를 증명하지만 실제 OpenSSH, kubectl, native filesystem, target cluster 동작을 증명하지 못합니다. Critical path 변경은 가능한 경우 real-binary/runtime evidence가 필요합니다.
+- Password 모드 SSH 인증(#26)은 실제 argv/env 구성을 검증하는 unit test(`BatchMode=yes` 없음, `StrictHostKeyChecking=accept-new` 있음, `sshpass -e`와 `SSHPASS` 사용)로 커버되지만, 실제 password 인증 SSH target에 대해서는 검증하지 못했습니다: 개발 환경에 그런 target이 없었습니다(다른 real-process 검증에 쓰인 로컬 Colima VM은 key 기반 인증만 지원합니다).
 - 현재 application은 macOS-first입니다. Rust/React의 portability만으로 다른 platform 지원을 주장하지 않습니다.
 
 ## 주장하지 않음
@@ -51,3 +53,4 @@ Last verified: 2026-09-22 against `main`
 - commit `5e617d3` (local runtime discovery dashboard, issue #14 Phase 1) and commit `e6ff486` (relocated to Settings)
 - commit `268feab` (`clusterdeck-connection-workflow` skill re-verified, issue #22); evidence at `research/issue-22-connection-workflow-replay-2026-09-22.md`
 - commit `cb85aff` and commit `24b231c` (release workflow: macOS `.dmg` draft GitHub Release on `v*` tag push, third-party Actions pinned to commit SHAs)
+- branch `feat/26-password-ssh-auth` (password 기반 SSH 인증 모드, issue #26)

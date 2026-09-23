@@ -92,7 +92,7 @@ pub fn validate_profile(profile: &crate::services::config::Profile) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::services::config::{BootstrapPolicy, Host, Profile};
+    use crate::services::config::{AuthMode, BootstrapPolicy, Host, Profile};
 
     #[test]
     fn is_safe_ssh_identifier_rejects_newlines_and_dashes() {
@@ -123,6 +123,7 @@ mod tests {
                 port: 22,
                 user: "root".into(),
                 identity_file: None,
+                auth: AuthMode::Key,
             }],
             bastion: None,
             bootstrap: BootstrapPolicy::default(),
@@ -154,6 +155,7 @@ mod tests {
                 port: 22,
                 user: "root".into(),
                 identity_file: None,
+                auth: AuthMode::Key,
             }],
             bastion: None,
             bootstrap: BootstrapPolicy::default(),

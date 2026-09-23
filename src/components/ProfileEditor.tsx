@@ -131,6 +131,7 @@ export default function ProfileEditor({ initial, onClose, onSaved, onDeleteReque
       port: detected.port,
       user: detected.user,
       identity_file: detected.identity_file,
+      auth: 'key',
     };
 
     let updatedHosts: Host[];
@@ -167,6 +168,7 @@ export default function ProfileEditor({ initial, onClose, onSaved, onDeleteReque
       port: d.port,
       user: d.user,
       identity_file: d.identity_file,
+      auth: 'key',
     }));
     setHosts(newHostList);
 
@@ -218,7 +220,7 @@ export default function ProfileEditor({ initial, onClose, onSaved, onDeleteReque
     const newHostName = `host-${hosts.length + 1}`;
     const updated = [
       ...hosts,
-      { name: newHostName, address: '', port: 22, user: 'root', identity_file: null },
+      { name: newHostName, address: '', port: 22, user: 'root', identity_file: null, auth: 'key' as const },
     ];
     setHosts(updated);
     if (useKubeconfig && !kubeControlPlane) {
@@ -316,6 +318,7 @@ export default function ProfileEditor({ initial, onClose, onSaved, onDeleteReque
         port: Number(h.port) || 22,
         user: h.user.trim(),
         identity_file: h.identity_file?.trim() || null,
+        auth: h.auth,
       })),
       bastion: useBastion
         ? {
@@ -510,6 +513,7 @@ export default function ProfileEditor({ initial, onClose, onSaved, onDeleteReque
                   <span>Port</span>
                   <span>User *</span>
                   <span>Identity File</span>
+                  <span>Auth</span>
                   <span></span>
                 </div>
                 {hosts.map((host, idx) => (
@@ -548,7 +552,17 @@ export default function ProfileEditor({ initial, onClose, onSaved, onDeleteReque
                       value={host.identity_file ?? ''}
                       onChange={(e) => updateHost(idx, 'identity_file', e.target.value || null)}
                       className="form-input mono"
+                      disabled={host.auth === 'password'}
                     />
+                    <select
+                      value={host.auth}
+                      onChange={(e) => updateHost(idx, 'auth', e.target.value)}
+                      className="form-select"
+                      title="SSH authentication mode for this host"
+                    >
+                      <option value="key">Key</option>
+                      <option value="password">Password</option>
+                    </select>
                     <button
                       type="button"
                       className="danger-icon-button"

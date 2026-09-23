@@ -120,7 +120,7 @@ pub fn get_profile(paths: &ClusterDeckPaths, profile_id: &str) -> Result<Profile
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::services::config::{BootstrapPolicy, Host, Profile};
+    use crate::services::config::{AuthMode, BootstrapPolicy, Host, Profile};
 
     fn temp_paths(tag: &str) -> ClusterDeckPaths {
         let dir = std::env::temp_dir().join(format!(
@@ -149,6 +149,7 @@ mod tests {
                 port: 22,
                 user: "root".into(),
                 identity_file: None,
+                auth: AuthMode::Key,
             }],
             bastion: None,
             bootstrap: BootstrapPolicy::default(),

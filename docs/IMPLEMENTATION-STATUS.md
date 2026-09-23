@@ -21,10 +21,12 @@ This file records current default-branch behavior, not future product direction.
 - TLS certificate verification on the curl Kubernetes API fallback path (used when `kubectl` itself fails, e.g. macOS Sequoia Local Network Privacy): verifies against the kubeconfig's CA data via `--cacert`, or curl's system trust store when no CA data is present — never `-k`/`--insecure` (#24).
 - Local runtime discovery dashboard: architecture/CPU/memory/disk display and Docker context association for Colima/Lima instances, in a read-only "Local Runtime" section in Settings (#14 Phase 1).
 - `clusterdeck-connection-workflow` Agent Skill re-verified via a fresh-session replay against a real target; `openforge-maturity` is `verified` again (#22).
+- Explicit per-host SSH authentication mode (`key`, the default, or `password`): password mode uses `sshpass -e`/`SSHPASS` consistently across Connect, Test Connection, and kubeconfig fetch, omits `BatchMode=yes` (which would block the password prompt) while keeping `StrictHostKeyChecking=accept-new`, and keeps the password ephemeral in frontend state only. Profile YAML written before this field existed deserializes unchanged as `key` (#26).
 
 ## Partial / environment-dependent
 
 - Unit/FakeRunner tests prove application control flow but cannot prove real OpenSSH, kubectl, native filesystem, or target-cluster behavior; critical-path changes require real-binary/runtime evidence where practical.
+- Password-mode SSH authentication (#26) is covered by unit tests that assert on real argv/env construction (no `BatchMode=yes`, has `StrictHostKeyChecking=accept-new`, uses `sshpass -e` with `SSHPASS`), but has not been exercised against a real password-authenticating SSH target: no such target was available in the development environment (the local Colima VM used for other real-process checks only supports key-based auth).
 - The application remains macOS-first; other platform support should not be inferred from portable Rust/React code alone.
 
 ## Not claimed
@@ -51,3 +53,4 @@ This file records current default-branch behavior, not future product direction.
 - commit `5e617d3` (local runtime discovery dashboard, issue #14 Phase 1) and commit `e6ff486` (relocated to Settings)
 - commit `268feab` (`clusterdeck-connection-workflow` skill re-verified, issue #22); evidence at `research/issue-22-connection-workflow-replay-2026-09-22.md`
 - commit `cb85aff` and commit `24b231c` (release workflow: macOS `.dmg` draft GitHub Release on `v*` tag push, third-party Actions pinned to commit SHAs)
+- branch `feat/26-password-ssh-auth` (password-based SSH authentication mode, issue #26)

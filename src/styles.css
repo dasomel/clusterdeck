@@ -699,7 +699,7 @@ h2 {
 
 .host-header-row {
   display: grid;
-  grid-template-columns: 1.1fr 1.3fr 65px 1fr 1.3fr 32px;
+  grid-template-columns: 1.1fr 1.3fr 65px 1fr 1.3fr 95px 32px;
   gap: 8px;
   padding: 0 4px;
   font-size: 10px;
@@ -711,7 +711,7 @@ h2 {
 
 .host-row-editor {
   display: grid;
-  grid-template-columns: 1.1fr 1.3fr 65px 1fr 1.3fr 32px;
+  grid-template-columns: 1.1fr 1.3fr 65px 1fr 1.3fr 95px 32px;
   gap: 8px;
   align-items: center;
 }
