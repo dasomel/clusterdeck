@@ -6,6 +6,9 @@ The format follows the principles of Keep a Changelog and uses semantic versioni
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-23
+
+- Add password-based SSH authentication as a per-host auth mode (`key` default | `password`): `sshpass -e` + `SSHPASS` env only, never argv/config/logs/YAML; consistent across Connect, Test Connection, and kubeconfig fetch; bounded by a 30s timeout; password auth through a bastion is refused explicitly (#26)
 - Fix kubeconfig merge to upsert existing cluster/context/user entries by name instead of relying on `kubectl config view --flatten`, which kept the first (stale) occurrence on a name collision (#27)
 
 ## [0.1.0] - 2026-09-22
