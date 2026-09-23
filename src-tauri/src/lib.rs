@@ -3,6 +3,7 @@ mod services;
 
 pub fn run() {
     tauri::Builder::default()
+        .manage(services::local_runtime_lifecycle::LifecycleGuard::default())
         .invoke_handler(tauri::generate_handler![
             commands::app::get_app_info,
             commands::profiles::list_profiles,
@@ -39,6 +40,11 @@ pub fn run() {
             commands::ca_trust::remove_ca_cmd,
             commands::kube_import::list_local_kube_contexts_cmd,
             commands::local_runtime::detect_local_hosts,
+            commands::local_runtime::start_local_runtime,
+            commands::local_runtime::stop_local_runtime,
+            commands::local_runtime::restart_local_runtime,
+            commands::local_runtime::open_local_runtime_shell,
+            commands::local_runtime::open_local_runtime_context,
         ])
         .run(tauri::generate_context!())
         .expect("error while running ClusterDeck");

@@ -100,6 +100,33 @@ pub async fn open_with_system(
     }
 }
 
+/// Opens a new Terminal.app window running `command_line`, via osascript's `do script`. Mirrors
+/// `open_with_system`'s call shape (goes through `CommandRunner`, returns `Result<(), String>`
+/// with the child's stderr surfaced on failure) but drives Terminal directly instead of the
+/// `open <url>` scheme `open_ssh_session` uses, because there is no URL scheme for an arbitrary
+/// shell command the way `ssh://` covers a plain SSH session.
+///
+/// `command_line` must already be built from validated tokens by the caller (see
+/// `services/local_runtime_lifecycle.rs`, which validates instance/context names via
+/// `services/validate.rs` before composing it) — this function only escapes the AppleScript
+/// string layer (backslash and double-quote), it does not authorize the content.
+pub async fn open_terminal_with_command(
+    runner: &dyn CommandRunner,
+    command_line: &str,
+) -> Result<(), String> {
+    let escaped = command_line.replace('\\', "\\\\").replace('"', "\\\"");
+    let script =
+        format!("tell application \"Terminal\"\n  activate\n  do script \"{escaped}\"\nend tell");
+    let out = runner.run("osascript", &["-e".to_string(), script]).await?;
+    if out.success {
+        Ok(())
+    } else if out.stderr.is_empty() {
+        Err("failed to open terminal".to_string())
+    } else {
+        Err(out.stderr)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -116,5 +143,60 @@ mod tests {
     fn resolve_cli_path_errors_on_unknown_binary() {
         let err = resolve_cli_path("definitely-not-a-real-binary-xyz").unwrap_err();
         assert!(err.contains("not found"));
+    }
+
+    struct FakeOsascriptRunner {
+        success: bool,
+        calls: std::sync::Mutex<Vec<(String, Vec<String>)>>,
+    }
+
+    #[async_trait]
+    impl CommandRunner for FakeOsascriptRunner {
+        async fn run(&self, bin: &str, args: &[String]) -> Result<CommandOutput, String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((bin.to_string(), args.to_vec()));
+            Ok(CommandOutput {
+                stdout: String::new(),
+                stderr: if self.success {
+                    String::new()
+                } else {
+                    "boom".to_string()
+                },
+                success: self.success,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn open_terminal_with_command_builds_do_script_and_escapes_quotes() {
+        let runner = FakeOsascriptRunner {
+            success: true,
+            calls: std::sync::Mutex::new(Vec::new()),
+        };
+        open_terminal_with_command(&runner, r#"echo "hi""#)
+            .await
+            .unwrap();
+
+        let calls = runner.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        let (bin, args) = &calls[0];
+        assert_eq!(bin, "osascript");
+        assert_eq!(args[0], "-e");
+        assert!(args[1].contains("tell application \"Terminal\""));
+        assert!(args[1].contains("do script \"echo \\\"hi\\\"\""));
+    }
+
+    #[tokio::test]
+    async fn open_terminal_with_command_surfaces_stderr_on_failure() {
+        let runner = FakeOsascriptRunner {
+            success: false,
+            calls: std::sync::Mutex::new(Vec::new()),
+        };
+        let err = open_terminal_with_command(&runner, "colima ssh --profile default")
+            .await
+            .unwrap_err();
+        assert_eq!(err, "boom");
     }
 }
