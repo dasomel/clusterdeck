@@ -43,8 +43,11 @@ pub struct SystemRunner;
 impl CommandRunner for SystemRunner {
     async fn run(&self, bin: &str, args: &[String]) -> Result<CommandOutput, String> {
         let path = resolve_cli_path(bin)?;
+        // kill_on_drop: without it, dropping this future (e.g. a tokio::time::timeout firing on
+        // a hung password-auth prompt) leaves the child running instead of terminating it.
         let output = Command::new(path)
             .args(args)
+            .kill_on_drop(true)
             .output()
             .await
             .map_err(|err| format!("{bin} execution failed: {err}"))?;
@@ -64,6 +67,7 @@ impl CommandRunner for SystemRunner {
         let path = resolve_cli_path(bin)?;
         let mut cmd = Command::new(path);
         cmd.args(args);
+        cmd.kill_on_drop(true);
         for (k, v) in env {
             cmd.env(k, v);
         }

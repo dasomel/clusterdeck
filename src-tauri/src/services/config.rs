@@ -24,6 +24,20 @@ pub struct Host {
     pub port: u16,
     pub user: String,
     pub identity_file: Option<String>,
+    /// SSH authentication mode for this host. `#[serde(default)]` (-> Key) so profile YAML
+    /// persisted before this field existed still deserializes unchanged (Issue #26).
+    #[serde(default)]
+    pub auth: AuthMode,
+}
+
+/// Explicit SSH authentication mode for a `Host`. Defaults to `Key` so existing persisted
+/// profiles that predate this field keep working without migration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AuthMode {
+    #[default]
+    Key,
+    Password,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
