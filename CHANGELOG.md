@@ -6,6 +6,8 @@ The format follows the principles of Keep a Changelog and uses semantic versioni
 
 ## [Unreleased]
 
+- Fix kubeconfig merge to upsert existing cluster/context/user entries by name instead of relying on `kubectl config view --flatten`, which kept the first (stale) occurrence on a name collision (#27)
+
 ## [0.1.0] - 2026-09-22
 
 - Initial OSS repository bootstrap
