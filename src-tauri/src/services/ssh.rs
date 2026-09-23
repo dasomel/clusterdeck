@@ -130,8 +130,16 @@ pub fn build_ssh_target_args(
 /// candidate-path loop) should stop on this rather than keep retrying: each retry is another
 /// failed login, and modern OpenSSH (`PerSourcePenalties`) or fail2ban-style tooling can
 /// temporarily or permanently block the client after a handful of failures in a row.
+///
+/// A real OpenSSH login rejection always has the shape `<user>@<host>: Permission denied
+/// (<methods>).`, where `<methods>` is the parenthesized list of auth methods that were tried
+/// (e.g. `publickey`, `password`, `publickey,password`). That trailing `(...)` is what
+/// distinguishes an actual auth failure from a *remote command's own* "Permission denied" (e.g.
+/// `cat: /etc/kubernetes/admin.conf: Permission denied` when reading a root-owned file as a
+/// non-root user), which never includes it (Issue #31: the bare substring match wrongly
+/// classified that case as an SSH auth failure and aborted the candidate-path loop early).
 pub fn is_auth_failure_error(stderr: &str) -> bool {
-    stderr.contains("Permission denied")
+    stderr.contains("Permission denied (")
 }
 
 /// Checks whether OpenSSH stderr indicates that the remote host key has changed
@@ -1058,5 +1066,29 @@ Host key verification failed.
         );
         // Call 4: ssh retry (succeeded)
         assert_eq!(recorded[3].0, "ssh");
+    }
+
+    #[test]
+    fn is_auth_failure_error_matches_real_openssh_login_rejections() {
+        assert!(is_auth_failure_error(
+            "root@192.0.2.10: Permission denied (publickey,password)."
+        ));
+        assert!(is_auth_failure_error(
+            "ubuntu@192.0.2.10: Permission denied (publickey)."
+        ));
+    }
+
+    #[test]
+    fn is_auth_failure_error_ignores_remote_command_permission_errors() {
+        // Issue #31: a remote `cat` failing on a root-owned file prints "Permission denied"
+        // too, but never with the parenthesized auth-methods suffix -- this must NOT be
+        // classified as an SSH login failure, or the kubeconfig candidate-path loop aborts
+        // after the first unreadable path instead of trying the rest.
+        assert!(!is_auth_failure_error(
+            "cat: /etc/kubernetes/admin.conf: Permission denied"
+        ));
+        assert!(!is_auth_failure_error(
+            "sudo: cat: /etc/kubernetes/admin.conf: Permission denied"
+        ));
     }
 }

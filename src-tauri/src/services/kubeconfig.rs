@@ -198,8 +198,9 @@ async fn fetch_remote_kubeconfig_content(
     };
 
     let mut last_ssh_err = String::new();
+    let tried_paths: Vec<&str> = candidates.clone();
     for candidate in candidates {
-        let read_cmd = format!("sudo cat '{candidate}' 2>/dev/null || cat '{candidate}'");
+        let read_cmd = build_candidate_read_cmd(candidate);
 
         // Key mode keeps BatchMode=yes (never hang on a prompt). Password mode must omit it:
         // BatchMode disables the interactive password prompt that sshpass answers via SSHPASS
@@ -275,8 +276,31 @@ async fn fetch_remote_kubeconfig_content(
     }
 
     Err(format!(
-        "kubeconfig fetch failed: ssh probe error: {last_ssh_err}"
+        "kubeconfig fetch failed after trying {} candidate path(s) ({}); last error: {last_ssh_err}",
+        tried_paths.len(),
+        tried_paths.join(", ")
     ))
+}
+
+/// Builds the remote read command for one candidate kubeconfig path.
+///
+/// `sudo -n` (non-interactive) is tried first so a locked-down remote user can still read a
+/// root-owned file without ever blocking on a password prompt; `-n` makes sudo fail immediately
+/// instead of waiting when no password-less rule is configured, so the `||` falls through to a
+/// plain `cat` for paths the connecting user already owns.
+///
+/// A candidate starting with `~/` is expanded via the remote shell's `$HOME` (double-quoted,
+/// since OpenSSH runs this command through a login shell that would otherwise treat a
+/// single-quoted `~` literally instead of expanding it -- Issue #31). The remainder of the path
+/// after `~/` stays single-quoted exactly as every other candidate already is; this only changes
+/// how the leading `~/` is rendered; it does not add or remove any quoting/escaping of
+/// caller-provided path content.
+fn build_candidate_read_cmd(candidate: &str) -> String {
+    let quoted_path = match candidate.strip_prefix("~/") {
+        Some(rest) => format!("\"$HOME\"/'{rest}'"),
+        None => format!("'{candidate}'"),
+    };
+    format!("sudo -n cat {quoted_path} 2>/dev/null || cat {quoted_path}")
 }
 
 pub async fn fetch_and_store(
@@ -1513,6 +1537,74 @@ users:
         assert_eq!(*runner.calls.lock().unwrap(), 1);
 
         std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn fetch_and_store_keeps_trying_candidates_on_remote_command_permission_error() {
+        // Issue #31: `cat: <path>: Permission denied` from the REMOTE COMMAND (e.g. a
+        // root-owned candidate the connecting user can't read) is not an SSH auth failure and
+        // must not abort the candidate-path loop early -- unlike the real auth-failure case
+        // above, this must try every candidate.
+        let temp_dir = std::env::temp_dir().join(format!(
+            "clusterdeck-kc-test-remote-perm-{}",
+            std::process::id()
+        ));
+        let paths = ClusterDeckPaths::at(temp_dir.clone());
+        let profile = password_auth_profile("cka-remote-perm");
+        let secret = "some_password";
+
+        struct RemotePermissionDeniedRunner {
+            calls: std::sync::Mutex<usize>,
+        }
+
+        #[async_trait]
+        impl CommandRunner for RemotePermissionDeniedRunner {
+            async fn run(&self, _bin: &str, _args: &[String]) -> Result<CommandOutput, String> {
+                *self.calls.lock().unwrap() += 1;
+                Ok(CommandOutput {
+                    stdout: String::new(),
+                    stderr: "cat: /etc/kubernetes/admin.conf: Permission denied".to_string(),
+                    success: false,
+                })
+            }
+
+            async fn run_with_env(
+                &self,
+                bin: &str,
+                args: &[String],
+                _env: &[(String, String)],
+            ) -> Result<CommandOutput, String> {
+                self.run(bin, args).await
+            }
+        }
+
+        let runner = RemotePermissionDeniedRunner {
+            calls: std::sync::Mutex::new(0),
+        };
+
+        let err = fetch_and_store(&runner, &paths, &profile, Some(secret))
+            .await
+            .unwrap_err();
+        // 4 unique candidate paths (the configured path de-dupes against one of the 4 built-in
+        // candidates) must all have been tried, and the final error names them.
+        assert_eq!(*runner.calls.lock().unwrap(), 4);
+        assert!(err.contains("4 candidate path"));
+        assert!(err.contains("/etc/kubernetes/admin.conf"));
+        assert!(err.contains("Permission denied"));
+
+        std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    #[test]
+    fn build_candidate_read_cmd_expands_tilde_via_home_and_keeps_other_paths_single_quoted() {
+        assert_eq!(
+            build_candidate_read_cmd("~/.kube/config"),
+            "sudo -n cat \"$HOME\"/'.kube/config' 2>/dev/null || cat \"$HOME\"/'.kube/config'"
+        );
+        assert_eq!(
+            build_candidate_read_cmd("/etc/kubernetes/admin.conf"),
+            "sudo -n cat '/etc/kubernetes/admin.conf' 2>/dev/null || cat '/etc/kubernetes/admin.conf'"
+        );
     }
 
     #[tokio::test]
