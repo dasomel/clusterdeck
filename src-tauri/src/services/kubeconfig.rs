@@ -995,7 +995,6 @@ pub async fn merge_profile_kubeconfig_to_user_config(
     let user_config_path = resolve_user_kubeconfig_path()?;
     let bak_dir = resolve_user_kube_bak_dir()?;
     merge_profile_kubeconfig_to_file(
-        runner,
         paths,
         &profile.id,
         &user_config_path,
@@ -1033,7 +1032,6 @@ pub fn is_profile_present_in_user_config(profile_id: &str) -> bool {
 }
 
 pub async fn merge_profile_kubeconfig_to_file(
-    runner: &dyn CommandRunner,
     paths: &ClusterDeckPaths,
     profile_id: &str,
     user_config_path: &std::path::Path,
@@ -1083,55 +1081,16 @@ pub async fn merge_profile_kubeconfig_to_file(
         });
     }
 
-    // Attempt kubectl config view --flatten first
-    let env = vec![(
-        "KUBECONFIG".to_string(),
-        format!(
-            "{}:{}",
-            user_config_path.to_string_lossy(),
-            profile_kc_path.to_string_lossy()
-        ),
-    )];
-    let kubectl_res = runner
-        .run_with_env(
-            "kubectl",
-            &[
-                "config".to_string(),
-                "view".to_string(),
-                "--flatten".to_string(),
-            ],
-            &env,
-        )
-        .await;
-
-    let mut merged_yaml = None;
-    if let Ok(out) = kubectl_res {
-        if out.success && is_valid_kubeconfig_yaml(&out.stdout) {
-            if let Ok(mut val) = serde_yaml::from_str::<serde_yaml::Value>(&out.stdout) {
-                if let Some(map) = val.as_mapping_mut() {
-                    map.insert(
-                        serde_yaml::Value::String("current-context".to_string()),
-                        serde_yaml::Value::String(profile_id.to_string()),
-                    );
-                }
-                if let Ok(serialized) = serde_yaml::to_string(&val) {
-                    merged_yaml = Some(serialized);
-                }
-            }
-            if merged_yaml.is_none() {
-                merged_yaml = Some(out.stdout);
-            }
-        }
-    }
-
-    let final_yaml = match merged_yaml {
-        Some(yaml) => yaml,
-        None => {
-            let existing_raw = std::fs::read_to_string(user_config_path)
-                .map_err(|e| format!("Failed to read existing kubeconfig: {e}"))?;
-            merge_yaml_kubeconfigs(&existing_raw, &profile_raw, Some(profile_id))?
-        }
-    };
+    // Deterministic name-based upsert (merge_yaml_kubeconfigs), not `kubectl config view
+    // --flatten`: kubectl's flatten merge keeps the FIRST occurrence of a duplicate
+    // cluster/context/user name, so a stale entry already in the user's kubeconfig would win
+    // over the freshly fetched profile entry (issue #27). merge_yaml_kubeconfigs replaces
+    // matching-name entries with the overlay's (profile's) version while preserving unrelated
+    // entries, and it fails on unparseable YAML *before* any write, so a corrupt existing file
+    // is reported instead of being clobbered.
+    let existing_raw = std::fs::read_to_string(user_config_path)
+        .map_err(|e| format!("Failed to read existing kubeconfig: {e}"))?;
+    let final_yaml = merge_yaml_kubeconfigs(&existing_raw, &profile_raw, Some(profile_id))?;
 
     write_kubeconfig_file_atomic(user_config_path, &final_yaml)?;
 
@@ -1515,6 +1474,118 @@ users:
         assert_eq!(val["current-context"].as_str().unwrap(), "ctx-2");
     }
 
+    #[test]
+    fn merge_yaml_kubeconfigs_upserts_matching_names_and_preserves_unrelated_entries() {
+        // Regression test for #27: kubectl's `config view --flatten` merge keeps the FIRST
+        // occurrence of a duplicate name, so stale credentials/server data would win over the
+        // freshly fetched profile entry. merge_yaml_kubeconfigs must instead replace the
+        // matching-name entry with the overlay's (profile's) version, while leaving unrelated
+        // entries untouched.
+        let base = r#"
+apiVersion: v1
+clusters:
+- cluster:
+    server: https://stale.example.com:6443
+    certificate-authority-data: c3RhbGUtY2E=
+  name: cka
+- cluster:
+    server: https://192.168.1.1:6443
+  name: unrelated-cluster
+contexts:
+- context:
+    cluster: cka
+    user: cka
+  name: cka
+- context:
+    cluster: unrelated-cluster
+    user: unrelated-user
+  name: unrelated-ctx
+current-context: unrelated-ctx
+users:
+- name: cka
+  user:
+    token: stale-token
+- name: unrelated-user
+  user:
+    token: unrelated-token
+"#;
+
+        let overlay = r#"
+apiVersion: v1
+clusters:
+- cluster:
+    server: https://fresh.example.com:6443
+    certificate-authority-data: ZnJlc2gtY2E=
+  name: cka
+contexts:
+- context:
+    cluster: cka
+    user: cka
+  name: cka
+current-context: cka
+users:
+- name: cka
+  user:
+    token: fresh-token
+"#;
+
+        let merged = merge_yaml_kubeconfigs(base, overlay, Some("cka")).unwrap();
+        let val: serde_yaml::Value = serde_yaml::from_str(&merged).unwrap();
+
+        // Totals unchanged (upsert, not append): matching names replaced in place.
+        assert_eq!(val["clusters"].as_sequence().unwrap().len(), 2);
+        assert_eq!(val["contexts"].as_sequence().unwrap().len(), 2);
+        assert_eq!(val["users"].as_sequence().unwrap().len(), 2);
+
+        // Stale entry for "cka" is replaced with the fresh profile data.
+        let clusters = val["clusters"].as_sequence().unwrap();
+        let cka_cluster = clusters
+            .iter()
+            .find(|c| c["name"].as_str() == Some("cka"))
+            .unwrap();
+        assert_eq!(
+            cka_cluster["cluster"]["server"].as_str().unwrap(),
+            "https://fresh.example.com:6443"
+        );
+        assert_eq!(
+            cka_cluster["cluster"]["certificate-authority-data"]
+                .as_str()
+                .unwrap(),
+            "ZnJlc2gtY2E="
+        );
+        let users = val["users"].as_sequence().unwrap();
+        let cka_user = users
+            .iter()
+            .find(|u| u["name"].as_str() == Some("cka"))
+            .unwrap();
+        assert_eq!(cka_user["user"]["token"].as_str().unwrap(), "fresh-token");
+
+        // Unrelated cluster/context/user entries remain untouched.
+        let unrelated_cluster = clusters
+            .iter()
+            .find(|c| c["name"].as_str() == Some("unrelated-cluster"))
+            .unwrap();
+        assert_eq!(
+            unrelated_cluster["cluster"]["server"].as_str().unwrap(),
+            "https://192.168.1.1:6443"
+        );
+        let unrelated_user = users
+            .iter()
+            .find(|u| u["name"].as_str() == Some("unrelated-user"))
+            .unwrap();
+        assert_eq!(
+            unrelated_user["user"]["token"].as_str().unwrap(),
+            "unrelated-token"
+        );
+        assert!(val["contexts"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .any(|c| c["name"].as_str() == Some("unrelated-ctx")));
+
+        assert_eq!(val["current-context"].as_str().unwrap(), "cka");
+    }
+
     struct DummyKubeRunner;
     #[async_trait]
     impl CommandRunner for DummyKubeRunner {
@@ -1546,11 +1617,8 @@ users:
         let user_kc_file = user_kube_dir.join("config");
         let bak_dir = user_kube_dir.join("bak");
 
-        let runner = DummyKubeRunner;
-
         // 1. Target doesn't exist -> creates it
         let res1 = merge_profile_kubeconfig_to_file(
-            &runner,
             &paths,
             profile_id,
             &user_kc_file,
@@ -1566,7 +1634,6 @@ users:
 
         // 2. Target exists -> merges into it
         let res2 = merge_profile_kubeconfig_to_file(
-            &runner,
             &paths,
             profile_id,
             &user_kc_file,
@@ -1579,6 +1646,148 @@ users:
         assert!(res2.success);
         assert!(res2.backup.is_some());
         assert_eq!(res2.clusters_count, 1); // same profile replaced
+
+        std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn merge_profile_kubeconfig_to_file_replaces_stale_entry_and_preserves_unrelated() {
+        // Regression test for #27 at the merge_profile_kubeconfig_to_file level: an existing
+        // ~/.kube/config already has a (stale) entry named after this profile, plus an unrelated
+        // context from a different profile. After merging the freshly fetched profile
+        // kubeconfig, the stale entry's server/credentials must be replaced by the fresh ones,
+        // and the unrelated context must remain untouched.
+        let temp_dir = std::env::temp_dir().join(format!(
+            "clusterdeck-merge-upsert-test-{}",
+            std::process::id()
+        ));
+        let paths = ClusterDeckPaths::at(temp_dir.clone());
+        paths.ensure_dirs().unwrap();
+
+        let profile_id = "cka";
+        let fresh_profile_kc = r#"
+apiVersion: v1
+kind: Config
+clusters:
+- name: cka
+  cluster:
+    server: https://fresh.example.com:6443
+    certificate-authority-data: ZnJlc2gtY2E=
+contexts:
+- name: cka
+  context:
+    cluster: cka
+    user: cka
+current-context: cka
+users:
+- name: cka
+  user:
+    client-certificate-data: ZnJlc2gtY2VydA==
+    client-key-data: ZnJlc2gta2V5
+"#;
+        std::fs::write(paths.kubeconfig_file(profile_id), fresh_profile_kc).unwrap();
+
+        let user_kube_dir = temp_dir.join(".kube");
+        let user_kc_file = user_kube_dir.join("config");
+        let bak_dir = user_kube_dir.join("bak");
+        std::fs::create_dir_all(&user_kube_dir).unwrap();
+
+        let stale_existing_config = r#"
+apiVersion: v1
+kind: Config
+clusters:
+- name: cka
+  cluster:
+    server: https://stale.example.com:6443
+    certificate-authority-data: c3RhbGUtY2E=
+- name: other-cluster
+  cluster:
+    server: https://other.example.com:6443
+contexts:
+- name: cka
+  context:
+    cluster: cka
+    user: cka
+- name: other-ctx
+  context:
+    cluster: other-cluster
+    user: other-user
+current-context: other-ctx
+users:
+- name: cka
+  user:
+    client-certificate-data: c3RhbGUtY2VydA==
+    client-key-data: c3RhbGUta2V5
+- name: other-user
+  user:
+    token: other-token
+"#;
+        std::fs::write(&user_kc_file, stale_existing_config).unwrap();
+
+        let res = merge_profile_kubeconfig_to_file(
+            &paths,
+            profile_id,
+            &user_kc_file,
+            Some(&bak_dir),
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert!(res.success);
+        assert_eq!(res.clusters_count, 2); // upsert in place, not appended
+        assert_eq!(res.contexts_count, 2);
+
+        let merged_raw = std::fs::read_to_string(&user_kc_file).unwrap();
+        let val: serde_yaml::Value = serde_yaml::from_str(&merged_raw).unwrap();
+
+        let clusters = val["clusters"].as_sequence().unwrap();
+        let cka_cluster = clusters
+            .iter()
+            .find(|c| c["name"].as_str() == Some("cka"))
+            .unwrap();
+        assert_eq!(
+            cka_cluster["cluster"]["server"].as_str().unwrap(),
+            "https://fresh.example.com:6443"
+        );
+        assert_eq!(
+            cka_cluster["cluster"]["certificate-authority-data"]
+                .as_str()
+                .unwrap(),
+            "ZnJlc2gtY2E="
+        );
+
+        let users = val["users"].as_sequence().unwrap();
+        let cka_user = users
+            .iter()
+            .find(|u| u["name"].as_str() == Some("cka"))
+            .unwrap();
+        assert_eq!(
+            cka_user["user"]["client-key-data"].as_str().unwrap(),
+            "ZnJlc2gta2V5"
+        );
+
+        // Unrelated entries from the other profile are untouched.
+        let other_cluster = clusters
+            .iter()
+            .find(|c| c["name"].as_str() == Some("other-cluster"))
+            .unwrap();
+        assert_eq!(
+            other_cluster["cluster"]["server"].as_str().unwrap(),
+            "https://other.example.com:6443"
+        );
+        let other_user = users
+            .iter()
+            .find(|u| u["name"].as_str() == Some("other-user"))
+            .unwrap();
+        assert_eq!(other_user["user"]["token"].as_str().unwrap(), "other-token");
+        assert!(val["contexts"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .any(|c| c["name"].as_str() == Some("other-ctx")));
+
+        assert_eq!(val["current-context"].as_str().unwrap(), "cka");
 
         std::fs::remove_dir_all(&temp_dir).ok();
     }
