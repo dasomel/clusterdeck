@@ -1508,16 +1508,18 @@ users:
     #[tokio::test]
     async fn fetch_and_store_rejects_unsafe_remote_path_without_invoking_runner() {
         // Sink-level defensive re-check (validate::is_safe_remote_path): a profile whose
-        // remote_path carries a shell metacharacter must never reach build_candidate_read_cmd's
-        // SSH argv, even if it somehow bypassed store::upsert_profile's persistence-boundary
-        // check (e.g. a profile loaded from disk before this validation existed).
+        // remote_path carries a literal single quote (which would end the single-quoted shell
+        // string build_candidate_read_cmd embeds it in early) must never reach that SSH argv,
+        // even if it somehow bypassed store::upsert_profile's save-boundary check (e.g. a
+        // profile loaded from disk, which is deliberately NOT re-validated on remote_path --
+        // see validate.rs's validate_profile doc comment).
         let temp_dir = std::env::temp_dir().join(format!(
             "clusterdeck-kc-test-unsafe-remote-path-{}",
             std::process::id()
         ));
         let paths = ClusterDeckPaths::at(temp_dir.clone());
         let mut profile = password_auth_profile("cka-unsafe-path");
-        profile.kubeconfig.as_mut().unwrap().remote_path = "/tmp/$(rm -rf ~)".to_string();
+        profile.kubeconfig.as_mut().unwrap().remote_path = "/tmp/'; rm -rf ~ #".to_string();
 
         let runner = CapturingSshRunner {
             sample_yaml: SAMPLE.to_string(),
