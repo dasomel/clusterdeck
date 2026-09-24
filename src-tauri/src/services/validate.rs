@@ -94,9 +94,48 @@ pub fn is_safe_shell_context_name(s: &str) -> bool {
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ':' | '/' | '@'))
 }
 
+/// Sink validator for `KubeconfigSource.remote_path`, which is interpolated into the remote SSH
+/// read command in `kubeconfig.rs::build_candidate_read_cmd` (single-quoted, with a leading `~/`
+/// expanded via the remote shell's `"$HOME"`). Requires an absolute path or a `~/`-prefixed one,
+/// and whitelists the charset a legitimate kubeconfig path needs (alnum plus `/ . _ - + @ :`) --
+/// which, by construction, excludes quotes, `$`, backticks, `\`, shell metacharacters
+/// (`; & | < >`), and whitespace/control characters, any of which could break out of the
+/// single-quoted/`"$HOME"` shell context the path is embedded in. Also rejects `..` path
+/// segments (traversal).
+pub fn is_safe_remote_path(s: &str) -> bool {
+    if s.is_empty() || s.len() > 4096 {
+        return false;
+    }
+    let rest = match s.strip_prefix("~/").or_else(|| s.strip_prefix('/')) {
+        Some(r) => r,
+        None => return false,
+    };
+    if rest.is_empty() {
+        return false;
+    }
+    if !rest
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | '+' | '@' | ':'))
+    {
+        return false;
+    }
+    if rest.split('/').any(|segment| segment == "..") {
+        return false;
+    }
+    true
+}
+
 pub fn validate_profile(profile: &crate::services::config::Profile) -> Result<(), String> {
     if !is_safe_profile_id(&profile.id) {
         return Err(format!("invalid profile id: {}", profile.id));
+    }
+    if let Some(kubeconfig) = &profile.kubeconfig {
+        if !is_safe_remote_path(&kubeconfig.remote_path) {
+            return Err(format!(
+                "invalid kubeconfig remote_path: {}",
+                kubeconfig.remote_path
+            ));
+        }
     }
     for host in &profile.hosts {
         if !is_safe_ssh_identifier(&host.name) {
@@ -206,6 +245,82 @@ mod tests {
         let mut invalid_profile = valid_profile.clone();
         invalid_profile.hosts[0].address = "192.168.1.10\nHost evil".into();
         assert!(validate_profile(&invalid_profile).is_err());
+    }
+
+    #[test]
+    fn is_safe_remote_path_accepts_conventional_kubeconfig_paths() {
+        assert!(is_safe_remote_path("/etc/kubernetes/admin.conf"));
+        assert!(is_safe_remote_path("/etc/rancher/k3s/k3s.yaml"));
+        assert!(is_safe_remote_path("/etc/rancher/rke2/rke2.yaml"));
+        assert!(is_safe_remote_path("/var/lib/k0s/pki/admin.conf"));
+        assert!(is_safe_remote_path("~/.kube/config"));
+        assert!(is_safe_remote_path(
+            "/var/lib/microk8s/credentials/client.config"
+        ));
+        assert!(is_safe_remote_path("/home/user-1/my.kube_config:v2"));
+    }
+
+    #[test]
+    fn is_safe_remote_path_rejects_each_unsafe_class() {
+        // empty / not absolute / not ~-prefixed
+        assert!(!is_safe_remote_path(""));
+        assert!(!is_safe_remote_path("relative/path"));
+        assert!(!is_safe_remote_path("etc/kubernetes/admin.conf"));
+        // bare root or bare "~/" with nothing after
+        assert!(!is_safe_remote_path("/"));
+        assert!(!is_safe_remote_path("~/"));
+        // path traversal
+        assert!(!is_safe_remote_path("/etc/../etc/shadow"));
+        assert!(!is_safe_remote_path("~/../../etc/passwd"));
+        // shell metacharacters and quoting breakout attempts
+        assert!(!is_safe_remote_path("/tmp/'; rm -rf ~ #"));
+        assert!(!is_safe_remote_path("/tmp/\"; rm -rf ~ #"));
+        assert!(!is_safe_remote_path("/tmp/$(rm -rf ~)"));
+        assert!(!is_safe_remote_path("/tmp/`rm -rf ~`"));
+        assert!(!is_safe_remote_path("/tmp/a\\b"));
+        assert!(!is_safe_remote_path("/tmp/a;b"));
+        assert!(!is_safe_remote_path("/tmp/a&b"));
+        assert!(!is_safe_remote_path("/tmp/a|b"));
+        assert!(!is_safe_remote_path("/tmp/a<b"));
+        assert!(!is_safe_remote_path("/tmp/a>b"));
+        // whitespace / control characters
+        assert!(!is_safe_remote_path("/tmp/a b"));
+        assert!(!is_safe_remote_path("/tmp/a\tb"));
+        assert!(!is_safe_remote_path("/tmp/a\nb"));
+        assert!(!is_safe_remote_path("/tmp/a\rb"));
+        // oversized
+        assert!(!is_safe_remote_path(&format!("/{}", "a".repeat(4096))));
+    }
+
+    #[test]
+    fn validate_profile_rejects_unsafe_kubeconfig_remote_path_and_accepts_safe_one() {
+        let mut profile = Profile {
+            id: "cka-lab".into(),
+            name: "CKA Lab".into(),
+            hosts: vec![Host {
+                name: "m1".into(),
+                address: "192.168.1.10".into(),
+                port: 22,
+                user: "root".into(),
+                identity_file: None,
+                auth: AuthMode::Key,
+            }],
+            bastion: None,
+            bootstrap: BootstrapPolicy::default(),
+            kubeconfig: Some(crate::services::config::KubeconfigSource {
+                remote_path: "/etc/kubernetes/admin.conf".into(),
+                control_plane: "m1".into(),
+                local_path: "".into(),
+                context: "cka-lab".into(),
+            }),
+            manage_hosts_file: false,
+            trusted_cas: Vec::new(),
+        };
+        assert!(validate_profile(&profile).is_ok());
+
+        profile.kubeconfig.as_mut().unwrap().remote_path = "/tmp/$(rm -rf ~)".into();
+        let err = validate_profile(&profile).unwrap_err();
+        assert!(err.contains("remote_path"));
     }
 
     #[test]

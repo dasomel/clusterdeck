@@ -168,6 +168,14 @@ async fn fetch_remote_kubeconfig_content(
 ) -> Result<String, String> {
     use crate::services::config::AuthMode;
 
+    // Defensive re-check at the sink: `store::upsert_profile` already validates
+    // `remote_path` via `validate::validate_profile` at the persistence boundary, but a
+    // profile loaded before that check existed (or from a path other than the store) must
+    // not reach the SSH argv this value is interpolated into (build_candidate_read_cmd).
+    if !crate::services::validate::is_safe_remote_path(configured_path) {
+        return Err(format!("invalid kubeconfig remote_path: {configured_path}"));
+    }
+
     let alias = crate::services::ssh_config::ssh_alias(&profile.id, &host.name);
     let ssh_conf_path = paths.ssh_conf(&profile.id);
 
@@ -1451,6 +1459,34 @@ users:
         );
         assert!(!args.contains(&secret.to_string()));
         assert!(env.contains(&("SSHPASS".to_string(), secret.to_string())));
+
+        std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn fetch_and_store_rejects_unsafe_remote_path_without_invoking_runner() {
+        // Sink-level defensive re-check (validate::is_safe_remote_path): a profile whose
+        // remote_path carries a shell metacharacter must never reach build_candidate_read_cmd's
+        // SSH argv, even if it somehow bypassed store::upsert_profile's persistence-boundary
+        // check (e.g. a profile loaded from disk before this validation existed).
+        let temp_dir = std::env::temp_dir().join(format!(
+            "clusterdeck-kc-test-unsafe-remote-path-{}",
+            std::process::id()
+        ));
+        let paths = ClusterDeckPaths::at(temp_dir.clone());
+        let mut profile = password_auth_profile("cka-unsafe-path");
+        profile.kubeconfig.as_mut().unwrap().remote_path = "/tmp/$(rm -rf ~)".to_string();
+
+        let runner = CapturingSshRunner {
+            sample_yaml: SAMPLE.to_string(),
+            calls: std::sync::Mutex::new(Vec::new()),
+        };
+
+        let err = fetch_and_store(&runner, &paths, &profile, Some("irrelevant"))
+            .await
+            .unwrap_err();
+        assert!(err.contains("remote_path"));
+        assert_eq!(runner.calls.lock().unwrap().len(), 0);
 
         std::fs::remove_dir_all(&temp_dir).ok();
     }
