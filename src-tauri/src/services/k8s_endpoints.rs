@@ -89,17 +89,26 @@ pub(crate) fn write_owner_only_file(path: &Path, contents: &[u8]) -> std::io::Re
     std::fs::write(path, contents)
 }
 
-/// Splits a `scheme://host:port[/path]` URL into its `(host, port)` components. Returns `None`
-/// if there is no `://` separator or no explicit `:port` (kubeconfig server URLs always carry
-/// an explicit port in practice). Used to build the curl `--connect-to` mapping below.
+/// Splits a `scheme://host[:port][/path]` URL into its `(host, port)` components. Returns `None`
+/// if there is no `://` separator. When the URL has no explicit `:port` (kubeconfig server URLs
+/// almost always carry one in practice, but a hand-edited or default-port one might not), falls
+/// back to the scheme's default port (443 for https, 80 for http) rather than skipping, so the
+/// curl `--connect-to` mapping this builds stays consistent with what kubectl would connect to.
 fn split_host_port(url: &str) -> Option<(String, String)> {
-    let after_scheme = url.split_once("://")?.1;
+    let (scheme, after_scheme) = url.split_once("://")?;
     let host_and_rest = after_scheme
         .split(['/', '?', '#'])
         .next()
         .unwrap_or(after_scheme);
-    let (host, port) = host_and_rest.rsplit_once(':')?;
-    Some((host.to_string(), port.to_string()))
+    if let Some((host, port)) = host_and_rest.rsplit_once(':') {
+        return Some((host.to_string(), port.to_string()));
+    }
+    let default_port = match scheme {
+        "https" => "443",
+        "http" => "80",
+        _ => return None,
+    };
+    Some((host_and_rest.to_string(), default_port.to_string()))
 }
 
 /// Fallback to system curl for querying the k8s API directly, used when kubectl fails (e.g.
@@ -784,7 +793,19 @@ mod tests {
             Some(("cluster.example.com".to_string(), "6443".to_string()))
         );
         assert_eq!(split_host_port("not-a-url"), None);
-        assert_eq!(split_host_port("https://no-port-here"), None);
+    }
+
+    #[test]
+    fn split_host_port_defaults_port_from_scheme_when_absent() {
+        assert_eq!(
+            split_host_port("https://no-port-here"),
+            Some(("no-port-here".to_string(), "443".to_string()))
+        );
+        assert_eq!(
+            split_host_port("http://no-port-here"),
+            Some(("no-port-here".to_string(), "80".to_string()))
+        );
+        assert_eq!(split_host_port("ftp://no-port-here"), None);
     }
 
     #[test]
@@ -1149,6 +1170,36 @@ mod tests {
         );
         let url = args.last().unwrap();
         assert_eq!(url, "https://127.0.0.1:6443/api/v1/services");
+    }
+
+    #[tokio::test]
+    async fn curl_k8s_api_uses_scheme_default_port_for_connect_to_when_url_has_no_port() {
+        // server URL with no explicit :port -- split_host_port must fall back to https's
+        // default (443) rather than skip --connect-to entirely.
+        let kubeconfig_yaml = "clusters:\n- cluster:\n    server: https://172.16.221.133\n    tls-server-name: 127.0.0.1\n  name: fake\nusers:\n- name: fake\n  user:\n    token: fake-token\n";
+        let kubeconfig_path = std::env::temp_dir().join(format!(
+            "clusterdeck-test-curl-connect-to-default-port-{}-{}.yaml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&kubeconfig_path, kubeconfig_yaml).unwrap();
+
+        let runner = ArgCapturingRunner {
+            captured_args: std::sync::Mutex::new(None),
+        };
+        let result = curl_k8s_api(&runner, &kubeconfig_path, "/api/v1/services").await;
+        let _ = std::fs::remove_file(&kubeconfig_path);
+
+        assert!(result.is_ok(), "curl_k8s_api failed: {result:?}");
+        let args = runner.captured_args.lock().unwrap().clone().unwrap();
+        let connect_to_idx = args
+            .iter()
+            .position(|a| a == "--connect-to")
+            .expect("--connect-to missing from curl args");
+        assert_eq!(args[connect_to_idx + 1], "127.0.0.1:443:172.16.221.133:443");
     }
 
     #[tokio::test]
