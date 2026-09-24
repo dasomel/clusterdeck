@@ -89,26 +89,39 @@ pub(crate) fn write_owner_only_file(path: &Path, contents: &[u8]) -> std::io::Re
     std::fs::write(path, contents)
 }
 
-/// Splits a `scheme://host[:port][/path]` URL into its `(host, port)` components. Returns `None`
-/// if there is no `://` separator. When the URL has no explicit `:port` (kubeconfig server URLs
-/// almost always carry one in practice, but a hand-edited or default-port one might not), falls
-/// back to the scheme's default port (443 for https, 80 for http) rather than skipping, so the
-/// curl `--connect-to` mapping this builds stays consistent with what kubectl would connect to.
-fn split_host_port(url: &str) -> Option<(String, String)> {
+/// Splits a `scheme://host[:port][/path[?query][#fragment]]` URL into its `(scheme, host, port,
+/// rest)` components, where `rest` is everything from the path onward (starting with `/`, `?`,
+/// or `#`, or empty when the URL is bare `scheme://host[:port]`). Returns `None` if there is no
+/// `://` separator. When the URL has no explicit `:port` (kubeconfig server URLs almost always
+/// carry one in practice, but a hand-edited or default-port one might not), `port` falls back to
+/// the scheme's default (443 for https, 80 for http) rather than being omitted, so a curl
+/// `--connect-to` mapping built from it stays consistent with what kubectl would connect to.
+///
+/// Returning the parsed components (rather than a rewritten string) lets a caller rebuild the
+/// URL with a substituted host via `format!("{scheme}://{new_host}:{port}{rest}")` -- a prior
+/// version rewrote the URL with `str::replacen("://{host}:", ...)`, which silently did nothing
+/// when the URL had no port (no literal `:` right after the host to match), leaving the request
+/// on the wrong host and defeating the whole `--connect-to` TLS-consistency fix.
+fn split_scheme_host_port(url: &str) -> Option<(&str, String, String, &str)> {
     let (scheme, after_scheme) = url.split_once("://")?;
-    let host_and_rest = after_scheme
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or(after_scheme);
-    if let Some((host, port)) = host_and_rest.rsplit_once(':') {
-        return Some((host.to_string(), port.to_string()));
+    let rest_start = after_scheme
+        .find(['/', '?', '#'])
+        .unwrap_or(after_scheme.len());
+    let (host_and_port, rest) = after_scheme.split_at(rest_start);
+    if let Some((host, port)) = host_and_port.rsplit_once(':') {
+        return Some((scheme, host.to_string(), port.to_string(), rest));
     }
     let default_port = match scheme {
         "https" => "443",
         "http" => "80",
         _ => return None,
     };
-    Some((host_and_rest.to_string(), default_port.to_string()))
+    Some((
+        scheme,
+        host_and_port.to_string(),
+        default_port.to_string(),
+        rest,
+    ))
 }
 
 /// Fallback to system curl for querying the k8s API directly, used when kubectl fails (e.g.
@@ -182,10 +195,12 @@ pub(crate) async fn curl_k8s_api(
     let mut effective_server_url = server_url.clone();
     let mut connect_to: Option<String> = None;
     if let Some(tsn) = tls_server_name {
-        if let Some((actual_host, port)) = split_host_port(&server_url) {
+        if let Some((scheme, actual_host, port, rest)) = split_scheme_host_port(&server_url) {
             if tsn != actual_host {
-                effective_server_url =
-                    server_url.replacen(&format!("://{actual_host}:"), &format!("://{tsn}:"), 1);
+                // Rebuilt from the parsed components, not a string replace: the URL's host may
+                // be followed by `:` (explicit port), `/`/`?`/`#` (path/query/fragment), or
+                // nothing at all (bare `scheme://host`), and all three must work.
+                effective_server_url = format!("{scheme}://{tsn}:{port}{rest}");
                 connect_to = Some(format!("{tsn}:{port}:{actual_host}:{port}"));
             }
         }
@@ -783,29 +798,43 @@ mod tests {
     use super::*;
 
     #[test]
-    fn split_host_port_parses_scheme_host_port() {
+    fn split_scheme_host_port_parses_scheme_host_port_and_rest() {
         assert_eq!(
-            split_host_port("https://127.0.0.1:6443"),
-            Some(("127.0.0.1".to_string(), "6443".to_string()))
+            split_scheme_host_port("https://127.0.0.1:6443"),
+            Some(("https", "127.0.0.1".to_string(), "6443".to_string(), ""))
         );
         assert_eq!(
-            split_host_port("https://cluster.example.com:6443/api"),
-            Some(("cluster.example.com".to_string(), "6443".to_string()))
+            split_scheme_host_port("https://cluster.example.com:6443/api"),
+            Some((
+                "https",
+                "cluster.example.com".to_string(),
+                "6443".to_string(),
+                "/api"
+            ))
         );
-        assert_eq!(split_host_port("not-a-url"), None);
+        assert_eq!(split_scheme_host_port("not-a-url"), None);
     }
 
     #[test]
-    fn split_host_port_defaults_port_from_scheme_when_absent() {
+    fn split_scheme_host_port_defaults_port_from_scheme_when_absent() {
         assert_eq!(
-            split_host_port("https://no-port-here"),
-            Some(("no-port-here".to_string(), "443".to_string()))
+            split_scheme_host_port("https://no-port-here"),
+            Some(("https", "no-port-here".to_string(), "443".to_string(), ""))
         );
         assert_eq!(
-            split_host_port("http://no-port-here"),
-            Some(("no-port-here".to_string(), "80".to_string()))
+            split_scheme_host_port("https://no-port-here/api/v1/services"),
+            Some((
+                "https",
+                "no-port-here".to_string(),
+                "443".to_string(),
+                "/api/v1/services"
+            ))
         );
-        assert_eq!(split_host_port("ftp://no-port-here"), None);
+        assert_eq!(
+            split_scheme_host_port("http://no-port-here"),
+            Some(("http", "no-port-here".to_string(), "80".to_string(), ""))
+        );
+        assert_eq!(split_scheme_host_port("ftp://no-port-here"), None);
     }
 
     #[test]
@@ -1174,8 +1203,11 @@ mod tests {
 
     #[tokio::test]
     async fn curl_k8s_api_uses_scheme_default_port_for_connect_to_when_url_has_no_port() {
-        // server URL with no explicit :port -- split_host_port must fall back to https's
-        // default (443) rather than skip --connect-to entirely.
+        // server URL with no explicit :port -- split_scheme_host_port must fall back to https's
+        // default (443) rather than skip --connect-to entirely, AND the rebuilt request URL
+        // must actually land on the original host: the prior string-replace implementation
+        // (`replacen("://{host}:", ...)`) silently did nothing here, since there is no literal
+        // `:` right after the host to match, leaving the URL on the wrong (rewritten) host.
         let kubeconfig_yaml = "clusters:\n- cluster:\n    server: https://172.16.221.133\n    tls-server-name: 127.0.0.1\n  name: fake\nusers:\n- name: fake\n  user:\n    token: fake-token\n";
         let kubeconfig_path = std::env::temp_dir().join(format!(
             "clusterdeck-test-curl-connect-to-default-port-{}-{}.yaml",
@@ -1200,6 +1232,8 @@ mod tests {
             .position(|a| a == "--connect-to")
             .expect("--connect-to missing from curl args");
         assert_eq!(args[connect_to_idx + 1], "127.0.0.1:443:172.16.221.133:443");
+        let url = args.last().unwrap();
+        assert_eq!(url, "https://127.0.0.1:443/api/v1/services");
     }
 
     #[tokio::test]
