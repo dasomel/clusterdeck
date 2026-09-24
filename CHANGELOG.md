@@ -6,7 +6,15 @@ The format follows the principles of Keep a Changelog and uses semantic versioni
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-24
+
 - Add local runtime lifecycle actions for Colima/Lima instances: Start/Stop/Restart, open a VM shell, open a host-side shell scoped to the instance's Docker/kube context (no global `docker context use`/`kubectl config use-context` mutation), and copy a plain-text runtime summary; guarded by strict instance-name validation, a fresh-discovery re-check before every action, and a per-instance concurrency lock (#14 Phase 2, ADR-0007)
+- Show the app version in the sidebar header (#33)
+- Fix remote kubeconfig fetch for non-root SSH users: a remote `cat: ... Permission denied` no longer aborts the candidate-path loop as if it were an SSH auth failure, `~/.kube/config` now expands via `$HOME`, and `sudo -n` never waits on a password prompt (#31)
+- Validate `KubeconfigSource.remote_path` against shell-quoting breakouts on save and at the fetch sink, without dropping legacy profiles on load (#39)
+- Set `tls-server-name` to the original kubeconfig server host instead of the profile label, and align the curl verification fallback via `--connect-to` (#39)
+- Add rke2 and k0s kubeconfig candidate paths; resolve CLI tools from absolute `$PATH` entries after the fixed directories (#39)
+- Bump tauri 2.11.6, base64 0.23, sha1 0.11, sha2 0.11 (#38)
 
 ## [0.2.0] - 2026-09-23
 
