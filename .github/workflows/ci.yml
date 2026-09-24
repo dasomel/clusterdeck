@@ -1,10 +1,11 @@
 name: CI
 
 on:
+  # PR branches are verified by `pull_request` only; also listing them under `push` ran CI
+  # twice per commit, and the concurrency group cancelled one run, leaving a red check on the PR.
   push:
     branches:
       - main
-      - 'feat/**'
   pull_request:
 
 concurrency:
