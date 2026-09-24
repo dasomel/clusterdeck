@@ -14,9 +14,11 @@ pub struct KubeconfigSummary {
     pub local_path: String,
 }
 
-const CANDIDATE_KUBECONFIG_PATHS: [&str; 4] = [
+const CANDIDATE_KUBECONFIG_PATHS: [&str; 6] = [
     "/etc/rancher/k3s/k3s.yaml",
+    "/etc/rancher/rke2/rke2.yaml",
     "/etc/kubernetes/admin.conf",
+    "/var/lib/k0s/pki/admin.conf",
     "~/.kube/config",
     "/var/lib/microk8s/credentials/client.config",
 ];
@@ -1609,8 +1611,8 @@ users:
             .await
             .unwrap_err();
         assert!(err.contains("Permission denied"));
-        // There are 5 candidate paths total; a real auth failure must stop after the first one
-        // rather than repeating a failed login 5x in a row (risks OpenSSH PerSourcePenalties or
+        // There are 6 candidate paths total; a real auth failure must stop after the first one
+        // rather than repeating a failed login 6x in a row (risks OpenSSH PerSourcePenalties or
         // fail2ban-style client lockout).
         assert_eq!(*runner.calls.lock().unwrap(), 1);
 
@@ -1663,10 +1665,10 @@ users:
         let err = fetch_and_store(&runner, &paths, &profile, Some(secret))
             .await
             .unwrap_err();
-        // 4 unique candidate paths (the configured path de-dupes against one of the 4 built-in
+        // 6 unique candidate paths (the configured path de-dupes against one of the 6 built-in
         // candidates) must all have been tried, and the final error names them.
-        assert_eq!(*runner.calls.lock().unwrap(), 4);
-        assert!(err.contains("4 candidate path"));
+        assert_eq!(*runner.calls.lock().unwrap(), 6);
+        assert!(err.contains("6 candidate path"));
         assert!(err.contains("/etc/kubernetes/admin.conf"));
         assert!(err.contains("Permission denied"));
 
