@@ -94,6 +94,19 @@ pub fn save_profiles(paths: &ClusterDeckPaths, profiles: &[Profile]) -> Result<(
 
 pub fn upsert_profile(paths: &ClusterDeckPaths, profile: Profile) -> Result<(), String> {
     crate::services::validate::validate_profile(&profile)?;
+    // remote_path is checked here rather than in validate_profile: validate_profile also
+    // filters profiles loaded from disk (see load_profiles above), and an unsafe/legacy
+    // remote_path must never make an otherwise-valid saved profile silently disappear and then
+    // get deleted on the next save. Here, at the save boundary, a rejection is instead a
+    // user-facing error the caller can act on.
+    if let Some(kubeconfig) = &profile.kubeconfig {
+        if !crate::services::validate::is_safe_remote_path(&kubeconfig.remote_path) {
+            return Err(format!(
+                "invalid kubeconfig remote_path: {}",
+                kubeconfig.remote_path
+            ));
+        }
+    }
     let mut profiles = load_profiles(paths)?;
     if let Some(pos) = profiles.iter().position(|p| p.id == profile.id) {
         profiles[pos] = profile;
@@ -251,6 +264,92 @@ profiles:
         let loaded = get_profile(&paths, "cka").unwrap();
         assert_eq!(loaded.trusted_cas.len(), 1);
         assert_eq!(loaded.trusted_cas[0], profile.trusted_cas[0]);
+    }
+
+    #[test]
+    fn load_profiles_keeps_profile_with_unsafe_legacy_remote_path_and_upsert_preserves_it_on_save()
+    {
+        // Regression: a profile saved before is_safe_remote_path existed (or hand-edited) must
+        // not vanish from load_profiles, and a later upsert of an UNRELATED profile must not
+        // delete it from disk as a side effect of save_profiles rewriting the whole file.
+        let paths = temp_paths("legacy-remote-path");
+        if let Some(parent) = paths.profiles_file().parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        let yaml = r#"
+profiles:
+  legacy:
+    name: "Legacy"
+    hosts:
+      - name: m1
+        address: 192.0.2.10
+        port: 22
+        user: root
+    kubeconfig:
+      remote_path: "relative/no/leading/slash.conf"
+      control_plane: m1
+      local_path: ""
+      context: legacy
+    manage_hosts_file: false
+"#;
+        std::fs::write(paths.profiles_file(), yaml).unwrap();
+
+        let loaded = load_profiles(&paths).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, "legacy");
+        assert_eq!(
+            loaded[0].kubeconfig.as_ref().unwrap().remote_path,
+            "relative/no/leading/slash.conf"
+        );
+
+        let other = Profile {
+            id: "other".into(),
+            name: "Other".into(),
+            hosts: vec![],
+            bastion: None,
+            bootstrap: BootstrapPolicy::default(),
+            kubeconfig: None,
+            manage_hosts_file: false,
+            trusted_cas: Vec::new(),
+        };
+        upsert_profile(&paths, other).unwrap();
+
+        let after_save = load_profiles(&paths).unwrap();
+        assert_eq!(
+            after_save.len(),
+            2,
+            "legacy profile must survive an unrelated upsert/save"
+        );
+        assert!(after_save.iter().any(|p| p.id == "legacy"));
+        assert!(after_save.iter().any(|p| p.id == "other"));
+    }
+
+    #[test]
+    fn upsert_profile_accepts_empty_remote_path_and_rejects_unsafe_one() {
+        let paths = temp_paths("remote-path-validation");
+        let mut profile = Profile {
+            id: "cka".into(),
+            name: "CKA Lab".into(),
+            hosts: vec![],
+            bastion: None,
+            bootstrap: BootstrapPolicy::default(),
+            kubeconfig: Some(KubeconfigSource {
+                remote_path: "".into(),
+                control_plane: "m1".into(),
+                local_path: "".into(),
+                context: "cka".into(),
+            }),
+            manage_hosts_file: false,
+            trusted_cas: Vec::new(),
+        };
+        assert!(
+            upsert_profile(&paths, profile.clone()).is_ok(),
+            "empty remote_path means unconfigured and must be accepted"
+        );
+
+        profile.kubeconfig.as_mut().unwrap().remote_path = "/tmp/'; rm -rf ~ #".into();
+        let err = upsert_profile(&paths, profile).unwrap_err();
+        assert!(err.contains("remote_path"));
     }
 
     #[test]

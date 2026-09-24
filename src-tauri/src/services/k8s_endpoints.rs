@@ -89,6 +89,41 @@ pub(crate) fn write_owner_only_file(path: &Path, contents: &[u8]) -> std::io::Re
     std::fs::write(path, contents)
 }
 
+/// Splits a `scheme://host[:port][/path[?query][#fragment]]` URL into its `(scheme, host, port,
+/// rest)` components, where `rest` is everything from the path onward (starting with `/`, `?`,
+/// or `#`, or empty when the URL is bare `scheme://host[:port]`). Returns `None` if there is no
+/// `://` separator. When the URL has no explicit `:port` (kubeconfig server URLs almost always
+/// carry one in practice, but a hand-edited or default-port one might not), `port` falls back to
+/// the scheme's default (443 for https, 80 for http) rather than being omitted, so a curl
+/// `--connect-to` mapping built from it stays consistent with what kubectl would connect to.
+///
+/// Returning the parsed components (rather than a rewritten string) lets a caller rebuild the
+/// URL with a substituted host via `format!("{scheme}://{new_host}:{port}{rest}")` -- a prior
+/// version rewrote the URL with `str::replacen("://{host}:", ...)`, which silently did nothing
+/// when the URL had no port (no literal `:` right after the host to match), leaving the request
+/// on the wrong host and defeating the whole `--connect-to` TLS-consistency fix.
+fn split_scheme_host_port(url: &str) -> Option<(&str, String, String, &str)> {
+    let (scheme, after_scheme) = url.split_once("://")?;
+    let rest_start = after_scheme
+        .find(['/', '?', '#'])
+        .unwrap_or(after_scheme.len());
+    let (host_and_port, rest) = after_scheme.split_at(rest_start);
+    if let Some((host, port)) = host_and_port.rsplit_once(':') {
+        return Some((scheme, host.to_string(), port.to_string(), rest));
+    }
+    let default_port = match scheme {
+        "https" => "443",
+        "http" => "80",
+        _ => return None,
+    };
+    Some((
+        scheme,
+        host_and_port.to_string(),
+        default_port.to_string(),
+        rest,
+    ))
+}
+
 /// Fallback to system curl for querying the k8s API directly, used when kubectl fails (e.g.
 /// macOS Sequoia Local Network Privacy blocks third-party sockets) or kubectl is not installed;
 /// curl bypasses LNP restrictions. Shared by query_k8s_api_json's step 2 and
@@ -146,8 +181,32 @@ pub(crate) async fn curl_k8s_api(
     let ca_path = cluster_obj
         .and_then(|c| c.get("certificate-authority"))
         .and_then(|v| v.as_str());
+    let tls_server_name = cluster_obj
+        .and_then(|c| c.get("tls-server-name"))
+        .and_then(|v| v.as_str());
 
-    let target_url = format!("{server_url}{api_path}");
+    // kubeconfig.rs::normalize_with_host sets tls-server-name to the server URL's ORIGINAL host
+    // (the one the fetched kubeconfig's TLS cert actually covers) whenever it rewrote the
+    // endpoint to a different, SSH-reachable address. kubectl honors that field for TLS
+    // verification; align this curl fallback the same way so it doesn't x509-fail against the
+    // rewritten host kubectl would happily connect to. `--connect-to` keeps the request URL
+    // (and therefore SNI/cert-hostname verification) on the original host while still routing
+    // the actual TCP connection to the reachable rewritten address.
+    let mut effective_server_url = server_url.clone();
+    let mut connect_to: Option<String> = None;
+    if let Some(tsn) = tls_server_name {
+        if let Some((scheme, actual_host, port, rest)) = split_scheme_host_port(&server_url) {
+            if tsn != actual_host {
+                // Rebuilt from the parsed components, not a string replace: the URL's host may
+                // be followed by `:` (explicit port), `/`/`?`/`#` (path/query/fragment), or
+                // nothing at all (bare `scheme://host`), and all three must work.
+                effective_server_url = format!("{scheme}://{tsn}:{port}{rest}");
+                connect_to = Some(format!("{tsn}:{port}:{actual_host}:{port}"));
+            }
+        }
+    }
+
+    let target_url = format!("{effective_server_url}{api_path}");
 
     let now_nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -204,6 +263,11 @@ pub(crate) async fn curl_k8s_api(
     } else if let Some(t) = token {
         curl_args.push("-H".to_string());
         curl_args.push(format!("Authorization: Bearer {t}"));
+    }
+
+    if let Some(mapping) = connect_to {
+        curl_args.push("--connect-to".to_string());
+        curl_args.push(mapping);
     }
 
     curl_args.push(target_url);
@@ -734,6 +798,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn split_scheme_host_port_parses_scheme_host_port_and_rest() {
+        assert_eq!(
+            split_scheme_host_port("https://127.0.0.1:6443"),
+            Some(("https", "127.0.0.1".to_string(), "6443".to_string(), ""))
+        );
+        assert_eq!(
+            split_scheme_host_port("https://cluster.example.com:6443/api"),
+            Some((
+                "https",
+                "cluster.example.com".to_string(),
+                "6443".to_string(),
+                "/api"
+            ))
+        );
+        assert_eq!(split_scheme_host_port("not-a-url"), None);
+    }
+
+    #[test]
+    fn split_scheme_host_port_defaults_port_from_scheme_when_absent() {
+        assert_eq!(
+            split_scheme_host_port("https://no-port-here"),
+            Some(("https", "no-port-here".to_string(), "443".to_string(), ""))
+        );
+        assert_eq!(
+            split_scheme_host_port("https://no-port-here/api/v1/services"),
+            Some((
+                "https",
+                "no-port-here".to_string(),
+                "443".to_string(),
+                "/api/v1/services"
+            ))
+        );
+        assert_eq!(
+            split_scheme_host_port("http://no-port-here"),
+            Some(("http", "no-port-here".to_string(), "80".to_string(), ""))
+        );
+        assert_eq!(split_scheme_host_port("ftp://no-port-here"), None);
+    }
+
+    #[test]
     fn parse_services_extracts_load_balancer_ip_and_annotations() {
         let json_str = r#"{
             "items": [
@@ -1055,6 +1159,112 @@ mod tests {
         assert!(
             !ca_path.exists(),
             "temp CA file should be removed after curl_k8s_api returns"
+        );
+    }
+
+    #[tokio::test]
+    async fn curl_k8s_api_routes_via_connect_to_and_keeps_url_on_original_host_when_tls_server_name_set(
+    ) {
+        // kubeconfig.rs::normalize_with_host sets tls-server-name to the ORIGINAL server host
+        // (127.0.0.1) whenever it rewrites the endpoint to a reachable address (172.16.221.133,
+        // used here as an obviously-fake profile-host address per AGENTS.md). curl must keep the
+        // request URL/SNI on the original host (so TLS verification matches the cert kubectl
+        // would accept) and use --connect-to to route the socket to the reachable address.
+        let kubeconfig_yaml = "clusters:\n- cluster:\n    server: https://172.16.221.133:6443\n    tls-server-name: 127.0.0.1\n  name: fake\nusers:\n- name: fake\n  user:\n    token: fake-token\n";
+        let kubeconfig_path = std::env::temp_dir().join(format!(
+            "clusterdeck-test-curl-connect-to-{}-{}.yaml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&kubeconfig_path, kubeconfig_yaml).unwrap();
+
+        let runner = ArgCapturingRunner {
+            captured_args: std::sync::Mutex::new(None),
+        };
+        let result = curl_k8s_api(&runner, &kubeconfig_path, "/api/v1/services").await;
+        let _ = std::fs::remove_file(&kubeconfig_path);
+
+        assert!(result.is_ok(), "curl_k8s_api failed: {result:?}");
+        let args = runner.captured_args.lock().unwrap().clone().unwrap();
+        let connect_to_idx = args
+            .iter()
+            .position(|a| a == "--connect-to")
+            .expect("--connect-to missing from curl args");
+        assert_eq!(
+            args[connect_to_idx + 1],
+            "127.0.0.1:6443:172.16.221.133:6443"
+        );
+        let url = args.last().unwrap();
+        assert_eq!(url, "https://127.0.0.1:6443/api/v1/services");
+    }
+
+    #[tokio::test]
+    async fn curl_k8s_api_uses_scheme_default_port_for_connect_to_when_url_has_no_port() {
+        // server URL with no explicit :port -- split_scheme_host_port must fall back to https's
+        // default (443) rather than skip --connect-to entirely, AND the rebuilt request URL
+        // must actually land on the original host: the prior string-replace implementation
+        // (`replacen("://{host}:", ...)`) silently did nothing here, since there is no literal
+        // `:` right after the host to match, leaving the URL on the wrong (rewritten) host.
+        let kubeconfig_yaml = "clusters:\n- cluster:\n    server: https://172.16.221.133\n    tls-server-name: 127.0.0.1\n  name: fake\nusers:\n- name: fake\n  user:\n    token: fake-token\n";
+        let kubeconfig_path = std::env::temp_dir().join(format!(
+            "clusterdeck-test-curl-connect-to-default-port-{}-{}.yaml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&kubeconfig_path, kubeconfig_yaml).unwrap();
+
+        let runner = ArgCapturingRunner {
+            captured_args: std::sync::Mutex::new(None),
+        };
+        let result = curl_k8s_api(&runner, &kubeconfig_path, "/api/v1/services").await;
+        let _ = std::fs::remove_file(&kubeconfig_path);
+
+        assert!(result.is_ok(), "curl_k8s_api failed: {result:?}");
+        let args = runner.captured_args.lock().unwrap().clone().unwrap();
+        let connect_to_idx = args
+            .iter()
+            .position(|a| a == "--connect-to")
+            .expect("--connect-to missing from curl args");
+        assert_eq!(args[connect_to_idx + 1], "127.0.0.1:443:172.16.221.133:443");
+        let url = args.last().unwrap();
+        assert_eq!(url, "https://127.0.0.1:443/api/v1/services");
+    }
+
+    #[tokio::test]
+    async fn curl_k8s_api_omits_connect_to_when_tls_server_name_absent() {
+        let kubeconfig_yaml =
+            "clusters:\n- cluster:\n    server: https://127.0.0.1:6443\n  name: fake\nusers:\n- name: fake\n  user:\n    token: fake-token\n";
+        let kubeconfig_path = std::env::temp_dir().join(format!(
+            "clusterdeck-test-curl-no-connect-to-{}-{}.yaml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&kubeconfig_path, kubeconfig_yaml).unwrap();
+
+        let runner = ArgCapturingRunner {
+            captured_args: std::sync::Mutex::new(None),
+        };
+        let result = curl_k8s_api(&runner, &kubeconfig_path, "/api/v1/services").await;
+        let _ = std::fs::remove_file(&kubeconfig_path);
+
+        assert!(result.is_ok(), "curl_k8s_api failed: {result:?}");
+        let args = runner.captured_args.lock().unwrap().clone().unwrap();
+        assert!(
+            !args.contains(&"--connect-to".to_string()),
+            "no tls-server-name means no --connect-to should be passed: {args:?}"
+        );
+        assert_eq!(
+            args.last().unwrap(),
+            "https://127.0.0.1:6443/api/v1/services"
         );
     }
 

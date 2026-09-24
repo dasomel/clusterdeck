@@ -14,9 +14,11 @@ pub struct KubeconfigSummary {
     pub local_path: String,
 }
 
-const CANDIDATE_KUBECONFIG_PATHS: [&str; 4] = [
+const CANDIDATE_KUBECONFIG_PATHS: [&str; 6] = [
     "/etc/rancher/k3s/k3s.yaml",
+    "/etc/rancher/rke2/rke2.yaml",
     "/etc/kubernetes/admin.conf",
+    "/var/lib/k0s/pki/admin.conf",
     "~/.kube/config",
     "/var/lib/microk8s/credentials/client.config",
 ];
@@ -47,18 +49,47 @@ pub fn read_current_context(path: &std::path::Path) -> Option<String> {
     Some(ctx.to_string())
 }
 
+/// Rewrites `server_url`'s host to `target_address` when (and only when) the URL's host is
+/// EXACTLY `127.0.0.1` or `localhost`. Parses the host via `extract_url_host` rather than a
+/// substring `contains("://127.0.0.1")` check -- the substring form also matched a host like
+/// `127.0.0.10`, silently corrupting an already-reachable non-loopback server URL.
 fn rewrite_server_endpoint(server_url: &str, target_address: &str) -> String {
     if target_address == "127.0.0.1" || target_address == "localhost" {
         return server_url.to_string();
     }
 
-    if server_url.contains("://127.0.0.1") {
-        server_url.replace("://127.0.0.1", &format!("://{target_address}"))
-    } else if server_url.contains("://localhost") {
-        server_url.replace("://localhost", &format!("://{target_address}"))
-    } else {
-        server_url.to_string()
+    match extract_url_host(server_url) {
+        Some(host) if host == "127.0.0.1" || host == "localhost" => {
+            server_url.replacen(&format!("://{host}"), &format!("://{target_address}"), 1)
+        }
+        _ => server_url.to_string(),
     }
+}
+
+/// Extracts the host component from a `scheme://host[:port][/path]` URL string, or `None` if
+/// `url` has no `://` separator. Used by `normalize_with_host` to recover the fetched
+/// kubeconfig's ORIGINAL server host before `rewrite_server_endpoint` replaces it with the
+/// profile's SSH-reachable address, so `tls-server-name` can be set to a value the upstream
+/// cluster's certificate is actually guaranteed to cover (the kubeconfig worked against that
+/// host on the node itself). Also used by k8s_endpoints::curl_k8s_api to keep its TLS
+/// verification consistent with kubectl's.
+pub(crate) fn extract_url_host(url: &str) -> Option<String> {
+    let after_scheme = url.split_once("://")?.1;
+    let host_and_rest = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(after_scheme);
+    // IPv6 literals are bracketed (`[::1]:6443`); not expected from a real kubeconfig server
+    // URL, but handled rather than mis-parsed into a colon-split fragment.
+    if let Some(inside_brackets) = host_and_rest.strip_prefix('[') {
+        return inside_brackets.split(']').next().map(|s| s.to_string());
+    }
+    Some(
+        host_and_rest
+            .rsplit_once(':')
+            .map_or(host_and_rest, |(host, _port)| host)
+            .to_string(),
+    )
 }
 
 pub fn normalize(raw_yaml: &str, profile_id: &str) -> Result<String, String> {
@@ -102,18 +133,34 @@ pub fn normalize_with_host(
             // Normalize endpoint and add tls-server-name if host is provided
             if let Some(h) = host {
                 if let Some(inner) = map.get_mut("cluster").and_then(|v| v.as_mapping_mut()) {
+                    let mut original_host: Option<String> = None;
                     if let Some(server_val) = inner.get_mut("server") {
                         if let Some(s) = server_val.as_str() {
-                            let rewritten = rewrite_server_endpoint(s, &h.address);
+                            let original = s.to_string();
+                            let rewritten = rewrite_server_endpoint(&original, &h.address);
+                            // Only set tls-server-name when the server URL was actually
+                            // rewritten to a different host: the fetched kubeconfig's TLS cert
+                            // is guaranteed to cover the ORIGINAL host it worked against on the
+                            // node (e.g. 127.0.0.1 for k3s), not the profile's host label,
+                            // which is a user-chosen display name with no relation to the
+                            // cluster's cert SANs. Go's x509 VerifyHostname matches IP SANs
+                            // too, so an IP value here is fine.
+                            if rewritten != original {
+                                original_host = extract_url_host(&original);
+                            }
                             *server_val = serde_yaml::Value::String(rewritten);
                         }
                     }
 
-                    if h.address != "127.0.0.1" && h.address != "localhost" && !h.name.is_empty() {
-                        inner.insert(
-                            serde_yaml::Value::String("tls-server-name".to_string()),
-                            serde_yaml::Value::String(h.name.clone()),
-                        );
+                    // Never override a tls-server-name already present in the fetched
+                    // kubeconfig -- the cluster operator set it deliberately.
+                    if !inner.contains_key("tls-server-name") {
+                        if let Some(orig) = original_host {
+                            inner.insert(
+                                serde_yaml::Value::String("tls-server-name".to_string()),
+                                serde_yaml::Value::String(orig),
+                            );
+                        }
                     }
                 }
             }
@@ -168,12 +215,28 @@ async fn fetch_remote_kubeconfig_content(
 ) -> Result<String, String> {
     use crate::services::config::AuthMode;
 
+    // Defensive re-check at the sink: `store::upsert_profile` already validates `remote_path`
+    // (a user-facing error) at the save boundary, but a profile loaded from disk is NOT
+    // re-validated there (validate_profile deliberately skips remote_path so a legacy/unsafe
+    // value never makes load_profiles drop an otherwise-valid profile -- see validate.rs). So
+    // this is the only check standing between a persisted profile and the SSH argv
+    // build_candidate_read_cmd interpolates it into. is_safe_remote_path treats "" (no
+    // configured path) as safe; the candidate-building step right below skips it rather than
+    // probing it.
+    if !crate::services::validate::is_safe_remote_path(configured_path) {
+        return Err(format!("invalid kubeconfig remote_path: {configured_path}"));
+    }
+
     let alias = crate::services::ssh_config::ssh_alias(&profile.id, &host.name);
     let ssh_conf_path = paths.ssh_conf(&profile.id);
 
     // Read candidate paths over SSH so the local destination is never exposed to a
-    // transfer-completion permission race.
-    let mut candidates = vec![configured_path];
+    // transfer-completion permission race. An empty configured_path means "unconfigured" and
+    // is skipped here rather than probed as a literal candidate; the built-in list still runs.
+    let mut candidates: Vec<&str> = Vec::new();
+    if !configured_path.is_empty() {
+        candidates.push(configured_path);
+    }
     for p in CANDIDATE_KUBECONFIG_PATHS {
         if !candidates.contains(&p) {
             candidates.push(p);
@@ -953,8 +1016,13 @@ pub fn merge_yaml_kubeconfigs(
 }
 
 /// Shape of the placeholder kubeconfig generate_default_kubeconfig emits when a profile has no
-/// fetched kubeconfig yet. Field order matches the document's key order; `tls_server_name` is
-/// only present when the control-plane host has a non-loopback address (mirrors normalize_with_host).
+/// fetched kubeconfig yet. Field order matches the document's key order. Deliberately carries no
+/// `tls-server-name`: unlike normalize_with_host (which derives it from a real fetched
+/// kubeconfig's ORIGINAL server host -- a value its cert is guaranteed to cover), this function
+/// synthesizes a server URL from scratch with no fetched kubeconfig to draw an original host
+/// from, so there is no known-good value to put there. `insecure-skip-tls-verify: true` is set
+/// unconditionally here anyway, so the field would be inert for this placeholder's own
+/// connection; it was previously the profile's host label, which has no relation to any cert.
 #[derive(Serialize)]
 struct DefaultKubeconfigDoc {
     #[serde(rename = "apiVersion")]
@@ -978,8 +1046,6 @@ struct DefaultClusterSpec {
     server: String,
     #[serde(rename = "insecure-skip-tls-verify")]
     insecure_skip_tls_verify: bool,
-    #[serde(rename = "tls-server-name", skip_serializing_if = "Option::is_none")]
-    tls_server_name: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1005,29 +1071,22 @@ pub fn generate_default_kubeconfig(profile: &Profile) -> Result<String, String> 
         return Err("invalid profile id".to_string());
     }
 
-    let (host_addr, host_name) = if let Some(ref kc) = profile.kubeconfig {
+    let host_addr = if let Some(ref kc) = profile.kubeconfig {
         if let Some(h) = profile.hosts.iter().find(|h| h.name == kc.control_plane) {
-            (h.address.as_str(), h.name.as_str())
+            h.address.as_str()
         } else if let Some(first) = profile.hosts.first() {
-            (first.address.as_str(), first.name.as_str())
+            first.address.as_str()
         } else {
-            ("127.0.0.1", "localhost")
+            "127.0.0.1"
         }
     } else if let Some(first) = profile.hosts.first() {
-        (first.address.as_str(), first.name.as_str())
+        first.address.as_str()
     } else {
-        ("127.0.0.1", "localhost")
+        "127.0.0.1"
     };
 
     let server_url = format!("https://{host_addr}:6443");
     let profile_id = profile.id.clone();
-
-    let tls_server_name =
-        if host_addr != "127.0.0.1" && host_addr != "localhost" && !host_name.is_empty() {
-            Some(host_name.to_string())
-        } else {
-            None
-        };
 
     let doc = DefaultKubeconfigDoc {
         api_version: "v1".to_string(),
@@ -1037,7 +1096,6 @@ pub fn generate_default_kubeconfig(profile: &Profile) -> Result<String, String> 
             cluster: DefaultClusterSpec {
                 server: server_url,
                 insecure_skip_tls_verify: true,
-                tls_server_name,
             },
         }],
         contexts: vec![DefaultContextItem {
@@ -1456,6 +1514,36 @@ users:
     }
 
     #[tokio::test]
+    async fn fetch_and_store_rejects_unsafe_remote_path_without_invoking_runner() {
+        // Sink-level defensive re-check (validate::is_safe_remote_path): a profile whose
+        // remote_path carries a literal single quote (which would end the single-quoted shell
+        // string build_candidate_read_cmd embeds it in early) must never reach that SSH argv,
+        // even if it somehow bypassed store::upsert_profile's save-boundary check (e.g. a
+        // profile loaded from disk, which is deliberately NOT re-validated on remote_path --
+        // see validate.rs's validate_profile doc comment).
+        let temp_dir = std::env::temp_dir().join(format!(
+            "clusterdeck-kc-test-unsafe-remote-path-{}",
+            std::process::id()
+        ));
+        let paths = ClusterDeckPaths::at(temp_dir.clone());
+        let mut profile = password_auth_profile("cka-unsafe-path");
+        profile.kubeconfig.as_mut().unwrap().remote_path = "/tmp/'; rm -rf ~ #".to_string();
+
+        let runner = CapturingSshRunner {
+            sample_yaml: SAMPLE.to_string(),
+            calls: std::sync::Mutex::new(Vec::new()),
+        };
+
+        let err = fetch_and_store(&runner, &paths, &profile, Some("irrelevant"))
+            .await
+            .unwrap_err();
+        assert!(err.contains("remote_path"));
+        assert_eq!(runner.calls.lock().unwrap().len(), 0);
+
+        std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    #[tokio::test]
     async fn fetch_and_store_refuses_password_mode_with_a_bastion() {
         use crate::services::config::Bastion;
         let temp_dir = std::env::temp_dir().join(format!(
@@ -1531,8 +1619,8 @@ users:
             .await
             .unwrap_err();
         assert!(err.contains("Permission denied"));
-        // There are 5 candidate paths total; a real auth failure must stop after the first one
-        // rather than repeating a failed login 5x in a row (risks OpenSSH PerSourcePenalties or
+        // There are 6 candidate paths total; a real auth failure must stop after the first one
+        // rather than repeating a failed login 6x in a row (risks OpenSSH PerSourcePenalties or
         // fail2ban-style client lockout).
         assert_eq!(*runner.calls.lock().unwrap(), 1);
 
@@ -1585,10 +1673,10 @@ users:
         let err = fetch_and_store(&runner, &paths, &profile, Some(secret))
             .await
             .unwrap_err();
-        // 4 unique candidate paths (the configured path de-dupes against one of the 4 built-in
+        // 6 unique candidate paths (the configured path de-dupes against one of the 6 built-in
         // candidates) must all have been tried, and the final error names them.
-        assert_eq!(*runner.calls.lock().unwrap(), 4);
-        assert!(err.contains("4 candidate path"));
+        assert_eq!(*runner.calls.lock().unwrap(), 6);
+        assert!(err.contains("6 candidate path"));
         assert!(err.contains("/etc/kubernetes/admin.conf"));
         assert!(err.contains("Permission denied"));
 
@@ -1694,11 +1782,100 @@ users:
             value["clusters"][0]["cluster"]["server"].as_str().unwrap(),
             "https://172.16.221.133:6443"
         );
+        // tls-server-name must be the ORIGINAL server host (127.0.0.1, guaranteed to be in the
+        // cert since the fetched kubeconfig worked against it on the node) -- not the profile's
+        // host label ("master-1"), which has no relation to the cluster's cert SANs.
         assert_eq!(
             value["clusters"][0]["cluster"]["tls-server-name"]
                 .as_str()
                 .unwrap(),
-            "master-1"
+            "127.0.0.1"
+        );
+    }
+
+    #[test]
+    fn normalize_with_host_does_not_set_tls_server_name_when_host_unchanged() {
+        // SAMPLE's server is already 192.0.2.10, and the host address matches it, so
+        // rewrite_server_endpoint is a no-op -- tls-server-name must not be set.
+        let host = Host {
+            name: "master-1".to_string(),
+            address: "192.0.2.10".to_string(),
+            port: 22,
+            user: "vagrant".to_string(),
+            identity_file: None,
+            auth: AuthMode::Key,
+        };
+
+        let normalized = normalize_with_host(SAMPLE, "dev-cluster", Some(&host)).unwrap();
+        let value: serde_yaml::Value = serde_yaml::from_str(&normalized).unwrap();
+        assert_eq!(
+            value["clusters"][0]["cluster"]["server"].as_str().unwrap(),
+            "https://192.0.2.10:6443"
+        );
+        assert!(value["clusters"][0]["cluster"]["tls-server-name"].is_null());
+    }
+
+    #[test]
+    fn normalize_with_host_never_overrides_existing_tls_server_name() {
+        let loopback_sample_with_tsn = SAMPLE
+            .replace("https://192.0.2.10:6443", "https://127.0.0.1:6443")
+            .replacen(
+                "certificate-authority-data: ZmFrZS1jYQ==",
+                "certificate-authority-data: ZmFrZS1jYQ==\n      tls-server-name: kubernetes.default.svc",
+                1,
+            );
+        let host = Host {
+            name: "master-1".to_string(),
+            address: "172.16.221.133".to_string(),
+            port: 22,
+            user: "vagrant".to_string(),
+            identity_file: None,
+            auth: AuthMode::Key,
+        };
+
+        let normalized =
+            normalize_with_host(&loopback_sample_with_tsn, "dev-cluster", Some(&host)).unwrap();
+        let value: serde_yaml::Value = serde_yaml::from_str(&normalized).unwrap();
+        assert_eq!(
+            value["clusters"][0]["cluster"]["tls-server-name"]
+                .as_str()
+                .unwrap(),
+            "kubernetes.default.svc"
+        );
+    }
+
+    #[test]
+    fn extract_url_host_parses_scheme_host_port() {
+        assert_eq!(
+            extract_url_host("https://127.0.0.1:6443"),
+            Some("127.0.0.1".to_string())
+        );
+        assert_eq!(
+            extract_url_host("https://192.0.2.10:6443/api"),
+            Some("192.0.2.10".to_string())
+        );
+        assert_eq!(
+            extract_url_host("https://cluster.example.com:6443"),
+            Some("cluster.example.com".to_string())
+        );
+        assert_eq!(extract_url_host("not-a-url"), None);
+    }
+
+    #[test]
+    fn rewrite_server_endpoint_does_not_match_127_0_0_10_as_loopback() {
+        // Regression: a substring check (`contains("://127.0.0.1")`) would also match
+        // "127.0.0.10", silently corrupting an already-reachable non-loopback server URL.
+        assert_eq!(
+            rewrite_server_endpoint("https://127.0.0.10:6443", "192.0.2.50"),
+            "https://127.0.0.10:6443"
+        );
+        assert_eq!(
+            rewrite_server_endpoint("https://127.0.0.1:6443", "192.0.2.50"),
+            "https://192.0.2.50:6443"
+        );
+        assert_eq!(
+            rewrite_server_endpoint("https://localhost:6443", "192.0.2.50"),
+            "https://192.0.2.50:6443"
         );
     }
 
@@ -1779,6 +1956,75 @@ users:
         let stored_yaml = std::fs::read_to_string(paths.kubeconfig_file("candidate-test")).unwrap();
         let value: serde_yaml::Value = serde_yaml::from_str(&stored_yaml).unwrap();
         assert_eq!(value["current-context"].as_str().unwrap(), "candidate-test");
+
+        std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn fetch_and_store_with_empty_remote_path_probes_built_in_candidates_directly() {
+        // An empty remote_path means "unconfigured" (is_safe_remote_path treats it as safe, and
+        // the candidate-building step skips it rather than probing it as a literal path) -- the
+        // very first SSH probe must already be a built-in candidate, not an empty-string path.
+        let temp_dir = std::env::temp_dir().join(format!(
+            "clusterdeck-kc-empty-remote-path-{}",
+            std::process::id()
+        ));
+        let paths = ClusterDeckPaths::at(temp_dir.clone());
+        let profile = Profile {
+            id: "empty-path-test".to_string(),
+            name: "Empty Path Test".to_string(),
+            hosts: vec![Host {
+                name: "m1".to_string(),
+                address: "192.0.2.10".to_string(),
+                port: 22,
+                user: "vagrant".to_string(),
+                identity_file: None,
+                auth: AuthMode::Key,
+            }],
+            bastion: None,
+            bootstrap: BootstrapPolicy::default(),
+            kubeconfig: Some(KubeconfigSource {
+                remote_path: "".to_string(),
+                control_plane: "m1".to_string(),
+                local_path: "".to_string(),
+                context: "empty-path-test".to_string(),
+            }),
+            manage_hosts_file: false,
+            trusted_cas: Vec::new(),
+        };
+
+        struct ProbeCapturingRunner {
+            sample_yaml: String,
+            probed_paths: std::sync::Mutex<Vec<String>>,
+        }
+
+        #[async_trait]
+        impl CommandRunner for ProbeCapturingRunner {
+            async fn run(&self, bin: &str, args: &[String]) -> Result<CommandOutput, String> {
+                if bin != "ssh" {
+                    return Err(format!("unexpected command {bin}"));
+                }
+                let command = args.last().expect("ssh command argument");
+                self.probed_paths.lock().unwrap().push(command.clone());
+                Ok(CommandOutput {
+                    stdout: self.sample_yaml.clone(),
+                    stderr: String::new(),
+                    success: true,
+                })
+            }
+        }
+
+        let runner = ProbeCapturingRunner {
+            sample_yaml: SAMPLE.to_string(),
+            probed_paths: std::sync::Mutex::new(Vec::new()),
+        };
+
+        fetch_and_store(&runner, &paths, &profile, None)
+            .await
+            .unwrap();
+        let probed_paths = runner.probed_paths.lock().unwrap();
+        assert_eq!(probed_paths.len(), 1);
+        assert!(probed_paths[0].contains("/etc/rancher/k3s/k3s.yaml"));
 
         std::fs::remove_dir_all(&temp_dir).ok();
     }
@@ -2421,8 +2667,10 @@ users:
     #[test]
     fn generate_default_kubeconfig_pins_exact_output_for_non_loopback_host() {
         // Characterization test: pins generate_default_kubeconfig's exact current output for a
-        // profile whose control-plane host has a non-loopback address (tls-server-name must be
-        // present). Guards the Mapping-builder -> typed-struct rewrite against output drift.
+        // profile whose control-plane host has a non-loopback address. No tls-server-name: this
+        // placeholder has no fetched kubeconfig to derive a known-good original host from (see
+        // DefaultKubeconfigDoc's doc comment), and insecure-skip-tls-verify is always true here
+        // anyway.
         let profile = Profile {
             id: "cka".to_string(),
             name: "CKA Lab".to_string(),
@@ -2453,7 +2701,6 @@ clusters:
   cluster:
     server: https://192.0.2.10:6443
     insecure-skip-tls-verify: true
-    tls-server-name: m1
 contexts:
 - name: cka
   context:
