@@ -1,14 +1,52 @@
 #![allow(dead_code)]
 
 use async_trait::async_trait;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use tokio::process::Command;
 
 const SEARCH_PATHS: [&str; 4] = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"];
 
+/// Parses a `PATH`-style variable into absolute directories only, in order. Relative and empty
+/// entries (e.g. a leading/trailing/doubled `:`, historically meaning "cwd") are dropped: this
+/// feeds a security-relevant lookup that ends in a `CommandRunner` invocation, and a
+/// cwd-relative resolution here would let whatever directory the app happens to be launched
+/// from shadow a system binary. Pulled out of `search_dirs` as a pure function so tests can
+/// exercise the parsing without mutating the real process's `PATH` (an env var is global,
+/// process-wide, shared-mutable state -- unsafe to touch from a test that may run in parallel
+/// with others in the same test binary).
+fn parse_path_env_dirs(path_var: &std::ffi::OsStr) -> Vec<PathBuf> {
+    std::env::split_paths(path_var)
+        .filter(|dir| dir.is_absolute())
+        .collect()
+}
+
+/// All directories `resolve_cli_path` searches, in order: the fixed `SEARCH_PATHS` first, then
+/// each absolute directory from the `PATH` environment variable, deduped against both
+/// `SEARCH_PATHS` and itself. A GUI-launched macOS app inherits a minimal PATH (or none), so
+/// PATH is a supplement here rather than a replacement -- `SEARCH_PATHS` is tried first and
+/// still covers the common case with no environment dependency.
+fn search_dirs() -> Vec<PathBuf> {
+    let mut seen = HashSet::new();
+    let mut dirs = Vec::new();
+    for dir in SEARCH_PATHS.iter().map(PathBuf::from) {
+        if seen.insert(dir.clone()) {
+            dirs.push(dir);
+        }
+    }
+    if let Some(path_var) = std::env::var_os("PATH") {
+        for dir in parse_path_env_dirs(&path_var) {
+            if seen.insert(dir.clone()) {
+                dirs.push(dir);
+            }
+        }
+    }
+    dirs
+}
+
 pub fn resolve_cli_path(bin: &str) -> Result<PathBuf, String> {
-    for dir in SEARCH_PATHS {
-        let candidate = PathBuf::from(dir).join(bin);
+    for dir in search_dirs() {
+        let candidate = dir.join(bin);
         if candidate.is_file() {
             return Ok(candidate);
         }
@@ -143,6 +181,41 @@ mod tests {
     fn resolve_cli_path_errors_on_unknown_binary() {
         let err = resolve_cli_path("definitely-not-a-real-binary-xyz").unwrap_err();
         assert!(err.contains("not found"));
+    }
+
+    #[test]
+    fn parse_path_env_dirs_keeps_only_absolute_entries() {
+        let dirs = parse_path_env_dirs(std::ffi::OsStr::new(
+            "/usr/bin:relative/path::/opt/tool/bin:",
+        ));
+        assert_eq!(
+            dirs,
+            vec![PathBuf::from("/usr/bin"), PathBuf::from("/opt/tool/bin")],
+            "relative and empty PATH entries must be dropped, absolute ones kept in order"
+        );
+    }
+
+    #[test]
+    fn parse_path_env_dirs_returns_empty_for_all_relative_or_empty() {
+        assert!(parse_path_env_dirs(std::ffi::OsStr::new("relative:another/path:")).is_empty());
+        assert!(parse_path_env_dirs(std::ffi::OsStr::new("")).is_empty());
+    }
+
+    #[test]
+    fn search_dirs_puts_fixed_paths_first_with_no_duplicates() {
+        let dirs = search_dirs();
+        let fixed: Vec<PathBuf> = SEARCH_PATHS.iter().map(PathBuf::from).collect();
+        assert_eq!(
+            &dirs[..fixed.len()],
+            &fixed[..],
+            "SEARCH_PATHS must be tried before any $PATH-supplied directory"
+        );
+        let unique: std::collections::HashSet<&PathBuf> = dirs.iter().collect();
+        assert_eq!(
+            unique.len(),
+            dirs.len(),
+            "search_dirs must not contain duplicate directories: {dirs:?}"
+        );
     }
 
     struct FakeOsascriptRunner {
