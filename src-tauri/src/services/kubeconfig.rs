@@ -215,10 +215,14 @@ async fn fetch_remote_kubeconfig_content(
 ) -> Result<String, String> {
     use crate::services::config::AuthMode;
 
-    // Defensive re-check at the sink: `store::upsert_profile` already validates
-    // `remote_path` via `validate::validate_profile` at the persistence boundary, but a
-    // profile loaded before that check existed (or from a path other than the store) must
-    // not reach the SSH argv this value is interpolated into (build_candidate_read_cmd).
+    // Defensive re-check at the sink: `store::upsert_profile` already validates `remote_path`
+    // (a user-facing error) at the save boundary, but a profile loaded from disk is NOT
+    // re-validated there (validate_profile deliberately skips remote_path so a legacy/unsafe
+    // value never makes load_profiles drop an otherwise-valid profile -- see validate.rs). So
+    // this is the only check standing between a persisted profile and the SSH argv
+    // build_candidate_read_cmd interpolates it into. is_safe_remote_path treats "" (no
+    // configured path) as safe; the candidate-building step right below skips it rather than
+    // probing it.
     if !crate::services::validate::is_safe_remote_path(configured_path) {
         return Err(format!("invalid kubeconfig remote_path: {configured_path}"));
     }
@@ -227,8 +231,12 @@ async fn fetch_remote_kubeconfig_content(
     let ssh_conf_path = paths.ssh_conf(&profile.id);
 
     // Read candidate paths over SSH so the local destination is never exposed to a
-    // transfer-completion permission race.
-    let mut candidates = vec![configured_path];
+    // transfer-completion permission race. An empty configured_path means "unconfigured" and
+    // is skipped here rather than probed as a literal candidate; the built-in list still runs.
+    let mut candidates: Vec<&str> = Vec::new();
+    if !configured_path.is_empty() {
+        candidates.push(configured_path);
+    }
     for p in CANDIDATE_KUBECONFIG_PATHS {
         if !candidates.contains(&p) {
             candidates.push(p);
@@ -1948,6 +1956,75 @@ users:
         let stored_yaml = std::fs::read_to_string(paths.kubeconfig_file("candidate-test")).unwrap();
         let value: serde_yaml::Value = serde_yaml::from_str(&stored_yaml).unwrap();
         assert_eq!(value["current-context"].as_str().unwrap(), "candidate-test");
+
+        std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn fetch_and_store_with_empty_remote_path_probes_built_in_candidates_directly() {
+        // An empty remote_path means "unconfigured" (is_safe_remote_path treats it as safe, and
+        // the candidate-building step skips it rather than probing it as a literal path) -- the
+        // very first SSH probe must already be a built-in candidate, not an empty-string path.
+        let temp_dir = std::env::temp_dir().join(format!(
+            "clusterdeck-kc-empty-remote-path-{}",
+            std::process::id()
+        ));
+        let paths = ClusterDeckPaths::at(temp_dir.clone());
+        let profile = Profile {
+            id: "empty-path-test".to_string(),
+            name: "Empty Path Test".to_string(),
+            hosts: vec![Host {
+                name: "m1".to_string(),
+                address: "192.0.2.10".to_string(),
+                port: 22,
+                user: "vagrant".to_string(),
+                identity_file: None,
+                auth: AuthMode::Key,
+            }],
+            bastion: None,
+            bootstrap: BootstrapPolicy::default(),
+            kubeconfig: Some(KubeconfigSource {
+                remote_path: "".to_string(),
+                control_plane: "m1".to_string(),
+                local_path: "".to_string(),
+                context: "empty-path-test".to_string(),
+            }),
+            manage_hosts_file: false,
+            trusted_cas: Vec::new(),
+        };
+
+        struct ProbeCapturingRunner {
+            sample_yaml: String,
+            probed_paths: std::sync::Mutex<Vec<String>>,
+        }
+
+        #[async_trait]
+        impl CommandRunner for ProbeCapturingRunner {
+            async fn run(&self, bin: &str, args: &[String]) -> Result<CommandOutput, String> {
+                if bin != "ssh" {
+                    return Err(format!("unexpected command {bin}"));
+                }
+                let command = args.last().expect("ssh command argument");
+                self.probed_paths.lock().unwrap().push(command.clone());
+                Ok(CommandOutput {
+                    stdout: self.sample_yaml.clone(),
+                    stderr: String::new(),
+                    success: true,
+                })
+            }
+        }
+
+        let runner = ProbeCapturingRunner {
+            sample_yaml: SAMPLE.to_string(),
+            probed_paths: std::sync::Mutex::new(Vec::new()),
+        };
+
+        fetch_and_store(&runner, &paths, &profile, None)
+            .await
+            .unwrap();
+        let probed_paths = runner.probed_paths.lock().unwrap();
+        assert_eq!(probed_paths.len(), 1);
+        assert!(probed_paths[0].contains("/etc/rancher/k3s/k3s.yaml"));
 
         std::fs::remove_dir_all(&temp_dir).ok();
     }
