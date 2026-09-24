@@ -61,6 +61,32 @@ fn rewrite_server_endpoint(server_url: &str, target_address: &str) -> String {
     }
 }
 
+/// Extracts the host component from a `scheme://host[:port][/path]` URL string, or `None` if
+/// `url` has no `://` separator. Used by `normalize_with_host` to recover the fetched
+/// kubeconfig's ORIGINAL server host before `rewrite_server_endpoint` replaces it with the
+/// profile's SSH-reachable address, so `tls-server-name` can be set to a value the upstream
+/// cluster's certificate is actually guaranteed to cover (the kubeconfig worked against that
+/// host on the node itself). Also used by k8s_endpoints::curl_k8s_api to keep its TLS
+/// verification consistent with kubectl's.
+pub(crate) fn extract_url_host(url: &str) -> Option<String> {
+    let after_scheme = url.split_once("://")?.1;
+    let host_and_rest = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(after_scheme);
+    // IPv6 literals are bracketed (`[::1]:6443`); not expected from a real kubeconfig server
+    // URL, but handled rather than mis-parsed into a colon-split fragment.
+    if let Some(inside_brackets) = host_and_rest.strip_prefix('[') {
+        return inside_brackets.split(']').next().map(|s| s.to_string());
+    }
+    Some(
+        host_and_rest
+            .rsplit_once(':')
+            .map_or(host_and_rest, |(host, _port)| host)
+            .to_string(),
+    )
+}
+
 pub fn normalize(raw_yaml: &str, profile_id: &str) -> Result<String, String> {
     normalize_with_host(raw_yaml, profile_id, None)
 }
@@ -102,18 +128,34 @@ pub fn normalize_with_host(
             // Normalize endpoint and add tls-server-name if host is provided
             if let Some(h) = host {
                 if let Some(inner) = map.get_mut("cluster").and_then(|v| v.as_mapping_mut()) {
+                    let mut original_host: Option<String> = None;
                     if let Some(server_val) = inner.get_mut("server") {
                         if let Some(s) = server_val.as_str() {
-                            let rewritten = rewrite_server_endpoint(s, &h.address);
+                            let original = s.to_string();
+                            let rewritten = rewrite_server_endpoint(&original, &h.address);
+                            // Only set tls-server-name when the server URL was actually
+                            // rewritten to a different host: the fetched kubeconfig's TLS cert
+                            // is guaranteed to cover the ORIGINAL host it worked against on the
+                            // node (e.g. 127.0.0.1 for k3s), not the profile's host label,
+                            // which is a user-chosen display name with no relation to the
+                            // cluster's cert SANs. Go's x509 VerifyHostname matches IP SANs
+                            // too, so an IP value here is fine.
+                            if rewritten != original {
+                                original_host = extract_url_host(&original);
+                            }
                             *server_val = serde_yaml::Value::String(rewritten);
                         }
                     }
 
-                    if h.address != "127.0.0.1" && h.address != "localhost" && !h.name.is_empty() {
-                        inner.insert(
-                            serde_yaml::Value::String("tls-server-name".to_string()),
-                            serde_yaml::Value::String(h.name.clone()),
-                        );
+                    // Never override a tls-server-name already present in the fetched
+                    // kubeconfig -- the cluster operator set it deliberately.
+                    if !inner.contains_key("tls-server-name") {
+                        if let Some(orig) = original_host {
+                            inner.insert(
+                                serde_yaml::Value::String("tls-server-name".to_string()),
+                                serde_yaml::Value::String(orig),
+                            );
+                        }
                     }
                 }
             }
@@ -1730,12 +1772,83 @@ users:
             value["clusters"][0]["cluster"]["server"].as_str().unwrap(),
             "https://172.16.221.133:6443"
         );
+        // tls-server-name must be the ORIGINAL server host (127.0.0.1, guaranteed to be in the
+        // cert since the fetched kubeconfig worked against it on the node) -- not the profile's
+        // host label ("master-1"), which has no relation to the cluster's cert SANs.
         assert_eq!(
             value["clusters"][0]["cluster"]["tls-server-name"]
                 .as_str()
                 .unwrap(),
-            "master-1"
+            "127.0.0.1"
         );
+    }
+
+    #[test]
+    fn normalize_with_host_does_not_set_tls_server_name_when_host_unchanged() {
+        // SAMPLE's server is already 192.0.2.10, and the host address matches it, so
+        // rewrite_server_endpoint is a no-op -- tls-server-name must not be set.
+        let host = Host {
+            name: "master-1".to_string(),
+            address: "192.0.2.10".to_string(),
+            port: 22,
+            user: "vagrant".to_string(),
+            identity_file: None,
+            auth: AuthMode::Key,
+        };
+
+        let normalized = normalize_with_host(SAMPLE, "dev-cluster", Some(&host)).unwrap();
+        let value: serde_yaml::Value = serde_yaml::from_str(&normalized).unwrap();
+        assert_eq!(
+            value["clusters"][0]["cluster"]["server"].as_str().unwrap(),
+            "https://192.0.2.10:6443"
+        );
+        assert!(value["clusters"][0]["cluster"]["tls-server-name"].is_null());
+    }
+
+    #[test]
+    fn normalize_with_host_never_overrides_existing_tls_server_name() {
+        let loopback_sample_with_tsn = SAMPLE
+            .replace("https://192.0.2.10:6443", "https://127.0.0.1:6443")
+            .replacen(
+                "certificate-authority-data: ZmFrZS1jYQ==",
+                "certificate-authority-data: ZmFrZS1jYQ==\n      tls-server-name: kubernetes.default.svc",
+                1,
+            );
+        let host = Host {
+            name: "master-1".to_string(),
+            address: "172.16.221.133".to_string(),
+            port: 22,
+            user: "vagrant".to_string(),
+            identity_file: None,
+            auth: AuthMode::Key,
+        };
+
+        let normalized =
+            normalize_with_host(&loopback_sample_with_tsn, "dev-cluster", Some(&host)).unwrap();
+        let value: serde_yaml::Value = serde_yaml::from_str(&normalized).unwrap();
+        assert_eq!(
+            value["clusters"][0]["cluster"]["tls-server-name"]
+                .as_str()
+                .unwrap(),
+            "kubernetes.default.svc"
+        );
+    }
+
+    #[test]
+    fn extract_url_host_parses_scheme_host_port() {
+        assert_eq!(
+            extract_url_host("https://127.0.0.1:6443"),
+            Some("127.0.0.1".to_string())
+        );
+        assert_eq!(
+            extract_url_host("https://192.0.2.10:6443/api"),
+            Some("192.0.2.10".to_string())
+        );
+        assert_eq!(
+            extract_url_host("https://cluster.example.com:6443"),
+            Some("cluster.example.com".to_string())
+        );
+        assert_eq!(extract_url_host("not-a-url"), None);
     }
 
     #[tokio::test]
