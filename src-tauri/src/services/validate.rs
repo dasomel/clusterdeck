@@ -97,13 +97,27 @@ pub fn is_safe_shell_context_name(s: &str) -> bool {
 /// Sink validator for `KubeconfigSource.remote_path`, which is interpolated into the remote SSH
 /// read command in `kubeconfig.rs::build_candidate_read_cmd`. The whole path is embedded inside
 /// a single-quoted shell string (a leading `~/` is expanded via the remote shell's `"$HOME"`;
-/// the remainder after it stays single-quoted like every other candidate) -- inside single
-/// quotes, POSIX shells treat every character literally except a single quote itself, so spaces
-/// and non-ASCII directory names are shell-safe and are accepted here. Rejects: a literal `'`
-/// (would end the quoted string early), control characters (including newline and NUL), `..`
-/// path segments (traversal), and anything that isn't an absolute path or a `~/`-prefixed one
-/// (deliberately not `~user/`: `build_candidate_read_cmd` only special-cases the exact `~/`
-/// prefix).
+/// the remainder after it stays single-quoted like every other candidate) -- in POSIX shells
+/// (bash/zsh/dash), single quotes make every character literal except `'` itself, with no
+/// escape mechanism at all, so spaces and non-ASCII directory names are shell-safe there. Rejects:
+///
+/// - a literal `'` -- ends the quoted string early on every shell.
+/// - a literal `\` -- inert inside single quotes in bash/zsh/dash/tcsh, but fish's single quotes
+///   DO recognize `\'` and `\\` as escapes (unlike POSIX shells), so a path ending in `\`
+///   immediately before the wrapping `'` swallows that quote as escaped-literal instead of
+///   closing the string, letting the remainder of `build_candidate_read_cmd`'s template (the
+///   `2>/dev/null || cat '...'` that follows) be reinterpreted as attacker-influenced shell
+///   content once a later `'` finally closes it. The remote login shell is user-configured and
+///   not something this app controls, so this is rejected unconditionally rather than only when
+///   fish is detected.
+/// - a literal `!` -- inert in POSIX shells and in a non-interactive csh/tcsh `-c` invocation,
+///   but tcsh's `!` history expansion is a known footgun in some interactive/sourced modes,
+///   and no realistic kubeconfig path needs it -- rejected out of caution, not because it is
+///   proven reachable via `ssh host 'command'` today.
+/// - control characters (including newline and NUL).
+/// - `..` path segments (traversal).
+/// - anything that isn't an absolute path or a `~/`-prefixed one (deliberately not `~user/`:
+///   `build_candidate_read_cmd` only special-cases the exact `~/` prefix).
 ///
 /// An EMPTY `remote_path` is intentionally treated as safe: it means "no configured path", so
 /// `fetch_remote_kubeconfig_content` falls straight through to the built-in candidate list --
@@ -124,7 +138,10 @@ pub fn is_safe_remote_path(s: &str) -> bool {
     if rest.is_empty() {
         return false;
     }
-    if rest.chars().any(|c| c == '\'' || c.is_control()) {
+    if rest
+        .chars()
+        .any(|c| matches!(c, '\'' | '\\' | '!') || c.is_control())
+    {
         return false;
     }
     if rest.split('/').any(|segment| segment == "..") {
@@ -295,6 +312,13 @@ mod tests {
         // a literal single quote would end the quoted shell string early
         assert!(!is_safe_remote_path("/tmp/'; rm -rf ~ #"));
         assert!(!is_safe_remote_path("/tmp/it's/admin.conf"));
+        // a trailing backslash is inert in bash/zsh/dash single quotes, but fish's single
+        // quotes DO recognize `\'` as an escaped literal quote, so this breaks out of the
+        // quoting on a fish remote login shell (regression: exact payload from review).
+        assert!(!is_safe_remote_path("/a; touch /tmp/pwn #\\"));
+        assert!(!is_safe_remote_path("/tmp/a\\b"));
+        // tcsh history expansion is a footgun in some modes; no real kubeconfig path needs `!`.
+        assert!(!is_safe_remote_path("/tmp/a!b"));
         // control characters
         assert!(!is_safe_remote_path("/tmp/a\tb"));
         assert!(!is_safe_remote_path("/tmp/a\nb"));
