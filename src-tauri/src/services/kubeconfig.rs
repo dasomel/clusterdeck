@@ -49,17 +49,20 @@ pub fn read_current_context(path: &std::path::Path) -> Option<String> {
     Some(ctx.to_string())
 }
 
+/// Rewrites `server_url`'s host to `target_address` when (and only when) the URL's host is
+/// EXACTLY `127.0.0.1` or `localhost`. Parses the host via `extract_url_host` rather than a
+/// substring `contains("://127.0.0.1")` check -- the substring form also matched a host like
+/// `127.0.0.10`, silently corrupting an already-reachable non-loopback server URL.
 fn rewrite_server_endpoint(server_url: &str, target_address: &str) -> String {
     if target_address == "127.0.0.1" || target_address == "localhost" {
         return server_url.to_string();
     }
 
-    if server_url.contains("://127.0.0.1") {
-        server_url.replace("://127.0.0.1", &format!("://{target_address}"))
-    } else if server_url.contains("://localhost") {
-        server_url.replace("://localhost", &format!("://{target_address}"))
-    } else {
-        server_url.to_string()
+    match extract_url_host(server_url) {
+        Some(host) if host == "127.0.0.1" || host == "localhost" => {
+            server_url.replacen(&format!("://{host}"), &format!("://{target_address}"), 1)
+        }
+        _ => server_url.to_string(),
     }
 }
 
@@ -1851,6 +1854,24 @@ users:
             Some("cluster.example.com".to_string())
         );
         assert_eq!(extract_url_host("not-a-url"), None);
+    }
+
+    #[test]
+    fn rewrite_server_endpoint_does_not_match_127_0_0_10_as_loopback() {
+        // Regression: a substring check (`contains("://127.0.0.1")`) would also match
+        // "127.0.0.10", silently corrupting an already-reachable non-loopback server URL.
+        assert_eq!(
+            rewrite_server_endpoint("https://127.0.0.10:6443", "192.0.2.50"),
+            "https://127.0.0.10:6443"
+        );
+        assert_eq!(
+            rewrite_server_endpoint("https://127.0.0.1:6443", "192.0.2.50"),
+            "https://192.0.2.50:6443"
+        );
+        assert_eq!(
+            rewrite_server_endpoint("https://localhost:6443", "192.0.2.50"),
+            "https://192.0.2.50:6443"
+        );
     }
 
     #[tokio::test]
