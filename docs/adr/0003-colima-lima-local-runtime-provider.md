@@ -4,6 +4,7 @@
 - Date: 2026-09-17
 - Issue: #14
 - Note: the as-built implementation diverges from this decision; see [ADR-0005](0005-local-host-detection-prefills-profiles.md) (Proposed).
+- Note: the "Lifecycle actions (start/stop/restart)" item below, deferred to "its own issue", is now decided by [ADR-0007](0007-local-runtime-lifecycle-actions.md) (Accepted).
 
 ## Context
 
@@ -137,7 +138,7 @@ Deferred with a reason, not merely unlisted:
 
 - **Lifecycle actions (start/stop/restart)** — mutating and long-running; the current command
   surface is fire-and-forget `Result<T, String>` with no cancellation or progress streaming.
-  Needs its own issue.
+  Needs its own issue. **Decided by [ADR-0007](0007-local-runtime-lifecycle-actions.md).**
 - **Container listing and Docker socket access** (issue #14 Phase 3) — overlaps ColimaUI and
   Portainer directly, and opens a new privileged sink.
 - **Phase 5 topology graph** — needs the provider data to exist first.

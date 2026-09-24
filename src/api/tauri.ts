@@ -189,6 +189,16 @@ export type HostsFileStatus = {
   pending_entries: string[];
 };
 
+// Only "colima" | "lima" — Phase 2 lifecycle actions (start/stop/restart/shell/context) do not
+// cover Vagrant, even though `DiscoveredLocalHost.provider` also reports "Vagrant" for the
+// read-only discovery panel.
+export type LocalRuntimeLifecycleProvider = 'colima' | 'lima';
+
+export type LifecycleActionResult = {
+  success: boolean;
+  message: string;
+};
+
 export const api = {
   listProfiles: () => invoke<Profile[]>('list_profiles'),
   getProfile: (profileId: string) => invoke<Profile>('get_profile_cmd', { profileId }),
@@ -226,6 +236,16 @@ export const api = {
   openPathInFinder: (path: string) => invoke<void>('open_path_in_finder', { path }),
   listLocalKubeContexts: () => invoke<LocalKubeContext[]>('list_local_kube_contexts_cmd'),
   detectLocalHosts: () => invoke<DiscoveredLocalHost[]>('detect_local_hosts'),
+  startLocalRuntime: (provider: LocalRuntimeLifecycleProvider, instanceName: string) =>
+    invoke<LifecycleActionResult>('start_local_runtime', { provider, instanceName }),
+  stopLocalRuntime: (provider: LocalRuntimeLifecycleProvider, instanceName: string) =>
+    invoke<LifecycleActionResult>('stop_local_runtime', { provider, instanceName }),
+  restartLocalRuntime: (provider: LocalRuntimeLifecycleProvider, instanceName: string) =>
+    invoke<LifecycleActionResult>('restart_local_runtime', { provider, instanceName }),
+  openLocalRuntimeShell: (provider: LocalRuntimeLifecycleProvider, instanceName: string) =>
+    invoke<void>('open_local_runtime_shell', { provider, instanceName }),
+  openLocalRuntimeContext: (provider: LocalRuntimeLifecycleProvider, instanceName: string) =>
+    invoke<void>('open_local_runtime_context', { provider, instanceName }),
   discoverClusterEndpoints: (profileId: string) =>
     invoke<DiscoveredEndpoint[]>('discover_cluster_endpoints_cmd', { profileId }),
   syncHostsFile: (profileId: string) =>

@@ -359,6 +359,22 @@ on load, purely for display — its results are never persisted or offered as pr
 its relationship to the earlier, differently-scoped
 [ADR-0003](adr/0003-colima-lima-local-runtime-provider.md).
 
+Issue #14 Phase 2 adds lifecycle actions — Start/Stop/Restart, opening an interactive VM shell,
+opening a host-side shell scoped to the instance's Docker/kube context, and copying a plain-text
+runtime summary — scoped to Colima and Lima only (not Vagrant). `services/local_runtime_lifecycle.rs`
+dispatches on a `LocalRuntimeProvider` enum (`Colima | Lima`), never a free string, and re-confirms
+every `(provider, instance_name)` pair against a fresh `detect_local_hosts` listing before acting, so
+a stale or hostile instance name from the frontend can never reach `colima`/`limactl` argv or the
+Terminal-launch script. Start/Stop/Restart are additionally guarded by a `LifecycleGuard` (Tauri
+managed state) that rejects a second concurrent operation on the same instance. Opening a shell or a
+context shell reuses `process::open_with_system`'s `CommandRunner`-based error-handling shape via a
+sibling helper, `process::open_terminal_with_command`, which drives `Terminal.app` through
+`osascript`'s `do script` (there is no URL scheme for an arbitrary command the way `ssh://` covers a
+plain SSH session, per `open_ssh_session`). "Open in runtime context" only exports
+`DOCKER_CONTEXT`/aliases `kubectl --context` in that new Terminal session — it never runs
+`docker context use` or `kubectl config use-context`, so the user's global Docker/kube state is
+untouched. See [ADR-0007](adr/0007-local-runtime-lifecycle-actions.md).
+
 ## 15. Kubernetes Endpoint Discovery
 
 `services/k8s_endpoints.rs` queries a profile's cluster (via `kubectl --kubeconfig` or a `curl`

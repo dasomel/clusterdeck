@@ -1,6 +1,6 @@
 # Implementation Status
 
-Last verified: 2026-09-22 against `main`
+Last verified: 2026-09-23 against `feat/14-local-runtime-lifecycle`
 
 This file records current default-branch behavior, not future product direction.
 
@@ -20,6 +20,7 @@ This file records current default-branch behavior, not future product direction.
 - Remote kubeconfig fetch reads over SSH exec (`sudo cat`, falling back to `cat`) instead of shelling out to `scp`, removing the local temp-file permission window (#23).
 - TLS certificate verification on the curl Kubernetes API fallback path (used when `kubectl` itself fails, e.g. macOS Sequoia Local Network Privacy): verifies against the kubeconfig's CA data via `--cacert`, or curl's system trust store when no CA data is present — never `-k`/`--insecure` (#24).
 - Local runtime discovery dashboard: architecture/CPU/memory/disk display and Docker context association for Colima/Lima instances, in a read-only "Local Runtime" section in Settings (#14 Phase 1).
+- Local runtime lifecycle actions for Colima/Lima instances (Start/Stop/Restart, open VM shell, open a host-side shell scoped to the instance's Docker/kube context, copy runtime info): a `LocalRuntimeProvider` enum dispatch, a fresh-discovery re-check before every action, a per-instance concurrency guard rejecting a second in-flight Start/Stop/Restart, and Stop/Restart confirmation modals in the Settings panel (#14 Phase 2, see ADR-0007). Verified against a real `colima` instance (`nqa-node2`): Stopped → Start → confirmed Running → Stop → confirmed Stopped.
 - `clusterdeck-connection-workflow` Agent Skill re-verified via a fresh-session replay against a real target; `openforge-maturity` is `verified` again (#22).
 - Explicit per-host SSH authentication mode (`key`, the default, or `password`): password mode uses `sshpass -e`/`SSHPASS` consistently across Connect, Test Connection, and kubeconfig fetch, omits `BatchMode=yes` (which would block the password prompt) while keeping `StrictHostKeyChecking=accept-new`, and keeps the password ephemeral in frontend state only. Profile YAML written before this field existed deserializes unchanged as `key` (#26).
 

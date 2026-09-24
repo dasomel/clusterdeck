@@ -1,6 +1,6 @@
 # 구현 상태
 
-Last verified: 2026-09-22 against `main`
+Last verified: 2026-09-23 against `feat/14-local-runtime-lifecycle`
 
 이 문서는 미래 product direction이 아니라 현재 default branch의 동작을 기록합니다.
 
@@ -20,6 +20,7 @@ Last verified: 2026-09-22 against `main`
 - 원격 kubeconfig fetch가 `scp`를 shell-out하는 대신 SSH exec(`sudo cat` 실패 시 `cat`으로 fallback)로 읽도록 바뀌어 local temp-file permission window를 제거했습니다 (#23).
 - curl Kubernetes API fallback 경로(예: macOS Sequoia Local Network Privacy로 `kubectl` 자체가 실패하는 경우)에서 TLS 인증서를 검증합니다: kubeconfig의 CA 데이터로 `--cacert` 검증하거나, CA 데이터가 없으면 curl의 system trust store를 사용하며, `-k`/`--insecure`는 사용하지 않습니다 (#24).
 - Colima/Lima instance의 architecture/CPU/memory/disk 표시와 Docker context 연동을 포함한 local runtime discovery dashboard가 완성되어 Settings의 read-only "Local Runtime" 섹션으로 제공됩니다 (#14 Phase 1).
+- Colima/Lima instance에 대한 local runtime lifecycle action(Start/Stop/Restart, VM shell 열기, instance의 Docker/kube context로 scope된 host-side shell 열기, runtime info 복사)을 추가했습니다: `LocalRuntimeProvider` enum dispatch, 모든 action 전 fresh-discovery 재확인, 동일 instance에 대한 두 번째 동시 Start/Stop/Restart를 거부하는 per-instance concurrency guard, Settings 패널의 Stop/Restart 확인 모달을 포함합니다 (#14 Phase 2, ADR-0007 참조). 실제 `colima` instance(`nqa-node2`)로 검증: Stopped → Start → Running 확인 → Stop → Stopped 확인.
 - 실제 대상에 대한 fresh-session replay로 `clusterdeck-connection-workflow` Agent Skill을 재검증했습니다; `openforge-maturity`는 다시 `verified`입니다 (#22).
 - Host별 명시적 SSH 인증 모드(`key`, 기본값, 또는 `password`)를 추가했습니다: password 모드는 Connect, Test Connection, kubeconfig fetch 전 경로에서 일관되게 `sshpass -e`/`SSHPASS`를 사용하고, sshpass가 응답할 password prompt를 막는 `BatchMode=yes`는 생략하되 `StrictHostKeyChecking=accept-new`는 유지하며, password는 frontend state에만 존재하는 ephemeral 값입니다. 이 field가 없던 기존 profile YAML은 변경 없이 `key`로 역직렬화됩니다 (#26).
 

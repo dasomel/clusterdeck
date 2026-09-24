@@ -56,6 +56,44 @@ pub fn is_safe_host_domain(s: &str) -> bool {
     true
 }
 
+/// Sink validator for Colima/Lima local-runtime instance names before they reach lifecycle argv
+/// (`colima start|stop|restart --profile <name>`, `limactl start|stop|shell <name>`) or an
+/// osascript Terminal-launch string (`services/process.rs::open_terminal_with_command`).
+/// Stricter than `is_safe_ssh_identifier`: anchors the whole charset instead of only excluding a
+/// leading dash/newlines, since these names are provider-discovered (untrusted) and are embedded
+/// both in argv and in an AppleScript string literal.
+pub fn is_safe_local_runtime_instance_name(s: &str) -> bool {
+    if s.is_empty() || s.len() > 64 {
+        return false;
+    }
+    let mut chars = s.chars();
+    let first = chars.next().unwrap();
+    if !first.is_ascii_alphanumeric() {
+        return false;
+    }
+    s.chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+/// Sink validator for Docker/Kubernetes context names embedded into a local-runtime Terminal
+/// script (`export DOCKER_CONTEXT=...` / `alias kubectl='kubectl --context ...'`). Context names
+/// are less constrained than instance names (colons/slashes appear in real cluster ARNs), but
+/// must still exclude quotes, whitespace, and shell metacharacters that could break out of the
+/// single-quoted alias or the osascript string. Per ADR-0007, a context that fails this check is
+/// omitted from the generated script rather than quoted defensively.
+pub fn is_safe_shell_context_name(s: &str) -> bool {
+    if s.is_empty() || s.len() > 253 {
+        return false;
+    }
+    let mut chars = s.chars();
+    let first = chars.next().unwrap();
+    if !first.is_ascii_alphanumeric() {
+        return false;
+    }
+    s.chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ':' | '/' | '@'))
+}
+
 pub fn validate_profile(profile: &crate::services::config::Profile) -> Result<(), String> {
     if !is_safe_profile_id(&profile.id) {
         return Err(format!("invalid profile id: {}", profile.id));
@@ -200,6 +238,37 @@ mod tests {
         assert!(!is_safe_ip_address("not-an-ip"));
         assert!(!is_safe_ip_address("192.168.1.1\nevil"));
         assert!(!is_safe_ip_address("192.168.1.1 80"));
+    }
+
+    #[test]
+    fn is_safe_local_runtime_instance_name_boundary_cases() {
+        assert!(is_safe_local_runtime_instance_name("default"));
+        assert!(is_safe_local_runtime_instance_name("nqa-node2"));
+        assert!(is_safe_local_runtime_instance_name("my.instance_1"));
+        assert!(!is_safe_local_runtime_instance_name(""));
+        assert!(!is_safe_local_runtime_instance_name("../../etc"));
+        assert!(!is_safe_local_runtime_instance_name("has space"));
+        assert!(!is_safe_local_runtime_instance_name("has\"quote"));
+        assert!(!is_safe_local_runtime_instance_name("a;b"));
+        assert!(!is_safe_local_runtime_instance_name("-oProxyCommand=evil"));
+        assert!(!is_safe_local_runtime_instance_name(".leading-dot"));
+        assert!(!is_safe_local_runtime_instance_name(&"a".repeat(65)));
+    }
+
+    #[test]
+    fn is_safe_shell_context_name_boundary_cases() {
+        assert!(is_safe_shell_context_name("colima"));
+        assert!(is_safe_shell_context_name("colima-nqa-node2"));
+        assert!(is_safe_shell_context_name(
+            "arn:aws:eks:us-east-1:123456789012:cluster/my-cluster"
+        ));
+        assert!(!is_safe_shell_context_name(""));
+        assert!(!is_safe_shell_context_name("has space"));
+        assert!(!is_safe_shell_context_name("has'quote"));
+        assert!(!is_safe_shell_context_name("has\"quote"));
+        assert!(!is_safe_shell_context_name("a;rm -rf /"));
+        assert!(!is_safe_shell_context_name("-oProxyCommand=evil"));
+        assert!(!is_safe_shell_context_name("-foo"));
     }
 
     #[test]

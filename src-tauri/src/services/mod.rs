@@ -6,6 +6,7 @@ pub mod k8s_endpoints;
 pub mod kube_import;
 pub mod kubeconfig;
 pub mod local_runtime;
+pub mod local_runtime_lifecycle;
 pub mod paths;
 pub mod process;
 pub mod ssh;
