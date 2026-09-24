@@ -95,15 +95,26 @@ pub fn is_safe_shell_context_name(s: &str) -> bool {
 }
 
 /// Sink validator for `KubeconfigSource.remote_path`, which is interpolated into the remote SSH
-/// read command in `kubeconfig.rs::build_candidate_read_cmd` (single-quoted, with a leading `~/`
-/// expanded via the remote shell's `"$HOME"`). Requires an absolute path or a `~/`-prefixed one,
-/// and whitelists the charset a legitimate kubeconfig path needs (alnum plus `/ . _ - + @ :`) --
-/// which, by construction, excludes quotes, `$`, backticks, `\`, shell metacharacters
-/// (`; & | < >`), and whitespace/control characters, any of which could break out of the
-/// single-quoted/`"$HOME"` shell context the path is embedded in. Also rejects `..` path
-/// segments (traversal).
+/// read command in `kubeconfig.rs::build_candidate_read_cmd`. The whole path is embedded inside
+/// a single-quoted shell string (a leading `~/` is expanded via the remote shell's `"$HOME"`;
+/// the remainder after it stays single-quoted like every other candidate) -- inside single
+/// quotes, POSIX shells treat every character literally except a single quote itself, so spaces
+/// and non-ASCII directory names are shell-safe and are accepted here. Rejects: a literal `'`
+/// (would end the quoted string early), control characters (including newline and NUL), `..`
+/// path segments (traversal), and anything that isn't an absolute path or a `~/`-prefixed one
+/// (deliberately not `~user/`: `build_candidate_read_cmd` only special-cases the exact `~/`
+/// prefix).
+///
+/// An EMPTY `remote_path` is intentionally treated as safe: it means "no configured path", so
+/// `fetch_remote_kubeconfig_content` falls straight through to the built-in candidate list --
+/// this must never be what makes `validate_profile` drop an otherwise-valid profile at load
+/// time. User-facing rejection of a non-empty-but-unsafe path happens at
+/// `store::upsert_profile` (the save/persistence boundary), not here in `validate_profile`.
 pub fn is_safe_remote_path(s: &str) -> bool {
-    if s.is_empty() || s.len() > 4096 {
+    if s.is_empty() {
+        return true;
+    }
+    if s.len() > 4096 {
         return false;
     }
     let rest = match s.strip_prefix("~/").or_else(|| s.strip_prefix('/')) {
@@ -113,10 +124,7 @@ pub fn is_safe_remote_path(s: &str) -> bool {
     if rest.is_empty() {
         return false;
     }
-    if !rest
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | '+' | '@' | ':'))
-    {
+    if rest.chars().any(|c| c == '\'' || c.is_control()) {
         return false;
     }
     if rest.split('/').any(|segment| segment == "..") {
@@ -125,17 +133,17 @@ pub fn is_safe_remote_path(s: &str) -> bool {
     true
 }
 
+/// Validates the fields that reach privileged sinks (SSH argv, `~/.ssh/config`, `/etc/hosts`, a
+/// generated file path). Deliberately does NOT validate `KubeconfigSource.remote_path` -- this
+/// function is also used by `store::load_profiles` to filter profiles loaded from disk, and a
+/// remote_path that predates a stricter rule (or was hand-edited) must never make a previously
+/// saved, otherwise-valid profile silently disappear from the list and then get deleted on the
+/// next save. `remote_path` is instead validated at `store::upsert_profile` (the save boundary,
+/// where a rejection surfaces as a user-facing error) and re-checked defensively at the fetch
+/// sink (`kubeconfig.rs::fetch_remote_kubeconfig_content`).
 pub fn validate_profile(profile: &crate::services::config::Profile) -> Result<(), String> {
     if !is_safe_profile_id(&profile.id) {
         return Err(format!("invalid profile id: {}", profile.id));
-    }
-    if let Some(kubeconfig) = &profile.kubeconfig {
-        if !is_safe_remote_path(&kubeconfig.remote_path) {
-            return Err(format!(
-                "invalid kubeconfig remote_path: {}",
-                kubeconfig.remote_path
-            ));
-        }
     }
     for host in &profile.hosts {
         if !is_safe_ssh_identifier(&host.name) {
@@ -258,43 +266,51 @@ mod tests {
             "/var/lib/microk8s/credentials/client.config"
         ));
         assert!(is_safe_remote_path("/home/user-1/my.kube_config:v2"));
+        // empty means "unconfigured" (falls through to built-in candidates), not unsafe.
+        assert!(is_safe_remote_path(""));
+    }
+
+    #[test]
+    fn is_safe_remote_path_accepts_spaces_and_non_ascii_since_it_is_single_quoted() {
+        // The whole path is embedded inside a single-quoted shell string, so anything except a
+        // literal `'` is shell-safe -- spaces and non-ASCII (e.g. Korean) directory names must
+        // be accepted, not just the conservative ASCII charset an earlier version required.
+        assert!(is_safe_remote_path("/mnt/my cluster/admin.conf"));
+        assert!(is_safe_remote_path("~/내 클러스터/config"));
+        assert!(is_safe_remote_path("/etc/쿠버네티스/admin.conf"));
     }
 
     #[test]
     fn is_safe_remote_path_rejects_each_unsafe_class() {
-        // empty / not absolute / not ~-prefixed
-        assert!(!is_safe_remote_path(""));
+        // not absolute / not ~-prefixed
         assert!(!is_safe_remote_path("relative/path"));
         assert!(!is_safe_remote_path("etc/kubernetes/admin.conf"));
+        assert!(!is_safe_remote_path("~user/admin.conf"));
         // bare root or bare "~/" with nothing after
         assert!(!is_safe_remote_path("/"));
         assert!(!is_safe_remote_path("~/"));
         // path traversal
         assert!(!is_safe_remote_path("/etc/../etc/shadow"));
         assert!(!is_safe_remote_path("~/../../etc/passwd"));
-        // shell metacharacters and quoting breakout attempts
+        // a literal single quote would end the quoted shell string early
         assert!(!is_safe_remote_path("/tmp/'; rm -rf ~ #"));
-        assert!(!is_safe_remote_path("/tmp/\"; rm -rf ~ #"));
-        assert!(!is_safe_remote_path("/tmp/$(rm -rf ~)"));
-        assert!(!is_safe_remote_path("/tmp/`rm -rf ~`"));
-        assert!(!is_safe_remote_path("/tmp/a\\b"));
-        assert!(!is_safe_remote_path("/tmp/a;b"));
-        assert!(!is_safe_remote_path("/tmp/a&b"));
-        assert!(!is_safe_remote_path("/tmp/a|b"));
-        assert!(!is_safe_remote_path("/tmp/a<b"));
-        assert!(!is_safe_remote_path("/tmp/a>b"));
-        // whitespace / control characters
-        assert!(!is_safe_remote_path("/tmp/a b"));
+        assert!(!is_safe_remote_path("/tmp/it's/admin.conf"));
+        // control characters
         assert!(!is_safe_remote_path("/tmp/a\tb"));
         assert!(!is_safe_remote_path("/tmp/a\nb"));
         assert!(!is_safe_remote_path("/tmp/a\rb"));
+        assert!(!is_safe_remote_path("/tmp/a\0b"));
         // oversized
         assert!(!is_safe_remote_path(&format!("/{}", "a".repeat(4096))));
     }
 
     #[test]
-    fn validate_profile_rejects_unsafe_kubeconfig_remote_path_and_accepts_safe_one() {
-        let mut profile = Profile {
+    fn validate_profile_does_not_check_kubeconfig_remote_path() {
+        // validate_profile is also used by store::load_profiles to filter profiles loaded from
+        // disk; an unsafe/legacy remote_path must never make it reject (and thus drop) an
+        // otherwise-valid profile. remote_path is validated separately at store::upsert_profile
+        // (the save boundary) and defensively at the fetch sink.
+        let profile = Profile {
             id: "cka-lab".into(),
             name: "CKA Lab".into(),
             hosts: vec![Host {
@@ -308,7 +324,7 @@ mod tests {
             bastion: None,
             bootstrap: BootstrapPolicy::default(),
             kubeconfig: Some(crate::services::config::KubeconfigSource {
-                remote_path: "/etc/kubernetes/admin.conf".into(),
+                remote_path: "/tmp/'; rm -rf ~ #".into(),
                 control_plane: "m1".into(),
                 local_path: "".into(),
                 context: "cka-lab".into(),
@@ -317,10 +333,6 @@ mod tests {
             trusted_cas: Vec::new(),
         };
         assert!(validate_profile(&profile).is_ok());
-
-        profile.kubeconfig.as_mut().unwrap().remote_path = "/tmp/$(rm -rf ~)".into();
-        let err = validate_profile(&profile).unwrap_err();
-        assert!(err.contains("remote_path"));
     }
 
     #[test]
