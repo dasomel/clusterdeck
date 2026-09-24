@@ -1008,8 +1008,13 @@ pub fn merge_yaml_kubeconfigs(
 }
 
 /// Shape of the placeholder kubeconfig generate_default_kubeconfig emits when a profile has no
-/// fetched kubeconfig yet. Field order matches the document's key order; `tls_server_name` is
-/// only present when the control-plane host has a non-loopback address (mirrors normalize_with_host).
+/// fetched kubeconfig yet. Field order matches the document's key order. Deliberately carries no
+/// `tls-server-name`: unlike normalize_with_host (which derives it from a real fetched
+/// kubeconfig's ORIGINAL server host -- a value its cert is guaranteed to cover), this function
+/// synthesizes a server URL from scratch with no fetched kubeconfig to draw an original host
+/// from, so there is no known-good value to put there. `insecure-skip-tls-verify: true` is set
+/// unconditionally here anyway, so the field would be inert for this placeholder's own
+/// connection; it was previously the profile's host label, which has no relation to any cert.
 #[derive(Serialize)]
 struct DefaultKubeconfigDoc {
     #[serde(rename = "apiVersion")]
@@ -1033,8 +1038,6 @@ struct DefaultClusterSpec {
     server: String,
     #[serde(rename = "insecure-skip-tls-verify")]
     insecure_skip_tls_verify: bool,
-    #[serde(rename = "tls-server-name", skip_serializing_if = "Option::is_none")]
-    tls_server_name: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1060,29 +1063,22 @@ pub fn generate_default_kubeconfig(profile: &Profile) -> Result<String, String> 
         return Err("invalid profile id".to_string());
     }
 
-    let (host_addr, host_name) = if let Some(ref kc) = profile.kubeconfig {
+    let host_addr = if let Some(ref kc) = profile.kubeconfig {
         if let Some(h) = profile.hosts.iter().find(|h| h.name == kc.control_plane) {
-            (h.address.as_str(), h.name.as_str())
+            h.address.as_str()
         } else if let Some(first) = profile.hosts.first() {
-            (first.address.as_str(), first.name.as_str())
+            first.address.as_str()
         } else {
-            ("127.0.0.1", "localhost")
+            "127.0.0.1"
         }
     } else if let Some(first) = profile.hosts.first() {
-        (first.address.as_str(), first.name.as_str())
+        first.address.as_str()
     } else {
-        ("127.0.0.1", "localhost")
+        "127.0.0.1"
     };
 
     let server_url = format!("https://{host_addr}:6443");
     let profile_id = profile.id.clone();
-
-    let tls_server_name =
-        if host_addr != "127.0.0.1" && host_addr != "localhost" && !host_name.is_empty() {
-            Some(host_name.to_string())
-        } else {
-            None
-        };
 
     let doc = DefaultKubeconfigDoc {
         api_version: "v1".to_string(),
@@ -1092,7 +1088,6 @@ pub fn generate_default_kubeconfig(profile: &Profile) -> Result<String, String> 
             cluster: DefaultClusterSpec {
                 server: server_url,
                 insecure_skip_tls_verify: true,
-                tls_server_name,
             },
         }],
         contexts: vec![DefaultContextItem {
@@ -2593,8 +2588,10 @@ users:
     #[test]
     fn generate_default_kubeconfig_pins_exact_output_for_non_loopback_host() {
         // Characterization test: pins generate_default_kubeconfig's exact current output for a
-        // profile whose control-plane host has a non-loopback address (tls-server-name must be
-        // present). Guards the Mapping-builder -> typed-struct rewrite against output drift.
+        // profile whose control-plane host has a non-loopback address. No tls-server-name: this
+        // placeholder has no fetched kubeconfig to derive a known-good original host from (see
+        // DefaultKubeconfigDoc's doc comment), and insecure-skip-tls-verify is always true here
+        // anyway.
         let profile = Profile {
             id: "cka".to_string(),
             name: "CKA Lab".to_string(),
@@ -2625,7 +2622,6 @@ clusters:
   cluster:
     server: https://192.0.2.10:6443
     insecure-skip-tls-verify: true
-    tls-server-name: m1
 contexts:
 - name: cka
   context:
