@@ -25,7 +25,7 @@ Do not turn ClusterDeck into a general Kubernetes administration console unless 
 - Keep external command execution asynchronous and cancellable where practical.
 - Treat Tauri command exposure, filesystem/process access, and public API widening as design changes.
 - All process execution goes through the `CommandRunner` trait (`services/process.rs`), never `tokio::process::Command` directly — this is what makes services unit-testable with a `FakeRunner` instead of hitting real SSH/kubectl/osascript.
-- Any `profile.id`, host/bastion name, or address that will reach a privileged sink (SSH argv, `~/.ssh/config`, `/etc/hosts`, a generated file path) must be validated via `services/validate.rs` (`is_safe_profile_id`, `is_safe_ssh_identifier`) first. `store::upsert_profile` already enforces this at the persistence boundary; a new sink should still re-check defensively rather than assume upstream validation covers it — two prior CRITICAL findings (SSH-config injection, path traversal via `profile.id`) both came from a sink trusting unvalidated profile data.
+- Any `profile.id`, host/bastion name, or address that will reach a privileged sink (SSH argv, `~/.ssh/config`, `/etc/hosts`, a generated file path) must be validated via `services/validate.rs` (`is_safe_profile_id`, `is_safe_ssh_identifier`) first. `store::upsert_profile` already enforces this at the persistence boundary; a new sink should still re-check defensively rather than assume upstream validation covers it — a sink trusting unvalidated profile data is how SSH-config injection and path traversal happen.
 - Frontend styling uses CSS custom-property design tokens in `src/styles.css` (the "Patch Panel" system — `--bg`, `--bg-elevated`, `--border`, `--text-primary/secondary`, `--accent`, `--font-mono`, separated for light/dark via `prefers-color-scheme` + an explicit `data-theme` override). Reuse these tokens; do not hardcode colors in new components.
 
 ## Security Rules
@@ -37,7 +37,7 @@ Do not turn ClusterDeck into a general Kubernetes administration console unless 
 - Keep generated state under the ClusterDeck-owned local directory.
 - Never overwrite a user's entire `~/.ssh/config`, `~/.kube/config`, or `/etc/hosts` — own only a clearly marked block (`Include ~/.clusterdeck/ssh/*.conf` for SSH; a `# >>> ClusterDeck BEGIN (profile: <id>) >>>` / `END` marker pair per profile for `/etc/hosts`, opt-in via `Profile.manage_hosts_file`) and never touch lines outside it.
 - Any SSH bootstrap password goes through `CommandRunner::run_with_env` as the `SSHPASS` env var (`sshpass -e`), never as a `-p <password>` argv element — argv is visible to other local processes via `ps`.
-- Every SSH invocation in `BatchMode=yes` (used everywhere so probes never hang on an interactive prompt) must also set `StrictHostKeyChecking=accept-new` — without it, connecting to any host not already in `known_hosts` fails outright instead of trust-on-first-use, which breaks the app's core scenario (frequently recreated VMs are by definition new hosts). A prior regression here (`probe_key_auth`'s path had the option missing while the password/bootstrap paths had it) was only caught by a real end-to-end SSH test, not by mocked unit tests — the `FakeRunner` unit tests could not have caught it, since they don't validate the actual argv content, just the code path structure. Keep this in mind when adding a new SSH invocation site.
+- Every SSH invocation in `BatchMode=yes` (used everywhere so probes never hang on an interactive prompt) must also set `StrictHostKeyChecking=accept-new` — without it, connecting to any host not already in `known_hosts` fails outright instead of trust-on-first-use, which breaks the app's core scenario (frequently recreated VMs are by definition new hosts). `FakeRunner` tests don't check argv content, so a missing option here passes them; check each new SSH invocation site against a real SSH target (see Validation).
 
 ## Change Rules
 
@@ -66,7 +66,7 @@ If an automated regression test is impractical, record executable reproduction e
 
 `make verify` is the authoritative local gate — it matches `docs/CI.md` exactly (`cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all-targets --all-features`, `pnpm build`). Run `make help` for the other targets (`dev`, `release`, `clean`, etc.).
 
-Use `cargo clippy --all-targets --all-features -- -D warnings`, not a bare `cargo clippy -- -D warnings` — the narrower invocation skips test-target code and has missed real warnings there more than once. `--all-targets` is what `make lint` actually runs.
+Use `cargo clippy --all-targets --all-features -- -D warnings`, not a bare `cargo clippy -- -D warnings` — the narrower invocation skips test-target code. `--all-targets` is what `make lint` actually runs.
 
 `make evidence` runs the verify stages individually and appends sanitized pass/fail/duration records to `research/evidence/YYYY-MM.jsonl`, per the OpenForge Research Evidence Collection Standard (`docs/research-evidence.md`). It never captures raw command output, credentials, or infrastructure identifiers — only exit codes and timings.
 
