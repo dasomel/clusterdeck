@@ -48,14 +48,32 @@ pub struct HostsFileStatus {
     pub pending_entries: Vec<String>,
 }
 
+/// Loads a profile and, if it was created from a detected Colima/Lima instance
+/// (`Profile.local_runtime`), re-resolves its SSH endpoint against a fresh discovery pass before
+/// any SSH-using command relies on it (D4) -- Colima/Lima forward a new SSH port on every VM
+/// restart, so the address/port saved at profile-creation time can go stale. A changed endpoint
+/// is persisted via `store::upsert_profile` (which re-validates) so it survives past this one
+/// call. A profile with no `local_runtime` source is returned unchanged, with no command run.
+async fn load_profile_fresh(
+    runner: &dyn CommandRunner,
+    paths: &ClusterDeckPaths,
+    profile_id: &str,
+) -> Result<Profile, String> {
+    let mut profile = store::get_profile(paths, profile_id)?;
+    if crate::services::local_runtime::refresh_local_runtime_endpoint(runner, &mut profile).await {
+        store::upsert_profile(paths, profile.clone())?;
+    }
+    Ok(profile)
+}
+
 #[tauri::command]
 pub async fn probe_profile_hosts(
     profile_id: String,
     password: Option<String>,
 ) -> Result<Vec<HostStageResult>, String> {
     let paths = ClusterDeckPaths::resolve()?;
-    let profile = store::get_profile(&paths, &profile_id)?;
     let runner = SystemRunner;
+    let profile = load_profile_fresh(&runner, &paths, &profile_id).await?;
     let pwd = password.as_deref();
 
     let host_futures = profile.hosts.iter().map(|host| async {
@@ -123,8 +141,8 @@ pub async fn bootstrap_profile(
     password: String,
 ) -> Result<Vec<BootstrapResult>, String> {
     let paths = ClusterDeckPaths::resolve()?;
-    let profile = store::get_profile(&paths, &profile_id)?;
     let runner = SystemRunner;
+    let profile = load_profile_fresh(&runner, &paths, &profile_id).await?;
 
     Ok(bootstrap_profile_hosts(&runner, &profile, &password).await)
 }
@@ -132,7 +150,8 @@ pub async fn bootstrap_profile(
 #[tauri::command]
 pub async fn generate_aliases(profile_id: String) -> Result<(), String> {
     let paths = ClusterDeckPaths::resolve()?;
-    let profile = store::get_profile(&paths, &profile_id)?;
+    let runner = SystemRunner;
+    let profile = load_profile_fresh(&runner, &paths, &profile_id).await?;
 
     ssh_config::write_profile_config(&paths, &profile)?;
     let home = std::env::var("HOME").map_err(|e| e.to_string())?;
@@ -147,8 +166,8 @@ pub async fn fetch_kubeconfig(
     password: Option<String>,
 ) -> Result<KubeconfigSummary, String> {
     let paths = ClusterDeckPaths::resolve()?;
-    let profile = store::get_profile(&paths, &profile_id)?;
     let runner = SystemRunner;
+    let profile = load_profile_fresh(&runner, &paths, &profile_id).await?;
 
     crate::services::kubeconfig::fetch_and_store(&runner, &paths, &profile, password.as_deref())
         .await
@@ -207,8 +226,8 @@ async fn compute_ssh_reachability(
 #[tauri::command]
 pub async fn verify_profile(profile_id: String) -> Result<VerificationResult, String> {
     let paths = ClusterDeckPaths::resolve()?;
-    let profile = store::get_profile(&paths, &profile_id)?;
     let runner = SystemRunner;
+    let profile = load_profile_fresh(&runner, &paths, &profile_id).await?;
 
     let kubeconfig_path = paths.kubeconfig_file(&profile_id);
     let target_context = resolve_verify_context(&profile, &kubeconfig_path);
@@ -252,8 +271,8 @@ pub async fn connect_profile(
     password: Option<String>,
 ) -> Result<ConnectionResult, String> {
     let paths = ClusterDeckPaths::resolve()?;
-    let profile = store::get_profile(&paths, &profile_id)?;
     let runner = SystemRunner;
+    let profile = load_profile_fresh(&runner, &paths, &profile_id).await?;
     let pwd = password.as_deref();
 
     let host_futures = profile.hosts.iter().map(|host| async {
@@ -428,8 +447,8 @@ pub async fn discover_cluster_endpoints_cmd(
     profile_id: String,
 ) -> Result<Vec<DiscoveredEndpoint>, String> {
     let paths = ClusterDeckPaths::resolve()?;
-    let profile = store::get_profile(&paths, &profile_id)?;
     let runner = SystemRunner;
+    let profile = load_profile_fresh(&runner, &paths, &profile_id).await?;
     let kubeconfig_path = paths.kubeconfig_file(&profile_id);
 
     if !kubeconfig_path.exists() {
@@ -529,7 +548,8 @@ pub async fn remove_hosts_file_cmd(profile_id: String) -> Result<SyncHostsResult
 #[tauri::command]
 pub async fn open_ssh_session(profile_id: String, host_name: String) -> Result<(), String> {
     let paths = ClusterDeckPaths::resolve()?;
-    let profile = store::get_profile(&paths, &profile_id)?;
+    let runner = SystemRunner;
+    let profile = load_profile_fresh(&runner, &paths, &profile_id).await?;
 
     let target_host = profile
         .hosts
@@ -541,8 +561,6 @@ pub async fn open_ssh_session(profile_id: String, host_name: String) -> Result<(
     let home = std::env::var("HOME").map_err(|e| e.to_string())?;
     let home_ssh_config = PathBuf::from(home).join(".ssh").join("config");
     ssh_config::ensure_ssh_include(&home_ssh_config, &paths)?;
-    let runner = SystemRunner;
-
     // Side-effect-only probe, result intentionally discarded: accept-new records this (possibly
     // just-recreated) VM's host key, and a changed key gets its stale known_hosts entry pruned,
     // so the interactive Terminal session below doesn't open onto a host-key failure. Terminal
@@ -710,6 +728,7 @@ mod tests {
             kubeconfig: None,
             manage_hosts_file: false,
             trusted_cas: Vec::new(),
+            local_runtime: None,
         }
     }
 

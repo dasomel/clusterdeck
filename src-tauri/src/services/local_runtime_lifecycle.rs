@@ -10,7 +10,7 @@
 //! read off that fresh row, never trusted from a caller-supplied value, closing off a class of
 //! sink-trusts-unvalidated-input bug AGENTS.md calls out as a repeat offender in this codebase.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::str::FromStr;
 use std::sync::Mutex;
@@ -38,7 +38,13 @@ const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 /// start/stop/restart/shell for Colima and Lima (ADR-0007 D1); routing a free string into argv
 /// is exactly what AGENTS.md's validate-at-every-sink rule exists to prevent, so the wire value
 /// is parsed into this enum and rejected outright if it is anything else.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// Also reused by `config::LocalRuntimeSource` (Issue: stale Colima/Lima SSH port after VM
+/// restart) to record which local runtime a profile's host came from, hence the `Serialize` /
+/// `Deserialize` derives below: that struct is persisted to `profiles.yaml` and round-tripped
+/// through Tauri commands, in addition to this module's own string-parsed usage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum LocalRuntimeProvider {
     Colima,
     Lima,

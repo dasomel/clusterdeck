@@ -32,6 +32,11 @@ export type KubeconfigSource = {
   context: string;
 };
 
+export type LocalRuntimeSource = {
+  provider: 'colima' | 'lima';
+  instance: string;
+};
+
 export type Profile = {
   id: string;
   name: string;
@@ -41,6 +46,7 @@ export type Profile = {
   kubeconfig: KubeconfigSource | null;
   manage_hosts_file: boolean;
   trusted_cas: TrustedCa[];
+  local_runtime?: LocalRuntimeSource | null;
 };
 
 export type HostStageResult = { host: string; reachable: boolean; detail: string };

@@ -816,6 +816,79 @@ pub async fn detect_local_hosts(
     Ok(results)
 }
 
+/// Re-resolves a Colima/Lima-sourced profile's stored SSH endpoint against a fresh
+/// `detect_colima`/`detect_lima` pass before SSH uses it. Colima/Lima allocate a new host-side
+/// SSH port (and can move the forwarded address) on every VM restart, so a port saved into the
+/// `Profile` at creation time goes stale; using it verbatim is what makes Test Connection/Connect
+/// fail with "Connection refused" after a restart.
+///
+/// Returns whether any host field was actually changed. `profile.local_runtime == None` is a
+/// no-op that runs no command at all. If the instance is missing from discovery, not `Running`,
+/// or reports port 0, this leaves the profile unchanged rather than erroring -- the caller's
+/// normal SSH attempt surfaces a meaningful connection error on its own.
+pub async fn refresh_local_runtime_endpoint(
+    runner: &dyn CommandRunner,
+    profile: &mut crate::services::config::Profile,
+) -> bool {
+    let Some(source) = profile.local_runtime.clone() else {
+        return false;
+    };
+
+    let discovered = match source.provider {
+        crate::services::local_runtime_lifecycle::LocalRuntimeProvider::Colima => {
+            detect_colima(runner, &HashSet::new()).await
+        }
+        crate::services::local_runtime_lifecycle::LocalRuntimeProvider::Lima => {
+            detect_lima(runner).await
+        }
+    };
+
+    let Some(entry) = discovered
+        .into_iter()
+        .find(|host| host.instance_name == source.instance)
+    else {
+        return false;
+    };
+    if entry.status != "Running" || entry.port == 0 {
+        return false;
+    }
+    // detect_colima falls back to 127.0.0.1:22 with no identity when `colima ssh-config` fails;
+    // a real ssh-config always carries an IdentityFile, so its absence means "no fresh data" and
+    // overwriting a working endpoint with that fallback would break it.
+    if source.provider == crate::services::local_runtime_lifecycle::LocalRuntimeProvider::Colima
+        && entry.identity_file.is_none()
+    {
+        return false;
+    }
+
+    // Match by host name; fall back to the profile's only host when there's exactly one, since a
+    // profile created from a single detected instance may have had its host renamed since.
+    let host_index = profile
+        .hosts
+        .iter()
+        .position(|host| host.name == entry.host_name)
+        .or_else(|| (profile.hosts.len() == 1).then_some(0));
+    let Some(host_index) = host_index else {
+        return false;
+    };
+
+    let host = &mut profile.hosts[host_index];
+    let mut changed = false;
+    if host.address != entry.address {
+        host.address = entry.address;
+        changed = true;
+    }
+    if host.port != entry.port {
+        host.port = entry.port;
+        changed = true;
+    }
+    if entry.identity_file.is_some() && host.identity_file != entry.identity_file {
+        host.identity_file = entry.identity_file;
+        changed = true;
+    }
+    changed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1206,5 +1279,201 @@ Host master-1
                 assert!(!arg.contains("--help"));
             }
         }
+    }
+
+    fn sample_profile(
+        hosts: Vec<crate::services::config::Host>,
+        local_runtime: Option<crate::services::config::LocalRuntimeSource>,
+    ) -> crate::services::config::Profile {
+        crate::services::config::Profile {
+            id: "test".to_string(),
+            name: "Test".to_string(),
+            hosts,
+            bastion: None,
+            bootstrap: crate::services::config::BootstrapPolicy::default(),
+            kubeconfig: None,
+            manage_hosts_file: false,
+            trusted_cas: Vec::new(),
+            local_runtime,
+        }
+    }
+
+    fn sample_host(name: &str, address: &str, port: u16) -> crate::services::config::Host {
+        crate::services::config::Host {
+            name: name.to_string(),
+            address: address.to_string(),
+            port,
+            user: "olduser".to_string(),
+            identity_file: Some("/path/to/old/key".to_string()),
+            auth: crate::services::config::AuthMode::Key,
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_local_runtime_endpoint_updates_colima_port_and_address() {
+        // Colima allocates a new host-side SSH port after a VM restart (56260 -> 58096); the
+        // stored Profile host must pick up the fresh port/address/identity_file, same
+        // ssh-config fixture shape as parse_ssh_config_extracts_fields above.
+        let colima_list = r#"{"name":"default","status":"Running","runtime":"docker"}"#;
+        let colima_ssh = r#"Host colima
+  IdentityFile "/path/to/new/key"
+  User testuser
+  Hostname 127.0.0.1
+  Port 58096"#;
+        let runner = FakeRunner {
+            colima_list,
+            colima_ssh,
+            lima_list: "",
+            docker_contexts: "",
+            vagrant_status: "",
+            vagrant_ssh: "",
+            calls: Mutex::new(Vec::new()),
+        };
+
+        let mut profile = sample_profile(
+            vec![sample_host("colima-vm", "127.0.0.1", 56260)],
+            Some(crate::services::config::LocalRuntimeSource {
+                provider: crate::services::local_runtime_lifecycle::LocalRuntimeProvider::Colima,
+                instance: "default".to_string(),
+            }),
+        );
+
+        let changed = refresh_local_runtime_endpoint(&runner, &mut profile).await;
+        assert!(changed);
+        assert_eq!(profile.hosts[0].port, 58096);
+        assert_eq!(profile.hosts[0].address, "127.0.0.1");
+        assert_eq!(
+            profile.hosts[0].identity_file.as_deref(),
+            Some("/path/to/new/key")
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_local_runtime_endpoint_is_noop_and_runs_no_command_when_local_runtime_is_none()
+    {
+        let runner = FakeRunner {
+            colima_list: r#"{"name":"default","status":"Running","runtime":"docker"}"#,
+            colima_ssh: "",
+            lima_list: "",
+            docker_contexts: "",
+            vagrant_status: "",
+            vagrant_ssh: "",
+            calls: Mutex::new(Vec::new()),
+        };
+        let mut profile = sample_profile(vec![sample_host("colima-vm", "127.0.0.1", 56260)], None);
+
+        let changed = refresh_local_runtime_endpoint(&runner, &mut profile).await;
+        assert!(!changed);
+        assert_eq!(profile.hosts[0].port, 56260);
+        assert!(runner.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn refresh_local_runtime_endpoint_leaves_profile_unchanged_when_instance_absent() {
+        let runner = FakeRunner {
+            colima_list: r#"{"name":"other","status":"Running","runtime":"docker"}"#,
+            colima_ssh: "",
+            lima_list: "",
+            docker_contexts: "",
+            vagrant_status: "",
+            vagrant_ssh: "",
+            calls: Mutex::new(Vec::new()),
+        };
+        let mut profile = sample_profile(
+            vec![sample_host("colima-vm", "127.0.0.1", 56260)],
+            Some(crate::services::config::LocalRuntimeSource {
+                provider: crate::services::local_runtime_lifecycle::LocalRuntimeProvider::Colima,
+                instance: "default".to_string(),
+            }),
+        );
+
+        let changed = refresh_local_runtime_endpoint(&runner, &mut profile).await;
+        assert!(!changed);
+        assert_eq!(profile.hosts[0].port, 56260);
+        assert_eq!(profile.hosts[0].address, "127.0.0.1");
+    }
+
+    #[tokio::test]
+    async fn refresh_local_runtime_endpoint_leaves_profile_unchanged_when_instance_stopped() {
+        let runner = FakeRunner {
+            colima_list: r#"{"name":"default","status":"Stopped","runtime":"docker"}"#,
+            colima_ssh: r#"Host colima
+  Hostname 127.0.0.1
+  User testuser
+  Port 58096"#,
+            lima_list: "",
+            docker_contexts: "",
+            vagrant_status: "",
+            vagrant_ssh: "",
+            calls: Mutex::new(Vec::new()),
+        };
+        let mut profile = sample_profile(
+            vec![sample_host("colima-vm", "127.0.0.1", 56260)],
+            Some(crate::services::config::LocalRuntimeSource {
+                provider: crate::services::local_runtime_lifecycle::LocalRuntimeProvider::Colima,
+                instance: "default".to_string(),
+            }),
+        );
+
+        let changed = refresh_local_runtime_endpoint(&runner, &mut profile).await;
+        assert!(!changed);
+        assert_eq!(profile.hosts[0].port, 56260);
+    }
+
+    #[tokio::test]
+    async fn refresh_local_runtime_endpoint_keeps_endpoint_when_colima_ssh_config_yields_nothing() {
+        let runner = FakeRunner {
+            colima_list: r#"{"name":"default","status":"Running","runtime":"docker+k3s"}"#,
+            colima_ssh: "",
+            lima_list: "",
+            docker_contexts: "",
+            vagrant_status: "",
+            vagrant_ssh: "",
+            calls: Mutex::new(Vec::new()),
+        };
+        let mut profile = sample_profile(
+            vec![sample_host("colima-vm", "127.0.0.1", 56260)],
+            Some(crate::services::config::LocalRuntimeSource {
+                provider: crate::services::local_runtime_lifecycle::LocalRuntimeProvider::Colima,
+                instance: "default".to_string(),
+            }),
+        );
+
+        let changed = refresh_local_runtime_endpoint(&runner, &mut profile).await;
+        assert!(!changed);
+        assert_eq!(profile.hosts[0].port, 56260);
+    }
+
+    #[tokio::test]
+    async fn refresh_local_runtime_endpoint_updates_lima_port() {
+        let lima_list = r#"{"name":"work","status":"Running","sshAddress":"127.0.0.1","sshLocalPort":50326,"IdentityFile":"/path/to/lima/key","config":{"user":{"name":"limauser"}}}"#;
+        let runner = FakeRunner {
+            colima_list: "",
+            colima_ssh: "",
+            lima_list,
+            docker_contexts: "",
+            vagrant_status: "",
+            vagrant_ssh: "",
+            calls: Mutex::new(Vec::new()),
+        };
+        let mut profile = sample_profile(
+            vec![sample_host("lima-work", "127.0.0.1", 40000)],
+            Some(crate::services::config::LocalRuntimeSource {
+                provider: crate::services::local_runtime_lifecycle::LocalRuntimeProvider::Lima,
+                instance: "work".to_string(),
+            }),
+        );
+
+        let changed = refresh_local_runtime_endpoint(&runner, &mut profile).await;
+        assert!(changed);
+        assert_eq!(profile.hosts[0].port, 50326);
+        assert_eq!(
+            profile.hosts[0].identity_file.as_deref(),
+            Some("/path/to/lima/key")
+        );
+
+        // Only limactl was invoked, never colima -- Lima refresh must not touch Colima.
+        let calls = runner.calls.lock().unwrap();
+        assert!(calls.iter().all(|(bin, _)| bin == "limactl"));
     }
 }

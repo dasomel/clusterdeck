@@ -1397,6 +1397,7 @@ users:
             }),
             manage_hosts_file: false,
             trusted_cas: Vec::new(),
+            local_runtime: None,
         };
 
         let runner = FakeSshRunner {
@@ -1473,6 +1474,7 @@ users:
             }),
             manage_hosts_file: false,
             trusted_cas: Vec::new(),
+            local_runtime: None,
         }
     }
 
@@ -1746,6 +1748,7 @@ users:
             }),
             manage_hosts_file: false,
             trusted_cas: Vec::new(),
+            local_runtime: None,
         };
 
         let runner = FakeSshRunner {
@@ -1905,6 +1908,7 @@ users:
             }),
             manage_hosts_file: false,
             trusted_cas: Vec::new(),
+            local_runtime: None,
         };
 
         struct CandidateRunner {
@@ -1991,6 +1995,7 @@ users:
             }),
             manage_hosts_file: false,
             trusted_cas: Vec::new(),
+            local_runtime: None,
         };
 
         struct ProbeCapturingRunner {
@@ -2591,6 +2596,7 @@ users:
             }),
             manage_hosts_file: false,
             trusted_cas: Vec::new(),
+            local_runtime: None,
         };
 
         let runner = DummyKubeRunner;
@@ -2692,6 +2698,7 @@ users:
             }),
             manage_hosts_file: false,
             trusted_cas: Vec::new(),
+            local_runtime: None,
         };
         let generated = generate_default_kubeconfig(&profile).unwrap();
         let expected = r#"apiVersion: v1
@@ -2727,6 +2734,7 @@ users:
             kubeconfig: None,
             manage_hosts_file: false,
             trusted_cas: Vec::new(),
+            local_runtime: None,
         };
         let generated = generate_default_kubeconfig(&profile).unwrap();
         let expected = r#"apiVersion: v1

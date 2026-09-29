@@ -14,6 +14,24 @@ pub struct Profile {
     pub manage_hosts_file: bool,
     #[serde(default)]
     pub trusted_cas: Vec<crate::services::ca_trust::TrustedCa>,
+    /// Which local VM runtime this profile's host(s) came from, if created from a detected
+    /// Colima/Lima instance. `#[serde(default, skip_serializing_if = "Option::is_none")]` so
+    /// profile YAML persisted before this field existed still deserializes unchanged, and a
+    /// profile with no local runtime origin doesn't grow a `local_runtime: null` line.
+    /// `services::local_runtime::refresh_local_runtime_endpoint` uses this to re-resolve the
+    /// current SSH address/port before connecting -- Colima/Lima forward a new SSH port on every
+    /// VM restart, so a port recorded at profile-creation time goes stale and Test
+    /// Connection/Connect fail with "Connection refused" against it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_runtime: Option<LocalRuntimeSource>,
+}
+
+/// Identifies the local Colima/Lima instance a `Profile`'s host was created from. See
+/// `Profile::local_runtime` for why this exists.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalRuntimeSource {
+    pub provider: crate::services::local_runtime_lifecycle::LocalRuntimeProvider,
+    pub instance: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -82,6 +82,7 @@ mod tests {
             kubeconfig: None,
             manage_hosts_file: false,
             trusted_cas,
+            local_runtime: None,
         }
     }
 

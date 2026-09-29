@@ -188,6 +188,18 @@ pub fn validate_profile(profile: &crate::services::config::Profile) -> Result<()
             }
         }
     }
+    if let Some(local_runtime) = &profile.local_runtime {
+        // Same validator lifecycle actions use before embedding an instance name in
+        // `colima`/`limactl` argv or an osascript string (services/local_runtime_lifecycle.rs) --
+        // this field reaches the same detect_colima/detect_lima calls via
+        // refresh_local_runtime_endpoint, so it needs the same charset guarantee.
+        if !is_safe_local_runtime_instance_name(&local_runtime.instance) {
+            return Err(format!(
+                "invalid local_runtime instance: {}",
+                local_runtime.instance
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -232,6 +244,7 @@ mod tests {
             kubeconfig: None,
             manage_hosts_file: false,
             trusted_cas: Vec::new(),
+            local_runtime: None,
         };
         assert!(validate_profile(&profile).is_err());
 
@@ -264,6 +277,7 @@ mod tests {
             kubeconfig: None,
             manage_hosts_file: false,
             trusted_cas: Vec::new(),
+            local_runtime: None,
         };
         assert!(validate_profile(&valid_profile).is_ok());
 
@@ -355,6 +369,7 @@ mod tests {
             }),
             manage_hosts_file: false,
             trusted_cas: Vec::new(),
+            local_runtime: None,
         };
         assert!(validate_profile(&profile).is_ok());
     }
@@ -438,5 +453,38 @@ mod tests {
         assert!(!is_safe_host_domain("bad\nhost.internal"));
         assert!(!is_safe_host_domain("bad host.internal"));
         assert!(!is_safe_host_domain("bad/host.internal"));
+    }
+
+    #[test]
+    fn validate_profile_rejects_unsafe_local_runtime_instance_and_accepts_safe_one() {
+        let mut profile = Profile {
+            id: "colima-default".into(),
+            name: "Colima Local".into(),
+            hosts: vec![Host {
+                name: "colima-vm".into(),
+                address: "127.0.0.1".into(),
+                port: 56260,
+                user: "root".into(),
+                identity_file: None,
+                auth: AuthMode::Key,
+            }],
+            bastion: None,
+            bootstrap: BootstrapPolicy::default(),
+            kubeconfig: None,
+            manage_hosts_file: false,
+            trusted_cas: Vec::new(),
+            local_runtime: Some(crate::services::config::LocalRuntimeSource {
+                provider: crate::services::local_runtime_lifecycle::LocalRuntimeProvider::Colima,
+                instance: "default".into(),
+            }),
+        };
+        assert!(validate_profile(&profile).is_ok());
+
+        profile.local_runtime = Some(crate::services::config::LocalRuntimeSource {
+            provider: crate::services::local_runtime_lifecycle::LocalRuntimeProvider::Colima,
+            instance: "-oProxyCommand=evil".into(),
+        });
+        let err = validate_profile(&profile).unwrap_err();
+        assert!(err.contains("invalid local_runtime instance"));
     }
 }

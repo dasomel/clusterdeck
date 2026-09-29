@@ -44,6 +44,16 @@ fn search_dirs() -> Vec<PathBuf> {
     dirs
 }
 
+/// `PATH` handed to every child process: the same directories `resolve_cli_path` searched.
+/// Resolving the binary alone is not enough -- tools like `colima` shell out to `limactl`, and
+/// kubectl exec plugins / docker credential helpers are PATH lookups too. A GUI-launched app
+/// inherits only `/usr/bin:/bin:/usr/sbin:/sbin`, so without this those nested lookups fail
+/// even though the top-level binary was found. `None` (a directory containing `:`) leaves the
+/// inherited PATH untouched rather than failing the command.
+fn child_path_env() -> Option<std::ffi::OsString> {
+    std::env::join_paths(search_dirs()).ok()
+}
+
 pub fn resolve_cli_path(bin: &str) -> Result<PathBuf, String> {
     for dir in search_dirs() {
         let candidate = dir.join(bin);
@@ -83,9 +93,12 @@ impl CommandRunner for SystemRunner {
         let path = resolve_cli_path(bin)?;
         // kill_on_drop: without it, dropping this future (e.g. a tokio::time::timeout firing on
         // a hung password-auth prompt) leaves the child running instead of terminating it.
-        let output = Command::new(path)
-            .args(args)
-            .kill_on_drop(true)
+        let mut cmd = Command::new(path);
+        cmd.args(args).kill_on_drop(true);
+        if let Some(child_path) = child_path_env() {
+            cmd.env("PATH", child_path);
+        }
+        let output = cmd
             .output()
             .await
             .map_err(|err| format!("{bin} execution failed: {err}"))?;
@@ -106,6 +119,9 @@ impl CommandRunner for SystemRunner {
         let mut cmd = Command::new(path);
         cmd.args(args);
         cmd.kill_on_drop(true);
+        if let Some(child_path) = child_path_env() {
+            cmd.env("PATH", child_path);
+        }
         for (k, v) in env {
             cmd.env(k, v);
         }
@@ -216,6 +232,16 @@ mod tests {
             dirs.len(),
             "search_dirs must not contain duplicate directories: {dirs:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn system_runner_gives_children_the_search_dirs_as_path() {
+        let out = SystemRunner
+            .run("sh", &["-c".to_string(), "printf %s \"$PATH\"".to_string()])
+            .await
+            .unwrap();
+        let expected = std::env::join_paths(search_dirs()).unwrap();
+        assert_eq!(out.stdout, expected.to_string_lossy());
     }
 
     struct FakeOsascriptRunner {

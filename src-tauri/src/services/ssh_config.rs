@@ -142,6 +142,7 @@ mod tests {
             kubeconfig: None,
             manage_hosts_file: false,
             trusted_cas: Vec::new(),
+            local_runtime: None,
         }
     }
 
