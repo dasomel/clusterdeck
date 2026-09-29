@@ -81,15 +81,16 @@ pub async fn verify_cluster_detailed(
 
     // 2. If kubectl fails (e.g. macOS Sequoia Local Network Privacy blocks third-party socket,
     // or kubectl is not installed), fall back to system curl which bypasses LNP restrictions
-    if let Ok(stdout) =
-        crate::services::k8s_endpoints::curl_k8s_api(runner, kubeconfig_path, "/api/v1/nodes").await
-    {
-        if let Some(res) = parse_nodes_json(&stdout, api_endpoint.clone()) {
+    let curl_result =
+        crate::services::k8s_endpoints::curl_k8s_api(runner, kubeconfig_path, "/api/v1/nodes")
+            .await;
+    if let Ok(stdout) = &curl_result {
+        if let Some(res) = parse_nodes_json(stdout, api_endpoint.clone()) {
             return (res, None);
         }
     }
 
-    // 3. If both failed, report the step-1 kubectl error
+    // 3. Report both failures so the UI can distinguish API/network/TLS failures.
     let err_msg = match kubectl_result {
         Ok(output) if !output.stderr.trim().is_empty() => {
             let raw = output.stderr.trim();
@@ -103,6 +104,11 @@ pub async fn verify_cluster_detailed(
         Err(e) => format!("Failed to execute kubectl: {e}"),
     };
 
+    let curl_detail = match curl_result {
+        Ok(_) => "curl returned an invalid nodes response".to_string(),
+        Err(e) => e,
+    };
+
     (
         VerificationResult {
             ssh: false,
@@ -113,7 +119,7 @@ pub async fn verify_cluster_detailed(
             api_endpoint,
             last_verified: None,
         },
-        Some(err_msg),
+        Some(format!("kubectl: {err_msg}; curl: {curl_detail}")),
     )
 }
 
@@ -240,10 +246,9 @@ mod tests {
         let (result, err) =
             verify_cluster_detailed(&runner, Path::new("/tmp/kc.yaml"), "dev").await;
         assert!(!result.kubernetes);
-        assert_eq!(
-            err,
-            Some("dial tcp 172.16.221.133:6443: connect: no route to host (macOS Sequoia: Check System Settings > Privacy & Security > Local Network)".to_string())
-        );
+        let err = err.unwrap();
+        assert!(err.contains("kubectl: dial tcp 172.16.221.133:6443: connect: no route to host"));
+        assert!(err.contains("curl: failed to read kubeconfig:"));
     }
 
     struct FakeRunnerWithCurlFallback {

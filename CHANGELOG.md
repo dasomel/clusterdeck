@@ -6,6 +6,12 @@ The format follows the principles of Keep a Changelog and uses semantic versioni
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-09-29
+
+- Skip remote kubeconfig candidates that have no authentication settings or broken context references, then continue probing later paths. Report the rejected candidate and remote read-permission guidance if no usable file is found.
+- Do not verify a stale or generated credential-free profile kubeconfig after Connect / Sync fails to fetch a fresh one, or merge that placeholder into `~/.kube/config`; show the fetch failure instead of a misleading Kubernetes `EOF`.
+- Include both `kubectl` and `curl` errors when Kubernetes verification fails.
+
 ## [0.4.0] - 2026-09-29
 
 - Re-resolve the SSH address, port, and identity of profiles created from a detected Colima/Lima instance before every SSH-using action (Test Connection, Connect/Sync, Bootstrap, kubeconfig fetch, Verify, endpoint discovery, SSH session); Colima/Lima forward a new SSH port on each VM restart, which previously left the saved port stale and failed with "Connection refused". Profiles record their origin in a new optional `local_runtime` field; existing profiles load unchanged (#14)

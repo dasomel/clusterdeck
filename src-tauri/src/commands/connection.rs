@@ -185,6 +185,14 @@ fn resolve_verify_context(profile: &Profile, kubeconfig_path: &Path) -> String {
     profile.id.clone()
 }
 
+fn has_kubeconfig_to_verify(profile: &Profile, fetched: bool, path: &Path) -> bool {
+    if profile.kubeconfig.is_some() {
+        fetched
+    } else {
+        path.exists()
+    }
+}
+
 // No password parameter on this command: it's a read-only/polling status check, so
 // password-auth hosts can't be probed here. Only probe key-auth hosts; if the profile has none
 // (all hosts are password-mode), keep whatever a prior Connect/Test Connection call (which do
@@ -359,7 +367,10 @@ pub async fn connect_profile(
     }
 
     let kubeconfig_path = paths.kubeconfig_file(&profile_id);
-    let kubeconfig_exists = kubeconfig_summary.is_some() || kubeconfig_path.exists();
+    // A previous merge may have created an unauthenticated placeholder. When this Connect
+    // attempt cannot fetch credentials, never verify that stale file as if it were fresh.
+    let kubeconfig_exists =
+        has_kubeconfig_to_verify(&profile, kubeconfig_summary.is_some(), &kubeconfig_path);
     let target_context = resolve_verify_context(&profile, &kubeconfig_path);
 
     let (mut verification, verify_err) = if kubeconfig_exists {
@@ -730,6 +741,25 @@ mod tests {
             trusted_cas: Vec::new(),
             local_runtime: None,
         }
+    }
+
+    #[test]
+    fn failed_fetch_does_not_verify_an_existing_placeholder() {
+        let mut profile = profile_with_hosts(vec![password_host("m1")]);
+        profile.kubeconfig = Some(crate::services::config::KubeconfigSource {
+            control_plane: "m1".to_string(),
+            remote_path: "/etc/kubernetes/admin.conf".to_string(),
+            local_path: String::new(),
+            context: "test".to_string(),
+        });
+        // The path is deliberately an existing file. The failed fetch must still leave the
+        // verification status false; its content may be a generated placeholder or stale keys.
+        assert!(!has_kubeconfig_to_verify(
+            &profile,
+            false,
+            Path::new(file!())
+        ));
+        assert!(has_kubeconfig_to_verify(&profile, true, Path::new(file!())));
     }
 
     #[tokio::test]
