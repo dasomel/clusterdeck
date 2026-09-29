@@ -6,6 +6,12 @@ The format follows the principles of Keep a Changelog and uses semantic versioni
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-29
+
+- Re-resolve the SSH address, port, and identity of profiles created from a detected Colima/Lima instance before every SSH-using action (Test Connection, Connect/Sync, Bootstrap, kubeconfig fetch, Verify, endpoint discovery, SSH session); Colima/Lima forward a new SSH port on each VM restart, which previously left the saved port stale and failed with "Connection refused". Profiles record their origin in a new optional `local_runtime` field; existing profiles load unchanged (#14)
+- Fix Colima detection when ClusterDeck is launched from Finder/Dock: child processes now receive the resolved tool search path, so `colima` can find its own `limactl`
+- Match the Save and Cancel button size in modal footers
+
 ## [0.3.0] - 2026-09-24
 
 - Add local runtime lifecycle actions for Colima/Lima instances: Start/Stop/Restart, open a VM shell, open a host-side shell scoped to the instance's Docker/kube context (no global `docker context use`/`kubectl config use-context` mutation), and copy a plain-text runtime summary; guarded by strict instance-name validation, a fresh-discovery re-check before every action, and a per-instance concurrency lock (#14 Phase 2, ADR-0007)
