@@ -82,7 +82,8 @@ pub async fn verify_cluster_detailed(
     // 2. If kubectl fails (e.g. macOS Sequoia Local Network Privacy blocks third-party socket,
     // or kubectl is not installed), fall back to system curl which bypasses LNP restrictions
     let curl_result =
-        crate::services::k8s_endpoints::curl_k8s_api(runner, kubeconfig_path, "/api/v1/nodes").await;
+        crate::services::k8s_endpoints::curl_k8s_api(runner, kubeconfig_path, "/api/v1/nodes")
+            .await;
     if let Ok(stdout) = &curl_result {
         if let Some(res) = parse_nodes_json(stdout, api_endpoint.clone()) {
             return (res, None);

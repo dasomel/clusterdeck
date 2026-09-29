@@ -369,11 +369,8 @@ pub async fn connect_profile(
     let kubeconfig_path = paths.kubeconfig_file(&profile_id);
     // A previous merge may have created an unauthenticated placeholder. When this Connect
     // attempt cannot fetch credentials, never verify that stale file as if it were fresh.
-    let kubeconfig_exists = has_kubeconfig_to_verify(
-        &profile,
-        kubeconfig_summary.is_some(),
-        &kubeconfig_path,
-    );
+    let kubeconfig_exists =
+        has_kubeconfig_to_verify(&profile, kubeconfig_summary.is_some(), &kubeconfig_path);
     let target_context = resolve_verify_context(&profile, &kubeconfig_path);
 
     let (mut verification, verify_err) = if kubeconfig_exists {
@@ -757,7 +754,11 @@ mod tests {
         });
         // The path is deliberately an existing file. The failed fetch must still leave the
         // verification status false; its content may be a generated placeholder or stale keys.
-        assert!(!has_kubeconfig_to_verify(&profile, false, Path::new(file!())));
+        assert!(!has_kubeconfig_to_verify(
+            &profile,
+            false,
+            Path::new(file!())
+        ));
         assert!(has_kubeconfig_to_verify(&profile, true, Path::new(file!())));
     }
 

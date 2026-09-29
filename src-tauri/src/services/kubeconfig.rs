@@ -1274,8 +1274,9 @@ pub async fn merge_profile_kubeconfig_to_file(
     if !is_valid_kubeconfig_yaml(&profile_raw) {
         return Err("Profile kubeconfig is not valid YAML".to_string());
     }
-    validate_fetched_kubeconfig(&profile_raw)
-        .map_err(|reason| format!("Profile kubeconfig is not ready to merge: {reason}. Run Connect / Sync first"))?;
+    validate_fetched_kubeconfig(&profile_raw).map_err(|reason| {
+        format!("Profile kubeconfig is not ready to merge: {reason}. Run Connect / Sync first")
+    })?;
 
     let mut backup_result = None;
     if backup_first && user_config_path.exists() {
@@ -1434,7 +1435,8 @@ users:
         assert!(validate_fetched_kubeconfig(&SAMPLE.replace(
             "client-certificate-data: ZmFrZS1jZXJ0\n      client-key-data: ZmFrZS1rZXk=",
             "token: test-token",
-        )).is_ok());
+        ))
+        .is_ok());
         assert_eq!(
             validate_fetched_kubeconfig(&SAMPLE.replace("user: original-user", "user: missing")),
             Err("current context does not reference the cluster and user")
@@ -1461,16 +1463,29 @@ users:
                 } else {
                     SAMPLE.to_string()
                 };
-                Ok(CommandOutput { stdout, stderr: String::new(), success: true })
+                Ok(CommandOutput {
+                    stdout,
+                    stderr: String::new(),
+                    success: true,
+                })
             }
         }
         let profile = password_auth_profile("candidate-auth");
         let host = &profile.hosts[0];
-        let runner = CandidateAuthRunner { calls: std::sync::Mutex::new(Vec::new()) };
+        let runner = CandidateAuthRunner {
+            calls: std::sync::Mutex::new(Vec::new()),
+        };
         let paths = ClusterDeckPaths::at(std::env::temp_dir().join("candidate-auth-test"));
         let fetched = fetch_remote_kubeconfig_content(
-            &runner, &paths, &profile, host, "/etc/kubernetes/admin.conf", Some("test-password"),
-        ).await.unwrap();
+            &runner,
+            &paths,
+            &profile,
+            host,
+            "/etc/kubernetes/admin.conf",
+            Some("test-password"),
+        )
+        .await
+        .unwrap();
         assert_eq!(fetched, SAMPLE);
         let calls = runner.calls.lock().unwrap();
         assert_eq!(calls.len(), 2);
@@ -2445,9 +2460,9 @@ users:
         let placeholder = generate_default_kubeconfig(&profile).unwrap();
         std::fs::write(paths.kubeconfig_file(&profile.id), placeholder).unwrap();
         let user_config = temp_dir.join("user-config");
-        let err = merge_profile_kubeconfig_to_file(
-            &paths, &profile.id, &user_config, None, false,
-        ).await.unwrap_err();
+        let err = merge_profile_kubeconfig_to_file(&paths, &profile.id, &user_config, None, false)
+            .await
+            .unwrap_err();
         assert!(err.contains("no authentication configuration"));
         assert!(!user_config.exists());
         std::fs::remove_dir_all(&temp_dir).ok();
