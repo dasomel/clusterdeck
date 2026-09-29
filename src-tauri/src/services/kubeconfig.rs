@@ -37,6 +37,54 @@ pub fn is_valid_kubeconfig_yaml(content: &str) -> bool {
     }
 }
 
+/// Candidate selection needs more than YAML shape: a placeholder with `user: {}` cannot
+/// authenticate, and normalizing it would hide a usable kubeconfig at a later path.
+fn validate_fetched_kubeconfig(content: &str) -> Result<(), &'static str> {
+    if !is_valid_kubeconfig_yaml(content) {
+        return Err("not a kubeconfig document");
+    }
+    let val: serde_yaml::Value = serde_yaml::from_str(content).map_err(|_| "invalid YAML")?;
+    let clusters = val["clusters"].as_sequence().ok_or("missing clusters")?;
+    let contexts = val["contexts"].as_sequence().ok_or("missing contexts")?;
+    let users = val["users"].as_sequence().ok_or("missing users")?;
+    if clusters.len() != 1 || contexts.len() != 1 || users.len() != 1 {
+        return Err("expected one cluster, context and user");
+    }
+    let cluster_name = clusters[0]["name"].as_str().ok_or("cluster has no name")?;
+    let user_name = users[0]["name"].as_str().ok_or("user has no name")?;
+    let context_name = contexts[0]["name"].as_str().ok_or("context has no name")?;
+    if val["current-context"].as_str() != Some(context_name)
+        || contexts[0]["context"]["cluster"].as_str() != Some(cluster_name)
+        || contexts[0]["context"]["user"].as_str() != Some(user_name)
+    {
+        return Err("current context does not reference the cluster and user");
+    }
+    if clusters[0]["cluster"]["server"]
+        .as_str()
+        .is_none_or(|server| server.trim().is_empty())
+    {
+        return Err("cluster has no API server");
+    }
+    let user = &users[0]["user"];
+    let present = |key: &str| {
+        user.get(key).is_some_and(|v| {
+            v.as_str().is_some_and(|s| !s.trim().is_empty())
+                || v.as_mapping().is_some_and(|m| !m.is_empty())
+        })
+    };
+    if !(present("token")
+        || present("tokenFile")
+        || (present("username") && present("password"))
+        || (present("client-certificate-data") && present("client-key-data"))
+        || (present("client-certificate") && present("client-key"))
+        || present("exec")
+        || present("auth-provider"))
+    {
+        return Err("referenced user has no authentication configuration");
+    }
+    Ok(())
+}
+
 /// Reads `path`, parses it as YAML, and returns its `current-context` value. Returns `None` on
 /// any I/O/parse failure or when the field is absent or empty, so callers can fall back.
 pub fn read_current_context(path: &std::path::Path) -> Option<String> {
@@ -261,6 +309,7 @@ async fn fetch_remote_kubeconfig_content(
     };
 
     let mut last_ssh_err = String::new();
+    let mut rejected_candidate = None;
     let tried_paths: Vec<&str> = candidates.clone();
     for candidate in candidates {
         let read_cmd = build_candidate_read_cmd(candidate);
@@ -319,8 +368,11 @@ async fn fetch_remote_kubeconfig_content(
 
         match ssh_output {
             Ok(out) => {
-                if out.success && is_valid_kubeconfig_yaml(&out.stdout) {
-                    return Ok(out.stdout);
+                if out.success {
+                    match validate_fetched_kubeconfig(&out.stdout) {
+                        Ok(()) => return Ok(out.stdout),
+                        Err(reason) => rejected_candidate = Some(format!("{candidate}: {reason}")),
+                    }
                 } else if !out.stderr.is_empty() {
                     last_ssh_err = out.stderr;
                     // Stop trying further candidate paths on an auth failure: each retry is
@@ -338,8 +390,11 @@ async fn fetch_remote_kubeconfig_content(
         }
     }
 
+    let rejection = rejected_candidate
+        .map(|reason| format!("; rejected candidate: {reason}"))
+        .unwrap_or_default();
     Err(format!(
-        "kubeconfig fetch failed after trying {} candidate path(s) ({}); last error: {last_ssh_err}",
+        "kubeconfig fetch failed after trying {} candidate path(s) ({}); last error: {last_ssh_err}{rejection}. Check remote_path and remote read permissions (passwordless sudo or a user-readable kubeconfig)",
         tried_paths.len(),
         tried_paths.join(", ")
     ))
@@ -1219,6 +1274,8 @@ pub async fn merge_profile_kubeconfig_to_file(
     if !is_valid_kubeconfig_yaml(&profile_raw) {
         return Err("Profile kubeconfig is not valid YAML".to_string());
     }
+    validate_fetched_kubeconfig(&profile_raw)
+        .map_err(|reason| format!("Profile kubeconfig is not ready to merge: {reason}. Run Connect / Sync first"))?;
 
     let mut backup_result = None;
     if backup_first && user_config_path.exists() {
@@ -1360,6 +1417,65 @@ users:
                 .unwrap(),
             "ZmFrZS1jYQ=="
         );
+    }
+
+    #[test]
+    fn fetch_validation_rejects_placeholder_and_accepts_credentials() {
+        let placeholder = SAMPLE.replace(
+            "client-certificate-data: ZmFrZS1jZXJ0\n      client-key-data: ZmFrZS1rZXk=",
+            "{}",
+        );
+        assert!(is_valid_kubeconfig_yaml(&placeholder));
+        assert_eq!(
+            validate_fetched_kubeconfig(&placeholder),
+            Err("referenced user has no authentication configuration")
+        );
+        assert!(validate_fetched_kubeconfig(SAMPLE).is_ok());
+        assert!(validate_fetched_kubeconfig(&SAMPLE.replace(
+            "client-certificate-data: ZmFrZS1jZXJ0\n      client-key-data: ZmFrZS1rZXk=",
+            "token: test-token",
+        )).is_ok());
+        assert_eq!(
+            validate_fetched_kubeconfig(&SAMPLE.replace("user: original-user", "user: missing")),
+            Err("current context does not reference the cluster and user")
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_skips_unauthenticated_candidate_and_uses_next_path() {
+        struct CandidateAuthRunner {
+            calls: std::sync::Mutex<Vec<String>>,
+        }
+        #[async_trait]
+        impl CommandRunner for CandidateAuthRunner {
+            async fn run(&self, bin: &str, args: &[String]) -> Result<CommandOutput, String> {
+                assert_eq!(bin, "ssh");
+                let cmd = args.last().unwrap().clone();
+                let mut calls = self.calls.lock().unwrap();
+                calls.push(cmd);
+                let stdout = if calls.len() == 1 {
+                    SAMPLE.replace(
+                        "client-certificate-data: ZmFrZS1jZXJ0\n      client-key-data: ZmFrZS1rZXk=",
+                        "{}",
+                    )
+                } else {
+                    SAMPLE.to_string()
+                };
+                Ok(CommandOutput { stdout, stderr: String::new(), success: true })
+            }
+        }
+        let profile = password_auth_profile("candidate-auth");
+        let host = &profile.hosts[0];
+        let runner = CandidateAuthRunner { calls: std::sync::Mutex::new(Vec::new()) };
+        let paths = ClusterDeckPaths::at(std::env::temp_dir().join("candidate-auth-test"));
+        let fetched = fetch_remote_kubeconfig_content(
+            &runner, &paths, &profile, host, "/etc/kubernetes/admin.conf", Some("test-password"),
+        ).await.unwrap();
+        assert_eq!(fetched, SAMPLE);
+        let calls = runner.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert!(calls[0].contains("/etc/kubernetes/admin.conf"));
+        assert!(calls[1].contains("/etc/rancher/k3s/k3s.yaml"));
     }
 
     #[test]
@@ -2315,6 +2431,26 @@ users:
         ) -> Result<CommandOutput, String> {
             Err("dummy runner does not run commands".to_string())
         }
+    }
+
+    #[tokio::test]
+    async fn merge_rejects_placeholder_without_touching_user_config() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "clusterdeck-merge-placeholder-{}",
+            std::process::id()
+        ));
+        let paths = ClusterDeckPaths::at(temp_dir.clone());
+        paths.ensure_dirs().unwrap();
+        let profile = password_auth_profile("placeholder-merge");
+        let placeholder = generate_default_kubeconfig(&profile).unwrap();
+        std::fs::write(paths.kubeconfig_file(&profile.id), placeholder).unwrap();
+        let user_config = temp_dir.join("user-config");
+        let err = merge_profile_kubeconfig_to_file(
+            &paths, &profile.id, &user_config, None, false,
+        ).await.unwrap_err();
+        assert!(err.contains("no authentication configuration"));
+        assert!(!user_config.exists());
+        std::fs::remove_dir_all(&temp_dir).ok();
     }
 
     #[tokio::test]
