@@ -774,7 +774,19 @@ h2 {
 .modal-footer-actions {
   display: flex;
   justify-content: flex-end;
+  align-items: center;
   gap: 10px;
+}
+
+/* .secondary-button's sidebar defaults (margin-top, full width) would otherwise make the row
+   taller than Cancel and stretch Save to match; give both buttons one shared size here. */
+.modal-footer-actions .secondary-button,
+.modal-footer-actions .primary-button {
+  margin-top: 0;
+  width: auto;
+  padding: 7px 14px;
+  border-radius: 8px;
+  font-size: 12px;
 }
 
 .form-error {
