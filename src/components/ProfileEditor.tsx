@@ -7,6 +7,7 @@ import {
   type Bastion,
   type LocalKubeContext,
   type DiscoveredLocalHost,
+  type LocalRuntimeSource,
 } from '../api/tauri';
 
 export type ProfileEditorProps = {
@@ -24,6 +25,14 @@ const deriveBaseId = (provider: string, projectName: string) =>
 
 const deriveFormattedName = (provider: string, projectName: string) =>
   projectName === 'default' ? `${provider} Local` : `${projectName} (${provider})`;
+
+const toLocalRuntimeSource = (host: DiscoveredLocalHost): LocalRuntimeSource | null => {
+  if (host.provider !== 'Colima' && host.provider !== 'Lima') return null;
+  return {
+    provider: host.provider.toLowerCase() as LocalRuntimeSource['provider'],
+    instance: host.instance_name,
+  };
+};
 
 export default function ProfileEditor({ initial, onClose, onSaved, onDeleteRequest }: ProfileEditorProps) {
   const isEditing = initial !== null;
@@ -66,6 +75,9 @@ export default function ProfileEditor({ initial, onClose, onSaved, onDeleteReque
 
   const [manageHostsFile, setManageHostsFile] = useState(
     initial?.manage_hosts_file ?? false
+  );
+  const [localRuntime, setLocalRuntime] = useState<LocalRuntimeSource | null>(
+    initial?.local_runtime ?? null
   );
 
   const [localKubeContexts, setLocalKubeContexts] = useState<LocalKubeContext[] | null>(null);
@@ -114,6 +126,8 @@ export default function ProfileEditor({ initial, onClose, onSaved, onDeleteReque
   const applyDetectedHost = (detected: DiscoveredLocalHost) => {
     const projectName = deriveProjectName(detected);
 
+    setLocalRuntime(toLocalRuntimeSource(detected));
+
     if (!id.trim()) {
       setId(deriveBaseId(detected.provider, projectName));
     }
@@ -153,6 +167,7 @@ export default function ProfileEditor({ initial, onClose, onSaved, onDeleteReque
   const applyAllFromGroup = (items: DiscoveredLocalHost[]) => {
     if (items.length === 0) return;
     const first = items[0];
+    setLocalRuntime(toLocalRuntimeSource(first));
     const projectName = deriveProjectName(first);
 
     if (!id.trim()) {
@@ -344,6 +359,7 @@ export default function ProfileEditor({ initial, onClose, onSaved, onDeleteReque
         : null,
       manage_hosts_file: manageHostsFile,
       trusted_cas: initial?.trusted_cas ?? [],
+      local_runtime: localRuntime,
     };
 
     try {
@@ -688,6 +704,11 @@ export default function ProfileEditor({ initial, onClose, onSaved, onDeleteReque
 
             {useKubeconfig && (
               <div className="form-group-stack" style={{ marginTop: '8px' }}>
+                {localRuntime && (
+                  <p className="form-helper">
+                    This profile's SSH address and port are re-detected from {localRuntime.provider === 'colima' ? 'Colima' : 'Lima'} before each connection, so they stay correct after a VM restart.
+                  </p>
+                )}
                 <div className="grid-two-fields">
                   <div className="form-group">
                     <label className="form-label">Remote Path *</label>

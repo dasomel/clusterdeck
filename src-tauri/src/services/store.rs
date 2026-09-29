@@ -3,7 +3,9 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-use crate::services::config::{Bastion, BootstrapPolicy, Host, KubeconfigSource, Profile};
+use crate::services::config::{
+    Bastion, BootstrapPolicy, Host, KubeconfigSource, LocalRuntimeSource, Profile,
+};
 use crate::services::paths::ClusterDeckPaths;
 
 #[derive(Serialize, Deserialize, Default)]
@@ -27,6 +29,8 @@ struct ProfileBody {
     manage_hosts_file: bool,
     #[serde(default)]
     trusted_cas: Vec<crate::services::ca_trust::TrustedCa>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    local_runtime: Option<LocalRuntimeSource>,
 }
 
 pub fn load_profiles(paths: &ClusterDeckPaths) -> Result<Vec<Profile>, String> {
@@ -49,6 +53,7 @@ pub fn load_profiles(paths: &ClusterDeckPaths) -> Result<Vec<Profile>, String> {
                 kubeconfig: body.kubeconfig,
                 manage_hosts_file: body.manage_hosts_file,
                 trusted_cas: body.trusted_cas,
+                local_runtime: body.local_runtime,
             };
             match crate::services::validate::validate_profile(&profile) {
                 Ok(()) => Some(profile),
@@ -83,6 +88,7 @@ pub fn save_profiles(paths: &ClusterDeckPaths, profiles: &[Profile]) -> Result<(
                 kubeconfig: p.kubeconfig.clone(),
                 manage_hosts_file: p.manage_hosts_file,
                 trusted_cas: p.trusted_cas.clone(),
+                local_runtime: p.local_runtime.clone(),
             },
         );
     }
@@ -169,6 +175,7 @@ mod tests {
             kubeconfig: None,
             manage_hosts_file: true,
             trusted_cas: Vec::new(),
+            local_runtime: None,
         };
         upsert_profile(&paths, profile.clone()).unwrap();
         let loaded = get_profile(&paths, "cka").unwrap();
@@ -189,6 +196,7 @@ mod tests {
             kubeconfig: None,
             manage_hosts_file: false,
             trusted_cas: Vec::new(),
+            local_runtime: None,
         };
         upsert_profile(&paths, profile).unwrap();
         delete_profile(&paths, "x").unwrap();
@@ -235,6 +243,7 @@ profiles:
             kubeconfig: None,
             manage_hosts_file: false,
             trusted_cas: Vec::new(),
+            local_runtime: None,
         };
         assert!(upsert_profile(&paths, profile).is_err());
     }
@@ -259,6 +268,7 @@ profiles:
                 not_after: "Sep 18 05:40:47 2036 GMT".into(),
                 trusted_at: "2026-09-21T00:00:00+00:00".into(),
             }],
+            local_runtime: None,
         };
         upsert_profile(&paths, profile.clone()).unwrap();
         let loaded = get_profile(&paths, "cka").unwrap();
@@ -311,6 +321,7 @@ profiles:
             kubeconfig: None,
             manage_hosts_file: false,
             trusted_cas: Vec::new(),
+            local_runtime: None,
         };
         upsert_profile(&paths, other).unwrap();
 
@@ -341,6 +352,7 @@ profiles:
             }),
             manage_hosts_file: false,
             trusted_cas: Vec::new(),
+            local_runtime: None,
         };
         assert!(
             upsert_profile(&paths, profile.clone()).is_ok(),
@@ -370,5 +382,53 @@ profiles:
         let loaded = load_profiles(&paths).unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].trusted_cas.len(), 0);
+    }
+
+    #[test]
+    fn load_profiles_defaults_local_runtime_to_none_when_field_absent_from_yaml() {
+        let paths = temp_paths("local-runtime-default");
+        if let Some(parent) = paths.profiles_file().parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        // Simulates profiles.yaml persisted before local_runtime existed (Issue: stale
+        // Colima/Lima SSH port after VM restart).
+        let yaml = r#"
+profiles:
+  legacy:
+    name: "Legacy"
+    hosts: []
+    manage_hosts_file: false
+"#;
+        std::fs::write(paths.profiles_file(), yaml).unwrap();
+        let loaded = load_profiles(&paths).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert!(loaded[0].local_runtime.is_none());
+    }
+
+    #[test]
+    fn upsert_then_load_roundtrips_local_runtime() {
+        let paths = temp_paths("local-runtime-roundtrip");
+        let profile = Profile {
+            id: "colima-default".into(),
+            name: "Colima Local".into(),
+            hosts: vec![],
+            bastion: None,
+            bootstrap: BootstrapPolicy::default(),
+            kubeconfig: None,
+            manage_hosts_file: false,
+            trusted_cas: Vec::new(),
+            local_runtime: Some(LocalRuntimeSource {
+                provider: crate::services::local_runtime_lifecycle::LocalRuntimeProvider::Colima,
+                instance: "default".into(),
+            }),
+        };
+        upsert_profile(&paths, profile).unwrap();
+        let loaded = get_profile(&paths, "colima-default").unwrap();
+        let local_runtime = loaded.local_runtime.expect("local_runtime must round-trip");
+        assert_eq!(
+            local_runtime.provider,
+            crate::services::local_runtime_lifecycle::LocalRuntimeProvider::Colima
+        );
+        assert_eq!(local_runtime.instance, "default");
     }
 }
