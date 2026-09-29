@@ -1451,7 +1451,7 @@ users:
         #[async_trait]
         impl CommandRunner for CandidateAuthRunner {
             async fn run(&self, bin: &str, args: &[String]) -> Result<CommandOutput, String> {
-                assert_eq!(bin, "ssh");
+                assert_eq!(bin, "sshpass");
                 let cmd = args.last().unwrap().clone();
                 let mut calls = self.calls.lock().unwrap();
                 calls.push(cmd);
