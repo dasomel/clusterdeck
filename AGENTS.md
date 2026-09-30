@@ -74,7 +74,6 @@ When code changes affect a critical path (SSH argv construction, `/etc/hosts` or
 
 ## Coding Guidance
 
-- Follow existing formatter/linter and naming conventions rather than inventing universal style rules.
 - Comments explain why, invariants, hazards, or compatibility constraints; do not narrate obvious code.
 - Preserve Rust/native boundaries instead of leaking low-level filesystem/process/network details into React.
 - Prefer a domain enum/type over boolean flags when the states have meaningful semantics.
@@ -92,7 +91,6 @@ Activity is not progress. Do not keep patching when the work is no longer conver
 ## GitHub Workflow
 
 - Use Issues for requirements, bugs, architecture, security, and implementation scope.
-- Use short-lived branches.
 - Use focused PRs linked to Issues.
 - Do not merge a change that bypasses known security or test failures without a documented decision.
 
