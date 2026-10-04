@@ -1,0 +1,32 @@
+{
+  "schemaVersion": "openforge-agent-skill-verification/v1",
+  "skill": "clusterdeck-connection-workflow",
+  "skillVersion": "1",
+  "freshSession": true,
+  "agentRuntime": "claude-sonnet-5-5 (Claude Code subagent)",
+  "happyPath": {
+    "status": "pass",
+    "summary": "Fresh-session replay (dasomel/openforge#54, 2026-10-04) selected the skill from its description, then audited every SSH invocation site against the Workflow: CommandRunner is the only production process site, push_connection_options carries StrictHostKeyChecking=accept-new on all three ssh.rs paths, and the kubeconfig.rs BatchMode site inherits it from the generated -F config. The real local ssh binary tests (--ignored) passed. No source change was needed, so nothing was reverted.",
+    "evidence": [
+      "research/issue-54-clusterdeck-connection-workflow-replay-2026-10-04.md#step-2-happy-path-scratch-only"
+    ]
+  },
+  "edgeCase": {
+    "status": "pass",
+    "summary": "Removed StrictHostKeyChecking=accept-new from push_connection_options in ssh.rs; the repository's own unit tests failed with a real nonzero exit (3 failed, cargo exit 101), then the change was reverted and the suite passed again (222 passed, exit 0).",
+    "evidence": [
+      "research/issue-54-clusterdeck-connection-workflow-replay-2026-10-04.md#step-3-failureedge-case-real-project-specific-hazard"
+    ]
+  },
+  "deterministicChecks": [
+    { "command": "make verify", "status": "pass" },
+    { "command": "cd src-tauri && cargo test --all-targets --all-features", "status": "pass" },
+    { "command": "cd src-tauri && cargo test --all-features -- --ignored real_process_receives real_ssh_binary_parses", "status": "pass" }
+  ],
+  "unverified": [
+    "No real SSH/k3s/Kubernetes target was available, so no live connect/bootstrap/kubeconfig-fetch evidence was gathered; only the local ssh binary argv/config-parse tests ran.",
+    "The ca_trust real-keychain ignored test was not run, and the ignored real-process ssh test was not re-run under the mutation.",
+    "Activation was assessed in a single-skill repository, so it does not show the skill winning against similar skills."
+  ],
+  "verifiedAt": "2026-10-04"
+}
