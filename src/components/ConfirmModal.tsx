@@ -1,3 +1,4 @@
+import { useEffect, useRef, type KeyboardEvent } from 'react';
 import { AlertTriangle, RefreshCw, X } from 'lucide-react';
 
 type ConfirmModalProps = {
@@ -21,59 +22,89 @@ export default function ConfirmModal({
   onConfirm,
   onCancel,
 }: ConfirmModalProps) {
+  const cancelButtonRef = useRef<HTMLButtonElement>(null);
+  const dialogRef = useRef<HTMLDivElement>(null);
+
+  // Esc key closes modal; danger actions focus Cancel button initially
+  useEffect(() => {
+    cancelButtonRef.current?.focus();
+
+    const handleKeyDown = (e: globalThis.KeyboardEvent) => {
+      if (e.key === 'Escape' && !busy) {
+        e.preventDefault();
+        onCancel();
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [busy, onCancel]);
+
+  // Focus trap inside the modal dialog
+  const handleDialogKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
+    if (e.key !== 'Tab') return;
+    const focusable = dialogRef.current?.querySelectorAll<HTMLElement>(
+      'button:not([disabled]), [tabindex]:not([tabindex="-1"])',
+    );
+    if (!focusable || focusable.length === 0) return;
+
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+
+    if (e.shiftKey && document.activeElement === first) {
+      e.preventDefault();
+      last?.focus();
+    } else if (!e.shiftKey && document.activeElement === last) {
+      e.preventDefault();
+      first?.focus();
+    }
+  };
+
   return (
     <div
-      style={{
-        position: 'fixed',
-        inset: 0,
-        backgroundColor: 'rgba(0, 0, 0, 0.55)',
-        backdropFilter: 'blur(3px)',
-        display: 'flex',
-        alignItems: 'center',
-        justifyContent: 'center',
-        zIndex: 9999,
+      className="modal-overlay"
+      onClick={() => {
+        if (!busy) onCancel();
       }}
-      onClick={onCancel}
     >
       <div
-        className="panel-card"
-        style={{
-          width: '420px',
-          maxWidth: '90vw',
-          padding: '22px 24px',
-          backgroundColor: 'var(--bg-elevated)',
-          boxShadow: 'var(--shadow-card)',
-          borderRadius: '12px',
-          border: '1px solid var(--border-strong)',
-        }}
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="confirm-modal-title"
+        className="modal-dialog"
         onClick={(e) => e.stopPropagation()}
+        onKeyDown={handleDialogKeyDown}
       >
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '14px' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+        <div className="modal-header" style={{ padding: '0 0 var(--space-3)' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-2)' }}>
             <AlertTriangle size={18} style={{ color: isDanger ? 'var(--danger)' : 'var(--accent)' }} />
-            <h3 style={{ margin: 0, fontSize: '15px', fontWeight: 700, color: 'var(--text-primary)' }}>{title}</h3>
+            <h3 id="confirm-modal-title" style={{ margin: 0, fontSize: 'var(--fs-lg)', fontWeight: 600, color: 'var(--text-primary)' }}>
+              {title}
+            </h3>
           </div>
           <button
             type="button"
             className="icon-button"
-            style={{ width: '26px', height: '26px', padding: 0 }}
+            style={{ width: '26px', height: '26px' }}
             onClick={onCancel}
             disabled={busy}
             title="Cancel"
+            aria-label="Cancel"
           >
             <X size={15} />
           </button>
         </div>
 
-        <p style={{ fontSize: '13px', color: 'var(--text-secondary)', lineHeight: '1.5', margin: '0 0 20px' }}>
+        <p style={{ fontSize: 'var(--fs-md)', color: 'var(--text-secondary)', lineHeight: 'var(--lh-body)', margin: 'var(--space-3) 0 var(--space-5)' }}>
           {message}
         </p>
 
-        <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '8px' }}>
+        <div className="modal-footer-actions">
           <button
+            ref={cancelButtonRef}
             type="button"
-            className="secondary-button"
-            style={{ width: 'auto', marginTop: 0, padding: '7px 14px', fontSize: '12px' }}
+            className="secondary-button compact-btn"
             onClick={onCancel}
             disabled={busy}
           >
@@ -81,18 +112,7 @@ export default function ConfirmModal({
           </button>
           <button
             type="button"
-            className="primary-button"
-            style={{
-              width: 'auto',
-              backgroundColor: isDanger ? 'var(--danger)' : 'var(--accent)',
-              borderColor: isDanger ? 'var(--danger)' : 'var(--accent)',
-              color: '#fff',
-              padding: '7px 16px',
-              fontSize: '12px',
-              display: 'inline-flex',
-              alignItems: 'center',
-              gap: '6px',
-            }}
+            className={`${isDanger ? 'danger-button' : 'primary-button'} compact-btn`}
             onClick={onConfirm}
             disabled={busy}
           >

@@ -14,7 +14,10 @@ type StatusBannerProps = {
 
 export default function StatusBanner({ message, onDismiss }: StatusBannerProps) {
   return (
-    <section className={`status-banner ${message.type}`}>
+    <section
+      className={`status-banner ${message.type}`}
+      role={message.type === 'error' ? 'alert' : 'status'}
+    >
       <div className="status-banner-header">
         <div className="status-banner-title">
           {message.type === 'success' && <CheckCircle2 size={16} className="status-ok" />}
@@ -28,6 +31,7 @@ export default function StatusBanner({ message, onDismiss }: StatusBannerProps) 
             type="button"
             className="status-banner-close"
             title="Dismiss"
+            aria-label="Dismiss"
             onClick={onDismiss}
           >
             <X size={14} />

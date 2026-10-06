@@ -1,209 +1,30 @@
 import { invoke } from '@tauri-apps/api/core';
+import type {
+  BackupKubeconfigResult,
+  ConnectionResult,
+  DiscoveredCaView,
+  DiscoveredEndpoint,
+  DiscoveredHost,
+  DiscoveredLocalHost,
+  EnvironmentProfileResult,
+  HostStageResult,
+  HostsFileStatus,
+  Inventory,
+  KubeconfigBackupInfo,
+  KubeconfigSummary,
+  LifecycleActionResult,
+  LocalKubeContext,
+  LocalRuntimeLifecycleProvider,
+  ManagedProfileKubeconfig,
+  MergeKubeconfigResult,
+  Profile,
+  SyncHostsResult,
+  TrustedCa,
+  UserKubeconfigDetails,
+  VerificationResult,
+} from './types';
 
-export type AuthMode = 'key' | 'password';
-
-export type Host = {
-  name: string;
-  address: string;
-  port: number;
-  user: string;
-  identity_file: string | null;
-  auth: AuthMode;
-};
-
-export type Bastion = {
-  name: string;
-  address: string;
-  port: number;
-  user: string;
-  identity_file: string | null;
-};
-
-export type BootstrapPolicy = {
-  enabled: boolean;
-  retries: number;
-  retry_delay_secs: number;
-};
-
-export type KubeconfigSource = {
-  remote_path: string;
-  control_plane: string;
-  local_path: string;
-  context: string;
-};
-
-export type LocalRuntimeSource = {
-  provider: 'colima' | 'lima';
-  instance: string;
-};
-
-export type Profile = {
-  id: string;
-  name: string;
-  hosts: Host[];
-  bastion: Bastion | null;
-  bootstrap: BootstrapPolicy;
-  kubeconfig: KubeconfigSource | null;
-  manage_hosts_file: boolean;
-  trusted_cas: TrustedCa[];
-  local_runtime?: LocalRuntimeSource | null;
-};
-
-export type HostStageResult = { host: string; reachable: boolean; detail: string };
-
-export type BootstrapResult = { host: string; key_deployed: boolean; verified: boolean; detail: string };
-
-export type KubeconfigSummary = { cluster_name: string; context_name: string; local_path: string };
-
-export type VerificationResult = {
-  ssh: boolean;
-  kubeconfig: boolean;
-  kubernetes: boolean;
-  node_count: number | null;
-  kubernetes_version: string | null;
-  api_endpoint: string | null;
-  last_verified: string | null;
-};
-
-export type DiscoveredEndpoint = {
-  host: string;
-  ip: string;
-  source: string;
-  resource_name: string;
-};
-
-export type CaTrustStatus = 'new' | 'trusted' | 'rotated';
-
-export type DiscoveredCaView = {
-  secret_ref: string;
-  source_hosts: string[];
-  subject_cn: string;
-  not_after: string;
-  fingerprint_sha256: string;
-  status: CaTrustStatus;
-  warnings: string[];
-};
-
-export type TrustedCa = {
-  secret_ref: string;
-  fingerprint_sha256: string;
-  fingerprint_sha1: string;
-  subject_cn: string;
-  not_after: string;
-  trusted_at: string;
-};
-
-export type ConnectionResult = {
-  hosts: HostStageResult[];
-  aliases_written: boolean;
-  kubeconfig: KubeconfigSummary | null;
-  verification: VerificationResult;
-  endpoints: DiscoveredEndpoint[];
-  errors: string[];
-};
-
-export type SyncHostsResult = {
-  success: boolean;
-  endpoints_count: number;
-  hosts_count: number;
-  endpoints: DiscoveredEndpoint[];
-  message: string;
-};
-
-export type DiscoveredHost = { address: string; ssh_open: boolean };
-
-export type LocalKubeContext = {
-  context_name: string;
-  cluster_name: string;
-  user_name: string;
-  server: string;
-};
-
-export type DiscoveredLocalHost = {
-  provider: string;
-  instance_name: string;
-  status: string;
-  host_name: string;
-  address: string;
-  port: number;
-  user: string;
-  identity_file: string | null;
-  runtime: string | null;
-  kube_context: string | null;
-  kube_remote_path: string | null;
-  arch: string | null;
-  cpus: number | null;
-  memory_bytes: number | null;
-  disk_bytes: number | null;
-  docker_context: string | null;
-};
-
-export type BackupKubeconfigResult = {
-  backed_up: boolean;
-  backup_path: string | null;
-  message: string;
-};
-
-export type MergeKubeconfigResult = {
-  success: boolean;
-  target_path: string;
-  context_name: string;
-  clusters_count: number;
-  contexts_count: number;
-  backup: BackupKubeconfigResult | null;
-  message: string;
-};
-
-export type KubeconfigBackupInfo = {
-  filename: string;
-  path: string;
-  size_bytes: number;
-  modified_at: string;
-};
-
-export type KubeContextInfo = {
-  name: string;
-  cluster: string;
-  user: string;
-  server: string;
-  is_current: boolean;
-};
-
-export type UserKubeconfigDetails = {
-  path: string;
-  exists: boolean;
-  size_bytes: number;
-  current_context: string | null;
-  contexts: KubeContextInfo[];
-  raw_yaml: string | null;
-};
-
-export type ManagedProfileKubeconfig = {
-  profile_id: string;
-  profile_name: string;
-  path: string;
-  exists: boolean;
-  size_bytes: number;
-  current_context: string | null;
-  server: string | null;
-};
-
-export type HostsFileStatus = {
-  managed_by_profile: boolean;
-  is_synced: boolean;
-  active_entries: string[];
-  pending_entries: string[];
-};
-
-// Only "colima" | "lima" — Phase 2 lifecycle actions (start/stop/restart/shell/context) do not
-// cover Vagrant, even though `DiscoveredLocalHost.provider` also reports "Vagrant" for the
-// read-only discovery panel.
-export type LocalRuntimeLifecycleProvider = 'colima' | 'lima';
-
-export type LifecycleActionResult = {
-  success: boolean;
-  message: string;
-};
+export * from './types';
 
 export const api = {
   listProfiles: () => invoke<Profile[]>('list_profiles'),
@@ -213,7 +34,8 @@ export const api = {
   discoverHosts: (input: string, port?: number) => invoke<DiscoveredHost[]>('discover_hosts', { input, port }),
   probeProfileHosts: (profileId: string, password?: string) =>
     invoke<HostStageResult[]>('probe_profile_hosts', { profileId, password }),
-  bootstrapProfile: (profileId: string, password: string) => invoke<BootstrapResult[]>('bootstrap_profile', { profileId, password }),
+  bootstrapProfile: (profileId: string, password: string) =>
+    invoke<{ host: string; key_deployed: boolean; verified: boolean; detail: string }[]>('bootstrap_profile', { profileId, password }),
   generateAliases: (profileId: string) => invoke<void>('generate_aliases', { profileId }),
   fetchKubeconfig: (profileId: string, password?: string) =>
     invoke<KubeconfigSummary>('fetch_kubeconfig', { profileId, password }),
@@ -270,4 +92,9 @@ export const api = {
     invoke<TrustedCa>('replace_ca_cmd', { profileId, secretRef }),
   removeCa: (profileId: string, secretRef: string) =>
     invoke<void>('remove_ca_cmd', { profileId, secretRef }),
+  // Inventory commands (Step 7)
+  discoverInventory: (demo: boolean) =>
+    invoke<Inventory>('discover_inventory', { demo }),
+  createProfileFromEnvironment: (environment: string) =>
+    invoke<EnvironmentProfileResult>('create_profile_from_environment', { environment }),
 };
