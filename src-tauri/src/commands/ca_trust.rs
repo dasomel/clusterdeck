@@ -65,22 +65,24 @@ pub async fn discover_cluster_cas_cmd(
         .collect())
 }
 
-#[tauri::command]
-pub async fn trust_ca_cmd(profile_id: String, secret_ref: String) -> Result<TrustedCa, String> {
-    let paths = ClusterDeckPaths::resolve()?;
-    let mut profile = store::get_profile(&paths, &profile_id)?;
-    let runner = SystemRunner;
-    let kubeconfig_path = paths.kubeconfig_file(&profile_id);
+async fn trust_ca_internal(
+    paths: &ClusterDeckPaths,
+    runner: &SystemRunner,
+    profile_id: &str,
+    secret_ref: &str,
+) -> Result<TrustedCa, String> {
+    let mut profile = store::get_profile(paths, profile_id)?;
+    let kubeconfig_path = paths.kubeconfig_file(profile_id);
     if !kubeconfig_path.exists() {
         return Err("kubeconfig not found for profile; please connect first".to_string());
     }
 
-    let (namespace, name) = split_secret_ref(&secret_ref)?;
-    let meta = ca_trust::fetch_ca(&runner, &kubeconfig_path, &namespace, &name).await?;
-    ca_trust::trust_ca(&runner, &meta.pem).await?;
+    let (namespace, name) = split_secret_ref(secret_ref)?;
+    let meta = ca_trust::fetch_ca(runner, &kubeconfig_path, &namespace, &name).await?;
+    ca_trust::trust_ca(runner, &meta.pem).await?;
 
     let record = TrustedCa {
-        secret_ref: secret_ref.clone(),
+        secret_ref: secret_ref.to_string(),
         fingerprint_sha256: meta.fingerprint_sha256,
         fingerprint_sha1: meta.fingerprint_sha1,
         subject_cn: meta.subject_cn,
@@ -91,13 +93,30 @@ pub async fn trust_ca_cmd(profile_id: String, secret_ref: String) -> Result<Trus
     // so re-confirming an already-Trusted CA (or completing a Rotated -> trust cycle) is safe.
     profile.trusted_cas.retain(|c| c.secret_ref != secret_ref);
     profile.trusted_cas.push(record.clone());
-    store::upsert_profile(&paths, profile)?;
+    store::upsert_profile(paths, profile)?;
 
     Ok(record)
 }
 
 #[tauri::command]
-pub async fn replace_ca_cmd(profile_id: String, secret_ref: String) -> Result<TrustedCa, String> {
+pub async fn trust_ca_cmd(
+    guard: tauri::State<'_, crate::services::store::ProfileWriteGuard>,
+    profile_id: String,
+    secret_ref: String,
+) -> Result<TrustedCa, String> {
+    let _lock = guard.lock().await;
+    let paths = ClusterDeckPaths::resolve()?;
+    let runner = SystemRunner;
+    trust_ca_internal(&paths, &runner, &profile_id, &secret_ref).await
+}
+
+#[tauri::command]
+pub async fn replace_ca_cmd(
+    guard: tauri::State<'_, crate::services::store::ProfileWriteGuard>,
+    profile_id: String,
+    secret_ref: String,
+) -> Result<TrustedCa, String> {
+    let _lock = guard.lock().await;
     let paths = ClusterDeckPaths::resolve()?;
     let profile = store::get_profile(&paths, &profile_id)?;
     let runner = SystemRunner;
@@ -120,7 +139,7 @@ pub async fn replace_ca_cmd(profile_id: String, secret_ref: String) -> Result<Tr
         let _ = ca_trust::untrust_ca(&runner, &old.fingerprint_sha1).await;
     }
 
-    match trust_ca_cmd(profile_id.clone(), secret_ref.clone()).await {
+    match trust_ca_internal(&paths, &runner, &profile_id, &secret_ref).await {
         Ok(record) => Ok(record),
         Err(e) => {
             // The old cert may already be out of the keychain (untrust above) while the new
@@ -137,7 +156,12 @@ pub async fn replace_ca_cmd(profile_id: String, secret_ref: String) -> Result<Tr
 }
 
 #[tauri::command]
-pub async fn remove_ca_cmd(profile_id: String, secret_ref: String) -> Result<(), String> {
+pub async fn remove_ca_cmd(
+    guard: tauri::State<'_, crate::services::store::ProfileWriteGuard>,
+    profile_id: String,
+    secret_ref: String,
+) -> Result<(), String> {
+    let _lock = guard.lock().await;
     let paths = ClusterDeckPaths::resolve()?;
     let mut profile = store::get_profile(&paths, &profile_id)?;
     let runner = SystemRunner;

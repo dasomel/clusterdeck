@@ -71,11 +71,31 @@ pub fn load_profiles(paths: &ClusterDeckPaths) -> Result<Vec<Profile>, String> {
     Ok(profiles)
 }
 
+static PROFILE_WRITE_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Process-wide mutual exclusion guard for writing to `profiles.yaml`.
+/// Registered as Tauri managed state (`lib.rs`'s `.manage(...)`) to serialize profile saves,
+/// deletes, inventory profile creations, and CA trust updates across commands.
+#[derive(Debug, Default, Clone)]
+pub struct ProfileWriteGuard;
+
+impl ProfileWriteGuard {
+    pub async fn lock(&self) -> tokio::sync::MutexGuard<'static, ()> {
+        PROFILE_WRITE_MUTEX.lock().await
+    }
+
+    pub async fn lock_process() -> tokio::sync::MutexGuard<'static, ()> {
+        PROFILE_WRITE_MUTEX.lock().await
+    }
+}
+
 pub fn save_profiles(paths: &ClusterDeckPaths, profiles: &[Profile]) -> Result<(), String> {
     let file_path = paths.profiles_file();
-    if let Some(parent) = file_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
+    let parent = file_path
+        .parent()
+        .ok_or_else(|| "invalid profiles file path: missing parent directory".to_string())?;
+    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+
     let mut map = BTreeMap::new();
     for p in profiles {
         map.insert(
@@ -94,7 +114,29 @@ pub fn save_profiles(paths: &ClusterDeckPaths, profiles: &[Profile]) -> Result<(
     }
     let file = ProfilesFile { profiles: map };
     let yaml = serde_yaml::to_string(&file).map_err(|e| e.to_string())?;
-    std::fs::write(&file_path, yaml).map_err(|e| e.to_string())?;
+
+    // Atomic write: write to a temporary file in the same directory, then rename to target path.
+    // Placing the tmp file in the same directory guarantees rename is atomic within the filesystem.
+    let rand_suffix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp_path = parent.join(format!(
+        ".profiles.yaml.tmp.{}.{}",
+        std::process::id(),
+        rand_suffix
+    ));
+
+    if let Err(err) = std::fs::write(&tmp_path, &yaml) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(err.to_string());
+    }
+
+    if let Err(err) = std::fs::rename(&tmp_path, &file_path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(err.to_string());
+    }
+
     Ok(())
 }
 
@@ -430,5 +472,89 @@ profiles:
             crate::services::local_runtime_lifecycle::LocalRuntimeProvider::Colima
         );
         assert_eq!(local_runtime.instance, "default");
+    }
+
+    fn sample_profile(id: &str) -> Profile {
+        Profile {
+            id: id.into(),
+            name: "Test Profile".into(),
+            hosts: vec![],
+            bastion: None,
+            bootstrap: BootstrapPolicy::default(),
+            kubeconfig: None,
+            manage_hosts_file: false,
+            trusted_cas: Vec::new(),
+            local_runtime: None,
+        }
+    }
+
+    #[test]
+    fn save_profiles_atomic_write_preserves_content_and_leaves_no_tmp_files() {
+        let paths = temp_paths("atomic-write-test");
+        let parent = paths.profiles_file().parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(&parent).unwrap();
+
+        let profile = sample_profile("atomic-p1");
+        save_profiles(&paths, std::slice::from_ref(&profile)).unwrap();
+
+        // 1. Target file exists and has valid content
+        let loaded = load_profiles(&paths).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, "atomic-p1");
+
+        // 2. No temporary file lingering in parent directory
+        let tmp_files: Vec<_> = std::fs::read_dir(&parent)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(".profiles.yaml.tmp.")
+            })
+            .collect();
+        assert!(
+            tmp_files.is_empty(),
+            "temporary write files must be cleaned up"
+        );
+
+        // 3. Atomically overwrite with second profile
+        let profile2 = sample_profile("atomic-p2");
+        save_profiles(&paths, &[profile, profile2]).unwrap();
+        let loaded2 = load_profiles(&paths).unwrap();
+        assert_eq!(loaded2.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn profile_write_guard_serializes_concurrent_writers() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let active_writers = Arc::new(AtomicUsize::new(0));
+        let max_concurrent = Arc::new(AtomicUsize::new(0));
+
+        let mut handles = Vec::new();
+        for _ in 0..10 {
+            let active = Arc::clone(&active_writers);
+            let max_c = Arc::clone(&max_concurrent);
+            handles.push(tokio::spawn(async move {
+                let guard = ProfileWriteGuard;
+                let _lock = guard.lock().await;
+
+                let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                max_c.fetch_max(current, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                active.fetch_sub(1, Ordering::SeqCst);
+            }));
+        }
+
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        assert_eq!(
+            max_concurrent.load(Ordering::SeqCst),
+            1,
+            "ProfileWriteGuard must allow only 1 concurrent writer"
+        );
     }
 }

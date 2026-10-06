@@ -29,13 +29,21 @@ fn save_profile_with_paths(paths: &ClusterDeckPaths, mut profile: Profile) -> Re
 }
 
 #[tauri::command]
-pub fn save_profile(profile: Profile) -> Result<(), String> {
+pub async fn save_profile(
+    guard: tauri::State<'_, crate::services::store::ProfileWriteGuard>,
+    profile: Profile,
+) -> Result<(), String> {
+    let _lock = guard.lock().await;
     let paths = ClusterDeckPaths::resolve()?;
     save_profile_with_paths(&paths, profile)
 }
 
 #[tauri::command]
-pub async fn delete_profile_cmd(profile_id: String) -> Result<(), String> {
+pub async fn delete_profile_cmd(
+    guard: tauri::State<'_, crate::services::store::ProfileWriteGuard>,
+    profile_id: String,
+) -> Result<(), String> {
+    let _lock = guard.lock().await;
     if !crate::services::validate::is_safe_profile_id(&profile_id) {
         return Err("invalid profile id".to_string());
     }

@@ -60,10 +60,62 @@ async fn load_profile_fresh(
     profile_id: &str,
 ) -> Result<Profile, String> {
     let mut profile = store::get_profile(paths, profile_id)?;
+    if profile.local_runtime.is_none() {
+        return Ok(profile);
+    }
+
+    let snapshot = profile.clone();
     if crate::services::local_runtime::refresh_local_runtime_endpoint(runner, &mut profile).await {
-        store::upsert_profile(paths, profile.clone())?;
+        // Re-acquire the write lock and reload fresh from disk before saving, so concurrent
+        // editor saves / CA trust updates are preserved, and deleted profiles are not resurrected.
+        let _lock = crate::services::store::ProfileWriteGuard::lock_process().await;
+        let mut fresh = store::get_profile(paths, profile_id)?;
+        if merge_refreshed_endpoints(&mut fresh, &snapshot, &profile) {
+            store::upsert_profile(paths, fresh.clone())?;
+        }
+        return Ok(fresh);
     }
     Ok(profile)
+}
+
+/// Copies onto `fresh` (re-read under the write lock) only the endpoint fields (address/port/
+/// identity_file) of hosts whose endpoint the refresh actually changed (`refreshed` vs the
+/// pre-detect `snapshot`), leaving every other host and field untouched so a concurrent edit
+/// survives. Hosts match by name; a lone host on both sides matches regardless of name (the
+/// refresh may have renamed it). If `local_runtime` was removed or changed since detection, the
+/// detected endpoint belongs to a different VM, so nothing is copied. Returns whether `fresh` changed.
+fn merge_refreshed_endpoints(fresh: &mut Profile, snapshot: &Profile, refreshed: &Profile) -> bool {
+    let same_source = match (&fresh.local_runtime, &snapshot.local_runtime) {
+        (Some(f), Some(s)) => f.provider == s.provider && f.instance == s.instance,
+        _ => false,
+    };
+    if !same_source {
+        return false;
+    }
+    let single = fresh.hosts.len() == 1 && snapshot.hosts.len() == 1;
+    let mut changed = false;
+    for (before, after) in snapshot.hosts.iter().zip(&refreshed.hosts) {
+        if before.address == after.address
+            && before.port == after.port
+            && before.identity_file == after.identity_file
+        {
+            continue;
+        }
+        let idx = fresh
+            .hosts
+            .iter()
+            .position(|h| h.name == before.name)
+            .or_else(|| single.then_some(0));
+        if let Some(h) = idx.map(|i| &mut fresh.hosts[i]) {
+            h.address = after.address.clone();
+            h.port = after.port;
+            if after.identity_file.is_some() {
+                h.identity_file = after.identity_file.clone();
+            }
+            changed = true;
+        }
+    }
+    changed
 }
 
 #[tauri::command]
@@ -820,5 +872,166 @@ mod tests {
         let reachable = compute_ssh_reachability(&runner, &profile, false).await;
         assert!(reachable);
         assert_eq!(runner.calls.load(Ordering::SeqCst), 1);
+    }
+
+    fn runtime() -> crate::services::config::LocalRuntimeSource {
+        crate::services::config::LocalRuntimeSource {
+            provider: crate::services::local_runtime_lifecycle::LocalRuntimeProvider::Colima,
+            instance: "default".to_string(),
+        }
+    }
+
+    #[test]
+    fn merge_refreshed_endpoints_touches_only_endpoint_fields() {
+        let mut snapshot = profile_with_hosts(vec![key_host("m1")]);
+        snapshot.local_runtime = Some(runtime());
+        let mut fresh = profile_with_hosts(vec![Host {
+            user: "edited".to_string(),
+            ..key_host("m1")
+        }]);
+        fresh.local_runtime = Some(runtime());
+        fresh.name = "Edited name".to_string();
+        fresh
+            .trusted_cas
+            .push(crate::services::ca_trust::TrustedCa {
+                secret_ref: "ns/ca".to_string(),
+                fingerprint_sha256: "a".to_string(),
+                fingerprint_sha1: "b".to_string(),
+                subject_cn: "cn".to_string(),
+                not_after: "x".to_string(),
+                trusted_at: "y".to_string(),
+            });
+        let mut refreshed = snapshot.clone();
+        refreshed.hosts[0].address = "127.0.0.1".to_string();
+        refreshed.hosts[0].port = 60022;
+        refreshed.name = "Stale name".to_string();
+
+        assert!(merge_refreshed_endpoints(&mut fresh, &snapshot, &refreshed));
+
+        assert_eq!(fresh.hosts[0].address, "127.0.0.1");
+        assert_eq!(fresh.hosts[0].port, 60022);
+        assert_eq!(fresh.hosts[0].user, "edited");
+        assert_eq!(fresh.name, "Edited name");
+        assert_eq!(fresh.trusted_cas.len(), 1);
+    }
+
+    #[test]
+    fn merge_refreshed_endpoints_keeps_concurrent_edit_of_unrefreshed_host() {
+        let mut snapshot = profile_with_hosts(vec![key_host("a"), key_host("b")]);
+        snapshot.local_runtime = Some(runtime());
+        // Host b was edited concurrently (new address/port) while host a refreshed.
+        let mut fresh = snapshot.clone();
+        fresh.hosts[1].address = "198.51.100.7".to_string();
+        fresh.hosts[1].port = 2200;
+        let mut refreshed = snapshot.clone();
+        refreshed.hosts[0].port = 60022;
+
+        assert!(merge_refreshed_endpoints(&mut fresh, &snapshot, &refreshed));
+
+        assert_eq!(fresh.hosts[0].port, 60022);
+        assert_eq!(fresh.hosts[1].address, "198.51.100.7");
+        assert_eq!(fresh.hosts[1].port, 2200);
+    }
+
+    #[test]
+    fn merge_refreshed_endpoints_skips_when_local_runtime_removed_or_changed() {
+        let mut snapshot = profile_with_hosts(vec![key_host("m1")]);
+        snapshot.local_runtime = Some(runtime());
+        let mut refreshed = snapshot.clone();
+        refreshed.hosts[0].port = 60022;
+
+        let mut removed = snapshot.clone();
+        removed.local_runtime = None;
+        assert!(!merge_refreshed_endpoints(
+            &mut removed,
+            &snapshot,
+            &refreshed
+        ));
+        assert_eq!(removed.hosts[0].port, 22);
+
+        let mut changed = snapshot.clone();
+        changed.local_runtime.as_mut().unwrap().instance = "other".to_string();
+        assert!(!merge_refreshed_endpoints(
+            &mut changed,
+            &snapshot,
+            &refreshed
+        ));
+        assert_eq!(changed.hosts[0].port, 22);
+    }
+
+    /// Fake Colima whose `colima list` runs `mutate` first, simulating a concurrent writer that
+    /// changes the store while the lock-free detection is in flight.
+    struct MidFlightRunner<F: Fn() + Send + Sync> {
+        mutate: F,
+    }
+
+    #[async_trait]
+    impl<F: Fn() + Send + Sync> CommandRunner for MidFlightRunner<F> {
+        async fn run(&self, bin: &str, args: &[String]) -> Result<CommandOutput, String> {
+            let stdout = if bin == "colima" && args.first().map(String::as_str) == Some("list") {
+                (self.mutate)();
+                r#"{"name":"default","status":"Running","runtime":"docker"}"#
+            } else if bin == "colima" {
+                "Host colima\n  IdentityFile \"/k\"\n  User u\n  Hostname 127.0.0.1\n  Port 58096\n"
+            } else {
+                ""
+            };
+            Ok(CommandOutput {
+                stdout: stdout.into(),
+                stderr: String::new(),
+                success: true,
+            })
+        }
+    }
+
+    fn temp_paths(tag: &str) -> ClusterDeckPaths {
+        let dir = std::env::temp_dir().join(format!("cd-lpf-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        ClusterDeckPaths::at(dir)
+    }
+
+    fn runtime_profile() -> Profile {
+        let mut p = profile_with_hosts(vec![key_host("colima-vm")]);
+        p.id = "colima-default".to_string();
+        p.local_runtime = Some(runtime());
+        p
+    }
+
+    #[tokio::test]
+    async fn load_profile_fresh_does_not_resurrect_profile_deleted_mid_flight() {
+        let paths = temp_paths("del");
+        store::upsert_profile(&paths, runtime_profile()).unwrap();
+        let p2 = paths.clone();
+        let runner = MidFlightRunner {
+            mutate: move || store::delete_profile(&p2, "colima-default").unwrap(),
+        };
+
+        let res = load_profile_fresh(&runner, &paths, "colima-default").await;
+
+        assert!(res.is_err());
+        assert!(store::load_profiles(&paths).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn load_profile_fresh_writes_nothing_when_local_runtime_removed_mid_flight() {
+        let paths = temp_paths("lr");
+        store::upsert_profile(&paths, runtime_profile()).unwrap();
+        let p2 = paths.clone();
+        let runner = MidFlightRunner {
+            mutate: move || {
+                let mut p = runtime_profile();
+                p.local_runtime = None;
+                store::upsert_profile(&p2, p).unwrap();
+            },
+        };
+
+        let res = load_profile_fresh(&runner, &paths, "colima-default")
+            .await
+            .unwrap();
+
+        assert!(res.local_runtime.is_none());
+        let stored = store::get_profile(&paths, "colima-default").unwrap();
+        assert!(stored.local_runtime.is_none());
+        assert_eq!(stored.hosts[0].port, 22);
     }
 }

@@ -55,6 +55,20 @@ fn child_path_env() -> Option<std::ffi::OsString> {
 }
 
 pub fn resolve_cli_path(bin: &str) -> Result<PathBuf, String> {
+    let p = std::path::Path::new(bin);
+    if p.is_absolute() {
+        if p.is_file() {
+            return Ok(p.to_path_buf());
+        }
+        return Err(format!("'{bin}' executable not found"));
+    }
+    if bin == "vmrun" {
+        let mac_vmrun =
+            std::path::Path::new("/Applications/VMware Fusion.app/Contents/Library/vmrun");
+        if mac_vmrun.is_file() {
+            return Ok(mac_vmrun.to_path_buf());
+        }
+    }
     for dir in search_dirs() {
         let candidate = dir.join(bin);
         if candidate.is_file() {
@@ -72,6 +86,21 @@ pub struct CommandOutput {
     pub success: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct CommandLimits {
+    pub timeout: std::time::Duration,
+    pub max_output_bytes: usize,
+}
+
+impl Default for CommandLimits {
+    fn default() -> Self {
+        Self {
+            timeout: std::time::Duration::from_secs(10),
+            max_output_bytes: 2 * 1024 * 1024,
+        }
+    }
+}
+
 #[async_trait]
 pub trait CommandRunner: Send + Sync {
     async fn run(&self, bin: &str, args: &[String]) -> Result<CommandOutput, String>;
@@ -82,6 +111,25 @@ pub trait CommandRunner: Send + Sync {
         _env: &[(String, String)],
     ) -> Result<CommandOutput, String> {
         self.run(bin, args).await
+    }
+    async fn run_bounded(
+        &self,
+        bin: &str,
+        args: &[String],
+        _limits: CommandLimits,
+    ) -> Result<CommandOutput, String> {
+        self.run(bin, args).await
+    }
+    /// `run_bounded` plus extra environment variables (e.g. `VAGRANT_CWD`: the runner has no
+    /// cwd support). Default delegates to `run_with_env`, so fakes need no change.
+    async fn run_bounded_with_env(
+        &self,
+        bin: &str,
+        args: &[String],
+        env: &[(String, String)],
+        _limits: CommandLimits,
+    ) -> Result<CommandOutput, String> {
+        self.run_with_env(bin, args, env).await
     }
 }
 
@@ -134,6 +182,99 @@ impl CommandRunner for SystemRunner {
             stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
             success: output.status.success(),
         })
+    }
+
+    async fn run_bounded(
+        &self,
+        bin: &str,
+        args: &[String],
+        limits: CommandLimits,
+    ) -> Result<CommandOutput, String> {
+        self.run_bounded_with_env(bin, args, &[], limits).await
+    }
+
+    async fn run_bounded_with_env(
+        &self,
+        bin: &str,
+        args: &[String],
+        env: &[(String, String)],
+        limits: CommandLimits,
+    ) -> Result<CommandOutput, String> {
+        let path = resolve_cli_path(bin)?;
+        let mut cmd = Command::new(path);
+        cmd.args(args)
+            .env("LC_ALL", "C")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+
+        if let Some(child_path) = child_path_env() {
+            cmd.env("PATH", child_path);
+        }
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+
+        let op = async {
+            let mut child = cmd
+                .spawn()
+                .map_err(|err| format!("{bin} execution failed: {err}"))?;
+
+            let stdout = child
+                .stdout
+                .take()
+                .ok_or_else(|| "stdout unavailable".to_string())?;
+            let stderr = child
+                .stderr
+                .take()
+                .ok_or_else(|| "stderr unavailable".to_string())?;
+
+            let max_read = (limits.max_output_bytes + 1) as u64;
+
+            let out_fut = async {
+                let mut data = Vec::new();
+                use tokio::io::AsyncReadExt;
+                stdout
+                    .take(max_read)
+                    .read_to_end(&mut data)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok::<_, String>(data)
+            };
+            let err_fut = async {
+                let mut data = Vec::new();
+                use tokio::io::AsyncReadExt;
+                stderr
+                    .take(max_read)
+                    .read_to_end(&mut data)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok::<_, String>(data)
+            };
+
+            let (out_bytes, err_bytes) = tokio::try_join!(out_fut, err_fut)?;
+            if out_bytes.len() > limits.max_output_bytes
+                || err_bytes.len() > limits.max_output_bytes
+            {
+                return Err("command output limit exceeded".to_string());
+            }
+
+            let status = child
+                .wait()
+                .await
+                .map_err(|err| format!("{bin} wait failed: {err}"))?;
+
+            Ok(CommandOutput {
+                stdout: String::from_utf8_lossy(&out_bytes).trim().to_owned(),
+                stderr: String::from_utf8_lossy(&err_bytes).trim().to_owned(),
+                success: status.success(),
+            })
+        };
+
+        tokio::time::timeout(limits.timeout, op)
+            .await
+            .map_err(|_| "command timed out".to_string())?
     }
 }
 
@@ -297,5 +438,94 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err, "boom");
+    }
+
+    #[tokio::test]
+    async fn system_runner_run_bounded_enforces_output_cap() {
+        let runner = SystemRunner;
+        let limits = CommandLimits {
+            timeout: std::time::Duration::from_secs(5),
+            max_output_bytes: 100,
+        };
+        let res = runner
+            .run_bounded(
+                "sh",
+                &["-c".to_string(), "yes abcdefghij | head -n 50".to_string()],
+                limits,
+            )
+            .await;
+        assert!(res.is_err());
+        assert_eq!(res.unwrap_err(), "command output limit exceeded");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn system_runner_run_bounded_times_out() {
+        let runner = SystemRunner;
+        let limits = CommandLimits {
+            timeout: std::time::Duration::from_millis(50),
+            max_output_bytes: 1024,
+        };
+        let res = runner
+            .run_bounded("sleep", &["10".to_string()], limits)
+            .await;
+        assert!(res.is_err());
+        assert_eq!(res.unwrap_err(), "command timed out");
+    }
+
+    #[tokio::test]
+    async fn system_runner_run_bounded_terminates_hanging_child_on_timeout() {
+        let runner = SystemRunner;
+        let tmp_dir = std::env::temp_dir();
+        let pid_file = tmp_dir.join(format!(
+            "clusterdeck_test_child_pid_{}_{}.pid",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_file(&pid_file);
+
+        let limits = CommandLimits {
+            timeout: std::time::Duration::from_millis(100),
+            max_output_bytes: 1024,
+        };
+        // sh replaces itself with sleep 60 via exec; the pid file records the pid.
+        let script = format!("echo $$ > '{}' && exec sleep 60", pid_file.display());
+        let res = runner
+            .run_bounded("sh", &["-c".to_string(), script], limits)
+            .await;
+        assert!(res.is_err());
+        assert_eq!(res.unwrap_err(), "command timed out");
+
+        let pid_str = std::fs::read_to_string(&pid_file).expect("pid file should exist");
+        let pid = pid_str.trim();
+        assert!(!pid.is_empty(), "pid should not be empty");
+
+        // Wait briefly for SIGKILL/cleanup to finish and confirm process is dead
+        let mut alive = true;
+        for _ in 0..20 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let status = std::process::Command::new("kill")
+                .args(["-0", pid])
+                .stderr(std::process::Stdio::null())
+                .status();
+            match status {
+                Ok(s) if !s.success() => {
+                    alive = false;
+                    break;
+                }
+                Err(_) => {
+                    alive = false;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let _ = std::fs::remove_file(&pid_file);
+        assert!(
+            !alive,
+            "child process with pid {pid} was not terminated on timeout"
+        );
     }
 }

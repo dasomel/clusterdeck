@@ -2,6 +2,7 @@ pub mod ca_trust;
 pub mod config;
 pub mod discovery;
 pub mod hosts_file;
+pub mod inventory;
 pub mod k8s_endpoints;
 pub mod kube_import;
 pub mod kubeconfig;

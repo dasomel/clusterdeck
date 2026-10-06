@@ -94,6 +94,25 @@ pub fn is_safe_shell_context_name(s: &str) -> bool {
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ':' | '/' | '@'))
 }
 
+/// Sink validator for path segments before joining them to create filesystem paths
+/// (e.g. `.vagrant/machines/<name>`, `_lima/<profile>`, `_disks/...`).
+/// Rejects path traversal (`..`), current dir (`.`), empty, leading dash, path separators (`/`, `\`),
+/// NUL, newlines, and control characters per R5.
+pub fn is_safe_path_segment(s: &str) -> bool {
+    if s.is_empty() || s.starts_with('-') || s == "." || s == ".." {
+        return false;
+    }
+    if s.contains('/') || s.contains('\\') || s.contains("..") {
+        return false;
+    }
+    if s.chars()
+        .any(|c| c.is_control() || c == '\0' || c == '\n' || c == '\r')
+    {
+        return false;
+    }
+    true
+}
+
 /// Sink validator for `KubeconfigSource.remote_path`, which is interpolated into the remote SSH
 /// read command in `kubeconfig.rs::build_candidate_read_cmd`. The whole path is embedded inside
 /// a single-quoted shell string (a leading `~/` is expanded via the remote shell's `"$HOME"`;
@@ -486,5 +505,23 @@ mod tests {
         });
         let err = validate_profile(&profile).unwrap_err();
         assert!(err.contains("invalid local_runtime instance"));
+    }
+
+    #[test]
+    fn is_safe_path_segment_boundary_cases() {
+        assert!(is_safe_path_segment("default"));
+        assert!(is_safe_path_segment("master-1"));
+        assert!(is_safe_path_segment("vmware_desktop"));
+        assert!(is_safe_path_segment("disk.vmdk"));
+        assert!(!is_safe_path_segment(""));
+        assert!(!is_safe_path_segment("."));
+        assert!(!is_safe_path_segment(".."));
+        assert!(!is_safe_path_segment("sub/dir"));
+        assert!(!is_safe_path_segment("sub\\dir"));
+        assert!(!is_safe_path_segment("../etc"));
+        assert!(!is_safe_path_segment("-leading-dash"));
+        assert!(!is_safe_path_segment("has\0null"));
+        assert!(!is_safe_path_segment("has\nnewline"));
+        assert!(!is_safe_path_segment("has\rreturn"));
     }
 }

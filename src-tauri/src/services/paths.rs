@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 
+#[derive(Clone, Debug)]
 pub struct ClusterDeckPaths {
     pub base: PathBuf,
 }
