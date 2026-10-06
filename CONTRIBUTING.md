@@ -68,6 +68,14 @@ For functionality involving SSH, kubeconfig, or Kubernetes connectivity, add or 
 
 Do not use real production credentials or infrastructure in tests committed to the repository.
 
+## Infrastructure Provider Adapters
+
+When adding or modifying provider adapters for the Infrastructure inventory (`services/inventory/`):
+
+- **Pure parsers & fixtures:** Prefer pure parsers and synthetic fixtures captured from supported provider versions (`colima`, `VBoxManage`, `vagrant`, `vmrun`). Preserve deterministic machine/environment IDs, keep unknown fields explicit (`None`), and execute commands exclusively through `CommandRunner::run_bounded`. Never introduce shell string execution.
+- **Acceptance on real macOS providers:** Automated parser fixtures do not guarantee real-host compatibility. Validate Colima JSON units/status, VirtualBox UUIDs and stopped/paused states, VMware Fusion VMX paths containing spaces, and Vagrant stale projects. Confirm discovery introduces zero host or guest state modifications.
+- **Data safety:** Never commit real user paths, private machine inventories, or credentials in tests or documentation.
+
 ## AI-Assisted Development
 
 AI-generated code is treated the same as human-authored code. Contributors remain responsible for:

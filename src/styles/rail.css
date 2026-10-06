@@ -1,0 +1,172 @@
+/* Patch Rail (Full variant) */
+.patch-rail {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  position: relative;
+  list-style: none;
+  margin: 0;
+  padding: var(--space-3) var(--space-4);
+  background: var(--bg-sunken);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  width: 100%;
+}
+
+.patch-rail-step {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  position: relative;
+  z-index: 2;
+  flex: 1;
+}
+
+.patch-rail-track {
+  position: absolute;
+  top: 24px;
+  left: 10%;
+  right: 10%;
+  height: 2px;
+  background: var(--border-strong);
+  z-index: 1;
+}
+
+.patch-jack {
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  border: 2px solid var(--border-strong);
+  background: var(--bg-elevated);
+  color: var(--text-tertiary);
+  transition: background-color 0.12s ease, border-color 0.12s ease, transform 0.12s ease;
+  z-index: 2;
+}
+
+.patch-jack.ok {
+  background: var(--success);
+  border-color: var(--success);
+  color: var(--accent-contrast);
+}
+
+.patch-jack.warn {
+  background: var(--warning);
+  border-color: var(--warning);
+  color: var(--accent-contrast);
+}
+
+.patch-jack.fail {
+  background: var(--danger);
+  border-color: var(--danger);
+  color: var(--accent-contrast);
+}
+
+.patch-jack.running {
+  border-color: var(--accent);
+  color: var(--accent);
+  animation: pulseRing 1.4s infinite cubic-bezier(0.4, 0, 0.6, 1);
+}
+
+.patch-jack.idle {
+  border-color: var(--border-strong);
+  color: var(--text-tertiary);
+}
+
+.patch-jack.skipped {
+  border-color: var(--border);
+  color: var(--text-tertiary);
+  opacity: 0.6;
+}
+
+.patch-step-label {
+  margin-top: var(--space-2);
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  color: var(--text-primary);
+  text-align: center;
+}
+
+.patch-step-label.skipped {
+  text-decoration: line-through;
+  color: var(--text-tertiary);
+}
+
+.patch-step-detail {
+  margin-top: 2px;
+  font-size: 10px;
+  color: var(--text-tertiary);
+  font-family: var(--font-mono);
+  text-align: center;
+}
+
+/* Mini Rail (in cards & overview) */
+.patch-rail-mini {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  position: relative;
+}
+
+.patch-jack-mini {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  border: 1px solid var(--border-strong);
+  background: var(--bg-sunken);
+  flex-shrink: 0;
+}
+
+.patch-jack-mini.ok {
+  background: var(--success);
+  border-color: var(--success);
+}
+
+.patch-jack-mini.warn {
+  background: var(--warning);
+  border-color: var(--warning);
+}
+
+.patch-jack-mini.fail {
+  background: var(--danger);
+  border-color: var(--danger);
+}
+
+.patch-jack-mini.running {
+  background: var(--accent);
+  border-color: var(--accent);
+  animation: pulseRing 1.4s infinite cubic-bezier(0.4, 0, 0.6, 1);
+}
+
+.patch-jack-mini.idle {
+  background: transparent;
+  border-color: var(--border-strong);
+}
+
+.patch-jack-mini.skipped {
+  background: transparent;
+  border-color: var(--border);
+  opacity: 0.5;
+}
+
+.patch-rail-mini-line {
+  width: 6px;
+  height: 1px;
+  background: var(--border-strong);
+}
+
+@keyframes pulseRing {
+  0% {
+    transform: scale(0.95);
+    box-shadow: 0 0 0 0 var(--accent-soft-bg);
+  }
+  70% {
+    transform: scale(1.1);
+    box-shadow: 0 0 0 4px transparent;
+  }
+  100% {
+    transform: scale(0.95);
+    box-shadow: 0 0 0 0 transparent;
+  }
+}

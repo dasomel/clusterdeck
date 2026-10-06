@@ -59,6 +59,7 @@ The MVP should avoid implementing a complete SSH client unless there is a concre
 │ React / TypeScript                            │
 │                                              │
 │ Profiles · Hosts · Connect · Status          │
+│ Infrastructure (VM Inventory & Environments) │
 └───────────────────────┬──────────────────────┘
                         │ Tauri Commands
 ┌───────────────────────▼──────────────────────┐
@@ -71,6 +72,7 @@ The MVP should avoid implementing a complete SSH client unless there is a concre
 │ Kubeconfig Service                           │
 │ Cluster Health Service                       │
 │ Local Configuration Service                   │
+│ Infrastructure / VM Inventory Service        │
 └───────────────┬───────────────┬──────────────┘
                 │               │
         ┌───────▼──────┐  ┌────▼──────────┐
@@ -412,7 +414,57 @@ CA:TRUE or keyCertSign). A genuine `-checkend` result is always silent on stdout
 the exit code carries it — so a non-zero exit *with* stderr output (e.g. an unreadable temp file)
 is treated as a tooling failure rather than expiry, avoiding a prior false-positive.
 
-## 17. MVP Boundaries
+## 17. Infrastructure VM Inventory & Environment Source
+
+Following the integration of InfraDeck into ClusterDeck ([ADR-0008](adr/0008-vm-inventory-environment-source.md)), ClusterDeck provides an **Infrastructure** view that observes local virtual machine inventory across four providers: Colima, VirtualBox, VMware Fusion, and Vagrant. This widens ClusterDeck's product boundary by one axis — observing VM inventory as an environment source — while keeping observation strictly read-only (no lifecycle mutations for VirtualBox, VMware, or Vagrant, and no general Kubernetes cluster administration).
+
+### 17.1 Domain Contract
+
+The inventory model (`services/inventory/`) unifies machine instances across hypervisors and orchestrators:
+- `Machine`: contains `id`, `runtime_id`, `name`, `runtime` (`colima` | `virtualbox` | `vmware_fusion`), optional `orchestrator` (`vagrant`), `environment` (grouping label such as project directory or runtime group), `state` (normalized lowercase string such as `running`, `stopped`, `stale`, `paused`, `poweroff`), configured resource allocations in GiB (`cpu`, `memory_gib`, `disk_gib`, `disk_used_gib`), creation timestamp (`created_at`), detected `ips`, and `kubernetes` detection state. Unknown values remain explicit `None`/`null`.
+- `Inventory`: contains execution `mode` (`"live"` | `"demo"`), timestamp, `host` hardware limits (platform, architecture, total CPU, total memory in GiB), `machines` list, `providers` status (`"available"` | `"not-installed"` | `"error"` | `"demo"`), and aggregate `summary` (running VM count, allocated CPU/memory/disk vs host capacity, unknown resources, and diagnostic warnings).
+
+### 17.2 Bounded Process Execution
+
+All provider CLI interactions run through `CommandRunner::run_bounded(bin, args, limits)` (`services/process.rs`):
+- Executes with `LC_ALL=C` for locale-independent output parsing.
+- Stdin is set to `null` and child processes are killed on drop (`kill_on_drop(true)`).
+- Streams are strictly bounded: stdout and stderr reads are each capped at 2 MiB during collection; exceeding the limit terminates the process with an error.
+- Enforces a 10-second timeout per command.
+- VMware Fusion's `vmrun` is resolved explicitly at `/Applications/VMware Fusion.app/Contents/Library/vmrun` as well as standard macOS PATH directories.
+
+### 17.3 Defensive Path Validation
+
+Any dynamic machine name, runtime identifier, or project directory joined into local filesystem paths (such as `.vagrant/machines/<name>`, `.vmx` files, or Lima instance directories) must pass `services/validate.rs::is_safe_path_segment`. The validator forbids directory separators (`/`, `\`), traversal segments (`..`), leading hyphens (`-`), NUL characters, and newlines before any filesystem operation. File inspection (e.g. VMX/VMDK files) is asynchronous or offloaded to blocking tasks with size limits, preventing executor stalls.
+
+### 17.4 Identity Reconciliation Rules
+
+- **Exact ID matching:** Observations from runtime providers (VirtualBox, VMware) and orchestrators (Vagrant) are reconciled strictly on exact `runtime:runtime_id`. VirtualBox UUIDs match directly; VMware merges only when Vagrant's ID matches the VMX path exactly.
+- **No VM name merging:** Merging by machine name is strictly prohibited because names can collide across environments. Unresolved identities remain separate observations.
+- **Vagrant state correction:** Vagrant's cached `global-status` is cross-checked against actual provider state: unmatched running entries are corrected to `stopped`, and entries whose `.vagrant` project metadata has been deleted are marked `stale`.
+
+### 17.5 Kubernetes Detection
+
+Kubernetes presence on discovered machines is evaluated without extracting credentials:
+1. Parsing hostnames from existing local kubeconfig server configurations.
+2. A non-blocking 500 ms TCP probe against port 6443.
+Status is reported evidence-first as `"kubeconfig server"`, `"API server reachable (6443)"`, or `"not detected"`.
+
+### 17.6 Environment Identity & Profile Creation
+
+ClusterDeck allows one-click profile creation from any observed multi-node environment:
+- **Deterministic ID derivation:** Vagrant environments generate profile IDs as `vagrant-<slug(basename)>-<6 hex sha256(canonical project path)>` (ensuring distinct workspaces with identical folder names like `/a/lab` vs `/b/lab` never collide). Colima environments use `colima-<slug(name)>`.
+- **ID-only profile matching:** Matching against existing profiles is evaluated strictly by profile ID.
+- **Collision rejection:** If an existing profile with a *different* ID already binds to the same target IP address and port, profile creation is refused with an explicit error.
+- **Typed-level merge:** For an existing profile with a matching ID, only `hosts[].address` and `hosts[].port` are updated and missing hosts appended; custom settings, trusted CAs, and kubeconfig definitions are preserved.
+- **Concurrency & store guard:** All profile creations/refreshes serialize behind a process-wide `tokio::sync::Mutex`. If profile loading indicates that `store::upsert_profile` dropped invalid profile entries, the operation refuses to persist to prevent data loss.
+- **One-click auto-save:** The one-click "Set up cluster" action persists the profile immediately via `store::upsert_profile` and selects it, explicitly superseding [ADR-0005](adr/0005-local-host-detection-prefills-profiles.md) D1 for this flow.
+
+### 17.7 In-App Demo Mode
+
+A synthetic inventory representing 3 Vagrant/VMware "Narwhal" control-plane and worker nodes is available in-app via the `demo: true` parameter to `discover_inventory`. Demo mode runs completely in-process without invoking host CLIs or modifying local state. The standalone `infradeck` CLI is dropped to avoid exposing an unstable public Rust library API.
+
+## 18. MVP Boundaries
 
 The first implementation should focus on:
 

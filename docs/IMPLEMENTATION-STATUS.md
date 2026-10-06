@@ -24,6 +24,10 @@ This file records current default-branch behavior, not future product direction.
 - `clusterdeck-connection-workflow` Agent Skill re-verified via a fresh-session replay against a real target; `openforge-maturity` is `verified` again (#22).
 - Explicit per-host SSH authentication mode (`key`, the default, or `password`): password mode uses `sshpass -e`/`SSHPASS` consistently across Connect, Test Connection, and kubeconfig fetch, omits `BatchMode=yes` (which would block the password prompt) while keeping `StrictHostKeyChecking=accept-new`, and keeps the password ephemeral in frontend state only. Profile YAML written before this field existed deserializes unchanged as `key` (#26).
 
+## In progress
+
+- Infrastructure VM inventory (status: in progress) — implemented: observation across Colima, VirtualBox, VMware Fusion (running VMs only), and Vagrant; disk, guest IP, and creation-time metadata where the provider exposes them; evidence-based Kubernetes detection; `stale` marking for vanished Vagrant projects; identity-based reconciliation, resource totals, and one-click profile creation from observed environments. Not implemented: stopped standalone Fusion VMs, per-field source/freshness recording, versioned credential-free manifest import (see [ROADMAP-infrastructure.md](ROADMAP-infrastructure.md)) (merging InfraDeck into ClusterDeck per [ADR-0008](adr/0008-vm-inventory-environment-source.md) and `.omc/plans/infradeck-merge.md`).
+
 ## Partial / environment-dependent
 
 - Unit/FakeRunner tests prove application control flow but cannot prove real OpenSSH, kubectl, native filesystem, or target-cluster behavior; critical-path changes require real-binary/runtime evidence where practical.
@@ -55,3 +59,6 @@ This file records current default-branch behavior, not future product direction.
 - commit `268feab` (`clusterdeck-connection-workflow` skill re-verified, issue #22); evidence at `research/issue-22-connection-workflow-replay-2026-09-22.md`
 - commit `cb85aff` and commit `24b231c` (release workflow: macOS `.dmg` draft GitHub Release on `v*` tag push, third-party Actions pinned to commit SHAs)
 - branch `feat/26-password-ssh-auth` (password-based SSH authentication mode, issue #26)
+- `docs/adr/0008-vm-inventory-environment-source.md` (VM inventory environment source and profile creation)
+- `docs/ROADMAP-infrastructure.md` (infrastructure roadmap preserved from InfraDeck)
+- `.omc/plans/infradeck-merge.md` (InfraDeck absorption plan and architectural amendments)

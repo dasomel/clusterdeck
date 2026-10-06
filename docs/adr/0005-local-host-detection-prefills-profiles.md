@@ -4,6 +4,7 @@
 - Date: 2026-09-20
 - Issue: #14
 - Note: if accepted, this supersedes [ADR-0003](0003-colima-lima-local-runtime-provider.md) in part — see the "Relationship to ADR-0003" table below for exactly which parts.
+- Note: D1 ("nothing persists until Save") is superseded in part by [ADR-0008](0008-vm-inventory-environment-source.md) (Proposed) for the one-click "Set up cluster" flow from the Infrastructure inventory.
 
 ## Context
 

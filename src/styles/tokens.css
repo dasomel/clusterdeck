@@ -1,0 +1,184 @@
+:root {
+  /* OpenForge & Figma Design System Semantic Tokens (Light) */
+  --of-color-bg-canvas: #f7f4ee;
+  --of-color-bg-surface: #ffffff;
+  --of-color-bg-subtle: #ece7dd;
+  --of-color-bg-surface-raised: #ffffff;
+  --of-color-border-default: rgba(20, 16, 8, 0.12);
+  --of-color-border-strong: rgba(20, 16, 8, 0.22);
+  --of-color-text-primary: #1c1a16;
+  --of-color-text-secondary: #5c574c;
+  --of-color-text-muted: #8a8375;
+  --of-color-accent-primary: #c9781a;
+  --of-color-accent-contrast: #fff8ec;
+  --of-color-status-success: #1f8a44;
+  --of-color-status-warning: #d97706;
+  --of-color-status-danger: #c23b32;
+  --of-color-status-info: #0284c7;
+
+  /* Typography */
+  --font-ui: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", sans-serif;
+  --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+
+  /* Patch Panel Tokens (Light) */
+  --bg: var(--of-color-bg-canvas);
+  --bg-elevated: var(--of-color-bg-surface);
+  --bg-sunken: var(--of-color-bg-subtle);
+  --border: var(--of-color-border-default);
+  --border-strong: var(--of-color-border-strong);
+  --text-primary: var(--of-color-text-primary);
+  --text-secondary: var(--of-color-text-secondary);
+  --text-tertiary: var(--of-color-text-muted);
+  --accent: var(--of-color-accent-primary);
+  --accent-contrast: var(--of-color-accent-contrast);
+  --accent-soft-bg: rgba(201, 120, 26, 0.12);
+  --success: var(--of-color-status-success);
+  --success-soft-bg: rgba(31, 138, 68, 0.10);
+  --warning: var(--of-color-status-warning);
+  --warning-soft-bg: rgba(217, 119, 6, 0.12);
+  --danger: var(--of-color-status-danger);
+  --danger-soft-bg: rgba(194, 59, 50, 0.10);
+  --shadow-card: 0 1px 3px rgba(20, 16, 8, 0.05), 0 8px 24px rgba(20, 16, 8, 0.06);
+  --sidebar-grid: rgba(20, 16, 8, 0.05);
+  --hover-row-bg: rgba(20, 16, 8, 0.035);
+  --pill-border-success: rgba(31, 138, 68, 0.25);
+  --pill-border-warning: rgba(217, 119, 6, 0.25);
+  --pill-border-danger: rgba(194, 59, 50, 0.25);
+
+  /* New tokens (Light) */
+  --info: var(--of-color-status-info);
+  --info-soft-bg: rgba(2, 132, 199, 0.10);
+  --pill-border-info: rgba(2, 132, 199, 0.25);
+  --demo-hatch: rgba(217, 119, 6, 0.08);
+  --scrim: rgba(20, 16, 8, 0.45);
+  --focus-ring: var(--accent);
+
+  /* Non-color (theme-independent) */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 10px;
+
+  --row-h: 32px;
+  --rail-w: 184px;
+  --list-w: 232px;
+
+  --fs-xs: 11px;
+  --fs-sm: 12px;
+  --fs-md: 13px;
+  --fs-lg: 15px;
+  --fs-xl: 20px;
+
+  --lh-tight: 1.25;
+  --lh-body: 1.45;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    /* OpenForge & Figma Design System Semantic Tokens (Dark - Refined Slate/Navy) */
+    --of-color-bg-canvas: #0f141c;
+    --of-color-bg-surface: #161f2c;
+    --of-color-bg-subtle: #0b0f16;
+    --of-color-bg-surface-raised: #1e2b3e;
+    --of-color-border-default: #26354a;
+    --of-color-border-strong: #3d5170;
+    --of-color-text-primary: #f1f5f9;
+    --of-color-text-secondary: #cbd5e1;
+    --of-color-text-muted: #94a3b8;
+    --of-color-accent-primary: #38bdf8;
+    --of-color-accent-contrast: #031525;
+    --of-color-status-success: #4ade80;
+    --of-color-status-warning: #fbbf24;
+    --of-color-status-danger: #f87171;
+    --of-color-status-info: #38bdf8;
+
+    /* Patch Panel Tokens (Dark) */
+    --bg: var(--of-color-bg-canvas);
+    --bg-elevated: var(--of-color-bg-surface);
+    --bg-sunken: var(--of-color-bg-subtle);
+    --border: var(--of-color-border-default);
+    --border-strong: var(--of-color-border-strong);
+    --text-primary: var(--of-color-text-primary);
+    --text-secondary: var(--of-color-text-secondary);
+    --text-tertiary: var(--of-color-text-muted);
+    --accent: var(--of-color-accent-primary);
+    --accent-contrast: var(--of-color-accent-contrast);
+    --accent-soft-bg: rgba(56, 189, 248, 0.15);
+    --sidebar-grid: rgba(255, 255, 255, 0.035);
+    --hover-row-bg: rgba(255, 255, 255, 0.04);
+    --pill-border-success: rgba(74, 222, 128, 0.3);
+    --pill-border-warning: rgba(251, 191, 36, 0.3);
+    --pill-border-danger: rgba(248, 113, 113, 0.3);
+    --success: var(--of-color-status-success);
+    --success-soft-bg: rgba(74, 222, 128, 0.15);
+    --warning: var(--of-color-status-warning);
+    --warning-soft-bg: rgba(251, 191, 36, 0.15);
+    --danger: var(--of-color-status-danger);
+    --danger-soft-bg: rgba(248, 113, 113, 0.15);
+    --shadow-card: 0 2px 6px rgba(0, 0, 0, 0.3), 0 12px 32px rgba(0, 0, 0, 0.45);
+
+    /* New tokens (Dark) */
+    --info: var(--of-color-status-info);
+    --info-soft-bg: rgba(56, 189, 248, 0.15);
+    --pill-border-info: rgba(56, 189, 248, 0.30);
+    --demo-hatch: rgba(251, 191, 36, 0.08);
+    --scrim: rgba(0, 0, 0, 0.60);
+    --focus-ring: var(--accent);
+  }
+}
+
+:root[data-theme="dark"] {
+  /* Explicit dark mode choice */
+  --of-color-bg-canvas: #0f141c;
+  --of-color-bg-surface: #161f2c;
+  --of-color-bg-subtle: #0b0f16;
+  --of-color-bg-surface-raised: #1e2b3e;
+  --of-color-border-default: #26354a;
+  --of-color-border-strong: #3d5170;
+  --of-color-text-primary: #f1f5f9;
+  --of-color-text-secondary: #cbd5e1;
+  --of-color-text-muted: #94a3b8;
+  --of-color-accent-primary: #38bdf8;
+  --of-color-accent-contrast: #031525;
+  --of-color-status-success: #4ade80;
+  --of-color-status-warning: #fbbf24;
+  --of-color-status-danger: #f87171;
+  --of-color-status-info: #38bdf8;
+
+  --bg: var(--of-color-bg-canvas);
+  --bg-elevated: var(--of-color-bg-surface);
+  --bg-sunken: var(--of-color-bg-subtle);
+  --border: var(--of-color-border-default);
+  --border-strong: var(--of-color-border-strong);
+  --text-primary: var(--of-color-text-primary);
+  --text-secondary: var(--of-color-text-secondary);
+  --text-tertiary: var(--of-color-text-muted);
+  --accent: var(--of-color-accent-primary);
+  --accent-contrast: var(--of-color-accent-contrast);
+  --accent-soft-bg: rgba(56, 189, 248, 0.15);
+  --sidebar-grid: rgba(255, 255, 255, 0.035);
+  --hover-row-bg: rgba(255, 255, 255, 0.04);
+  --pill-border-success: rgba(74, 222, 128, 0.3);
+  --pill-border-warning: rgba(251, 191, 36, 0.3);
+  --pill-border-danger: rgba(248, 113, 113, 0.3);
+  --success: var(--of-color-status-success);
+  --success-soft-bg: rgba(74, 222, 128, 0.15);
+  --warning: var(--of-color-status-warning);
+  --warning-soft-bg: rgba(251, 191, 36, 0.15);
+  --danger: var(--of-color-status-danger);
+  --danger-soft-bg: rgba(248, 113, 113, 0.15);
+  --shadow-card: 0 2px 6px rgba(0, 0, 0, 0.3), 0 12px 32px rgba(0, 0, 0, 0.45);
+
+  --info: var(--of-color-status-info);
+  --info-soft-bg: rgba(56, 189, 248, 0.15);
+  --pill-border-info: rgba(56, 189, 248, 0.30);
+  --demo-hatch: rgba(251, 191, 36, 0.08);
+  --scrim: rgba(0, 0, 0, 0.60);
+  --focus-ring: var(--accent);
+}

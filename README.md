@@ -68,8 +68,30 @@ Kubernetes Connectivity Check
 - Bastion / ProxyJump support
 - Remote kubeconfig fetch and normalization
 - `kubectl` connectivity verification
+- Local VM inventory observation across Colima, VirtualBox, VMware Fusion, and Vagrant
+- One-click profile creation from detected multi-node VM environments
+- In-app demo mode for trying ClusterDeck without host hypervisors
 
 ClusterDeck is not intended to become a general Kubernetes administration console.
+
+## Infrastructure & VM Inventory
+
+ClusterDeck incorporates the multi-provider VM inventory capabilities previously developed in InfraDeck ([ADR-0008](docs/adr/0008-vm-inventory-environment-source.md)). It observes local virtual machines and environments, presents resource capacity totals (CPU, RAM, disk in GiB), and enables a one-click "Set up cluster" flow that auto-saves a ready-to-connect profile.
+
+### Provider Readiness
+
+Install only the providers you use. ClusterDeck executes discovery commands read-only and bounded (10s timeout, 2 MiB stream caps, no shell).
+
+| Provider | Discovery source | Current data | Limitations |
+| --- | --- | --- | --- |
+| Colima | `colima list --json` | Profile, state, CPU, RAM, disk capacity, data-disk usage, creation time, advertised address | Kubernetes status comes from the shared detection below |
+| VirtualBox | `VBoxManage list vms`, `showvminfo`, `showmediuminfo`, `guestproperty` | Registered VM, UUID, state, CPU, RAM, disk capacity/usage, creation time; guest IPs while running | IP only when the guest reports one |
+| VMware Fusion | bundled `vmrun -T fusion list`, VMX files | Running VMs, CPU, RAM, VMDK disk capacity/usage, creation time; guest IP via `getGuestIPAddress` | Stopped standalone VMs are not listed; IP needs running VMware Tools |
+| Vagrant | `vagrant global-status`, `.vagrant/.../id`, `vagrant ssh-config` | Project, state, orchestrator/runtime relationship; VMX/disk data for VMware; static or ssh-config address | Entries whose project directory or `.vagrant` data is gone are shown as `stale`; unsupported providers are skipped |
+
+Kubernetes status for any machine with an IP is derived from kubeconfig server hosts and a 500 ms TCP probe of port 6443 (`kubeconfig server`, `API server reachable (6443)`, `not detected`, or `unknown` without an IP); credentials are never read.
+
+> **Note on Standalone CLI:** The standalone `infradeck` CLI was folded into ClusterDeck's backend and deliberately omitted as an independent binary to avoid widening the public Rust library crate API; synthetic inventory exploration is available directly in the desktop app via **Demo mode**.
 
 ## First Verified Success
 

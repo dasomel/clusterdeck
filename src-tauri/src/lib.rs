@@ -4,6 +4,7 @@ mod services;
 pub fn run() {
     tauri::Builder::default()
         .manage(services::local_runtime_lifecycle::LifecycleGuard::default())
+        .manage(services::store::ProfileWriteGuard)
         .invoke_handler(tauri::generate_handler![
             commands::app::get_app_info,
             commands::profiles::list_profiles,
@@ -45,6 +46,8 @@ pub fn run() {
             commands::local_runtime::restart_local_runtime,
             commands::local_runtime::open_local_runtime_shell,
             commands::local_runtime::open_local_runtime_context,
+            commands::inventory::discover_inventory,
+            commands::inventory::create_profile_from_environment,
         ])
         .run(tauri::generate_context!())
         .expect("error while running ClusterDeck");

@@ -90,15 +90,31 @@ fn parse_ssh_config_block(raw: &str) -> SshConfigBlock {
         .unwrap_or_default()
 }
 
-#[derive(Deserialize)]
-struct ColimaListRow {
-    name: String,
-    status: Option<String>,
-    runtime: Option<String>,
-    arch: Option<String>,
-    cpus: Option<u32>,
-    memory: Option<u64>,
-    disk: Option<u64>,
+#[derive(Deserialize, Debug, Clone, PartialEq)]
+pub struct ColimaListRow {
+    pub name: String,
+    pub status: Option<String>,
+    pub runtime: Option<String>,
+    pub arch: Option<String>,
+    pub cpus: Option<u32>,
+    pub memory: Option<u64>,
+    pub disk: Option<u64>,
+    #[serde(default)]
+    pub address: Option<String>,
+}
+
+pub fn parse_colima_json_rows(text: &str) -> Result<Vec<ColimaListRow>, String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(Vec::new());
+    }
+    if text.starts_with('[') {
+        serde_json::from_str(text).map_err(|e| format!("invalid Colima JSON: {e}"))
+    } else {
+        text.lines()
+            .map(|line| serde_json::from_str(line).map_err(|e| format!("invalid Colima JSON: {e}")))
+            .collect()
+    }
 }
 
 #[derive(Deserialize)]
@@ -144,16 +160,22 @@ async fn detect_colima(
         _ => return out,
     };
 
-    for line in list_output.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let entry: ColimaListRow = match serde_json::from_str(line) {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
+    let entries = match parse_colima_json_rows(&list_output) {
+        Ok(es) => es,
+        Err(_) => list_output
+            .lines()
+            .filter_map(|l| {
+                let l = l.trim();
+                if l.is_empty() {
+                    None
+                } else {
+                    serde_json::from_str(l).ok()
+                }
+            })
+            .collect(),
+    };
 
+    for entry in entries {
         // entry.name is untrusted `colima list --json` output; a leading `-` would be parsed as
         // a CLI option.
         if !crate::services::validate::is_safe_ssh_identifier(&entry.name) {
@@ -327,16 +349,16 @@ async fn detect_lima(runner: &dyn CommandRunner) -> Vec<DiscoveredLocalHost> {
     out
 }
 
-#[derive(Debug, PartialEq, Eq)]
-struct VagrantEntry {
-    id: String,
-    name: String,
-    provider: String,
-    state: String,
-    directory: String,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VagrantEntry {
+    pub id: String,
+    pub name: String,
+    pub provider: String,
+    pub state: String,
+    pub directory: String,
 }
 
-fn parse_vagrant_global_status(stdout: &str) -> Vec<VagrantEntry> {
+pub fn parse_vagrant_global_status(stdout: &str) -> Vec<VagrantEntry> {
     let mut entries = Vec::new();
     let mut in_table = false;
 
@@ -358,8 +380,25 @@ fn parse_vagrant_global_status(stdout: &str) -> Vec<VagrantEntry> {
             let id = tokens[0].to_string();
             let name = tokens[1].to_string();
             let provider = tokens[2].to_string();
-            let directory = tokens[tokens.len() - 1].to_string();
-            let state = tokens[3..tokens.len() - 1].join(" ");
+
+            let (state, dir_start_idx) = if tokens.len() >= 6 && tokens[3] == "not" {
+                (format!("{} {}", tokens[3], tokens[4]), 5)
+            } else {
+                (tokens[3].to_string(), 4)
+            };
+
+            let mut rest = trimmed;
+            for _ in 0..dir_start_idx {
+                rest = rest
+                    .split_once(char::is_whitespace)
+                    .map(|(_, tail)| tail.trim_start())
+                    .unwrap_or("");
+            }
+            let directory = if !rest.is_empty() {
+                rest.to_string()
+            } else {
+                tokens[dir_start_idx..].join(" ")
+            };
 
             entries.push(VagrantEntry {
                 id,
@@ -550,7 +589,7 @@ fn extract_ip_from_vagrantfile(
     None
 }
 
-fn find_static_vagrant_info(vagrant_dir: &Path, machine_name: &str) -> (Option<String>, bool) {
+pub fn find_static_vagrant_info(vagrant_dir: &Path, machine_name: &str) -> (Option<String>, bool) {
     let mut detected_ip = None;
     let mut has_k3s = false;
 
@@ -975,6 +1014,21 @@ Host colima
             parsed.identity_file.as_deref(),
             Some("/Users/test/.colima/_lima/_config/user")
         );
+    }
+
+    #[test]
+    fn parse_colima_json_rows_handles_array_and_ndjson() {
+        let ndjson = "{\"name\":\"default\",\"status\":\"Running\",\"cpus\":4,\"memory\":8589934592}\n{\"name\":\"other\",\"status\":\"Stopped\"}";
+        let parsed_ndjson = parse_colima_json_rows(ndjson).unwrap();
+        assert_eq!(parsed_ndjson.len(), 2);
+        assert_eq!(parsed_ndjson[0].name, "default");
+        assert_eq!(parsed_ndjson[0].status.as_deref(), Some("Running"));
+        assert_eq!(parsed_ndjson[1].name, "other");
+        assert_eq!(parsed_ndjson[1].status.as_deref(), Some("Stopped"));
+
+        let array = "[{\"name\":\"default\",\"status\":\"Running\",\"cpus\":4,\"memory\":8589934592},{\"name\":\"other\",\"status\":\"Stopped\"}]";
+        let parsed_array = parse_colima_json_rows(array).unwrap();
+        assert_eq!(parsed_array, parsed_ndjson);
     }
 
     #[test]
