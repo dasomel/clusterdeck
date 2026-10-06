@@ -68,8 +68,30 @@ Kubernetes 연결 확인
 - Bastion / ProxyJump
 - 원격 kubeconfig fetch 및 정규화
 - `kubectl` 기반 연결 확인
+- Colima, VirtualBox, VMware Fusion, Vagrant 로컬 VM 인벤토리 관찰
+- 감지된 멀티노드 VM 환경 기반 원클릭 프로필 생성
+- 하이퍼바이저 설치 없이 사용 가능한 인앱 Demo 모드
 
 ClusterDeck은 일반적인 Kubernetes 관리자 콘솔을 목표로 하지 않는다.
+
+## 인프라 및 VM 인벤토리 (Infrastructure & VM Inventory)
+
+ClusterDeck은 기존 InfraDeck에서 개발되었던 멀티 프로바이더 VM 인벤토리 관찰 기능을 통합하였다([ADR-0008](docs/adr/0008-vm-inventory-environment-source.md)). 로컬 VM 및 환경을 관찰하고, 자원 할당량(CPU, RAM, 디스크 GiB 단위)을 종합 표시하며, 발견된 환경에서 "클러스터 설정" 클릭 한 번으로 접속 가능한 Profile을 즉시 자동 저장한다.
+
+### 프로바이더 지원 현황
+
+사용하는 프로바이더만 설치하면 된다. ClusterDeck은 읽기 전용 및 제한된 실행(10초 타임아웃, 2 MiB 버퍼 제한, 셸 미사용)으로 인벤토리를 조회한다.
+
+| Provider | Discovery source | Current data | Limitations |
+| --- | --- | --- | --- |
+| Colima | `colima list --json` | Profile, 상태, CPU, RAM, 디스크 용량, 데이터 디스크 사용량, 생성 시각, advertised address | Kubernetes 상태는 아래 공통 감지를 따른다 |
+| VirtualBox | `VBoxManage list vms`, `showvminfo`, `showmediuminfo`, `guestproperty` | 등록된 VM, UUID, 상태, CPU, RAM, 디스크 용량/사용량, 생성 시각; 실행 중일 때 게스트 IP | 게스트가 IP를 보고할 때만 표시 |
+| VMware Fusion | 번들 `vmrun -T fusion list`, VMX 파일 | 실행 중인 VM, CPU, RAM, VMDK 디스크 용량/사용량, 생성 시각; `getGuestIPAddress`로 게스트 IP | 정지된 독립 VM은 목록에 없음; IP는 VMware Tools 실행 필요 |
+| Vagrant | `vagrant global-status`, `.vagrant/.../id`, `vagrant ssh-config` | 프로젝트, 상태, orchestrator/runtime 관계; VMware의 VMX/디스크 데이터; 고정 IP 또는 ssh-config 주소 | 프로젝트 디렉터리 또는 `.vagrant` 데이터가 사라진 항목은 `stale`로 표시; 미지원 provider는 건너뜀 |
+
+IP가 있는 머신의 Kubernetes 상태는 kubeconfig server 호스트와 6443 포트에 대한 500 ms TCP probe로 판단한다(`kubeconfig server`, `API server reachable (6443)`, `not detected`, IP가 없으면 `unknown`). 자격 증명은 읽지 않는다.
+
+> **독립형 CLI 관련 안내:** 기존 `infradeck` 독립형 CLI는 ClusterDeck 백엔드로 흡수되면서 공개 Rust 라이브러리 크레이트 API가 불필요하게 확장되는 것을 방지하기 위해 별도 바이너리로는 제공되지 않는다. 예제 인벤토리 확인은 데스크톱 앱 내의 **Demo 모드**를 통해 직접 이용할 수 있다.
 
 ## 첫 성공 기준 (First Verified Success)
 

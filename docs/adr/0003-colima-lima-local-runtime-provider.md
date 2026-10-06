@@ -5,6 +5,7 @@
 - Issue: #14
 - Note: the as-built implementation diverges from this decision; see [ADR-0005](0005-local-host-detection-prefills-profiles.md) (Proposed).
 - Note: the "Lifecycle actions (start/stop/restart)" item below, deferred to "its own issue", is now decided by [ADR-0007](0007-local-runtime-lifecycle-actions.md) (Accepted).
+- Note: VM inventory observation across Colima, VirtualBox, VMware Fusion, and Vagrant is expanded in [ADR-0008](0008-vm-inventory-environment-source.md) (Proposed).
 
 ## Context
 

@@ -24,6 +24,10 @@ Last verified: 2026-09-23 against `feat/14-local-runtime-lifecycle`
 - 실제 대상에 대한 fresh-session replay로 `clusterdeck-connection-workflow` Agent Skill을 재검증했습니다; `openforge-maturity`는 다시 `verified`입니다 (#22).
 - Host별 명시적 SSH 인증 모드(`key`, 기본값, 또는 `password`)를 추가했습니다: password 모드는 Connect, Test Connection, kubeconfig fetch 전 경로에서 일관되게 `sshpass -e`/`SSHPASS`를 사용하고, sshpass가 응답할 password prompt를 막는 `BatchMode=yes`는 생략하되 `StrictHostKeyChecking=accept-new`는 유지하며, password는 frontend state에만 존재하는 ephemeral 값입니다. 이 field가 없던 기존 profile YAML은 변경 없이 `key`로 역직렬화됩니다 (#26).
 
+## 진행 중 (In progress)
+
+- Infrastructure VM inventory (상태: 진행 중) — 구현됨: Colima, VirtualBox, VMware Fusion(실행 중 VM만), Vagrant 관찰; provider가 제공하는 범위의 디스크·게스트 IP·생성 시각 메타데이터; 증거 기반 Kubernetes 감지; 사라진 Vagrant 프로젝트의 `stale` 표시; ID 기반 조정(reconciliation), 자원 합계, 관찰된 환경 기반 원클릭 프로필 생성. 미구현: 정지된 독립 Fusion VM, 필드별 source/freshness 기록, 버전 관리되는 자격 증명 없는 manifest import ([ROADMAP-infrastructure.md](ROADMAP-infrastructure.md) 참조) ([ADR-0008](adr/0008-vm-inventory-environment-source.md) 및 `.omc/plans/infradeck-merge.md`에 따른 InfraDeck 통합 진행 중).
+
 ## 부분적 / 환경 의존
 
 - Unit/FakeRunner test는 application control flow를 증명하지만 실제 OpenSSH, kubectl, native filesystem, target cluster 동작을 증명하지 못합니다. Critical path 변경은 가능한 경우 real-binary/runtime evidence가 필요합니다.
@@ -55,3 +59,6 @@ Last verified: 2026-09-23 against `feat/14-local-runtime-lifecycle`
 - commit `268feab` (`clusterdeck-connection-workflow` skill re-verified, issue #22); evidence at `research/issue-22-connection-workflow-replay-2026-09-22.md`
 - commit `cb85aff` and commit `24b231c` (release workflow: macOS `.dmg` draft GitHub Release on `v*` tag push, third-party Actions pinned to commit SHAs)
 - branch `feat/26-password-ssh-auth` (password 기반 SSH 인증 모드, issue #26)
+- `docs/adr/0008-vm-inventory-environment-source.md` (VM 인벤토리 환경 소스 및 프로필 생성)
+- `docs/ROADMAP-infrastructure.md` (InfraDeck에서 보존된 인프라 로드맵)
+- `.omc/plans/infradeck-merge.md` (InfraDeck 통합 계획 및 아키텍처 개정 사항)

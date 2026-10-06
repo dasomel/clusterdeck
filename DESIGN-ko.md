@@ -9,6 +9,8 @@
 ClusterDeck은 Kubernetes 및 클러스터 노드 운영자를 위한 데스크톱 대시보드로, 통합 플릿 관리, SSH 접속 및 Kubernetes 연결을 제공합니다.
 
 - **Figma 디자인 시스템 원본:** [OpenForge Design System](https://www.figma.com/design/Y1JpRSOwctAKSwPjDNbe1g)
+- **저장소 스냅샷:** [design/figma-snapshot.md](design/figma-snapshot.md) 및 [design/design-tokens.json](design/design-tokens.json)
+- **스냅샷 기준일:** 2026-09-22
 - **참조 디자인:** OpenForge (`openforge/docs/design-system-ko.md`), Dasomel Portal (`dasomel.github.io`)
 
 ## 제품 성격 (Personality)
@@ -20,6 +22,9 @@ ClusterDeck은 Kubernetes 및 클러스터 노드 운영자를 위한 데스크�
 ## 시맨틱 토큰 매핑 (Token mapping)
 
 OpenForge 및 Figma 디자인 시스템 토큰과 연동된 매핑:
+
+Figma에 접근할 수 없을 때는 저장소 스냅샷을 기준으로 사용합니다. 외부 디자인이 변경되면
+토큰 매핑과 provenance를 함께 갱신해야 합니다.
 
 ```yaml
 tokens:
@@ -49,3 +54,7 @@ tokens:
   statusDanger: var(--of-color-status-danger, var(--danger, #ef4444))
   statusInfo: var(--of-color-status-info, #38bdf8)
 ```
+
+## 인프라 인벤토리 (Infrastructure Inventory)
+
+인프라 인벤토리 화면은 OpenForge 디자인 토큰 체계(`--of-color-*`, 밀도, 타이포그래피, 상태 신호)를 ClusterDeck의 기존 레이아웃과 일관되게 공유합니다. 인프라 인벤토리를 클러스터 프로필과 결합하는 전체 UI 재설계 사양은 [design/ui-redesign.md](design/ui-redesign.md)를 참조하십시오.

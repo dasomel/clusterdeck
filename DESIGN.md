@@ -9,6 +9,8 @@ English | [한국어](DESIGN-ko.md)
 ClusterDeck is a desktop application for Kubernetes and cluster node operators, providing unified cluster fleet management, SSH access, and Kubernetes connectivity.
 
 - **Figma Reference:** [OpenForge Design System](https://www.figma.com/design/Y1JpRSOwctAKSwPjDNbe1g)
+- **Repository snapshot:** [design/figma-snapshot.md](design/figma-snapshot.md) and [design/design-tokens.json](design/design-tokens.json)
+- **Snapshot date:** 2026-09-22
 - **Reference Implementations:** OpenForge (`openforge/docs/design-system.md`), Dasomel Portal (`dasomel.github.io`)
 
 ## Product personality
@@ -20,6 +22,9 @@ ClusterDeck is a desktop application for Kubernetes and cluster node operators, 
 ## Token mapping
 
 Aligned with OpenForge & Figma Design System tokens:
+
+The repository snapshot is the fallback source when the Figma file cannot be accessed. Update
+the snapshot and its provenance together with this mapping when the external design changes.
 
 ```yaml
 tokens:
@@ -55,3 +60,7 @@ tokens:
 - Tauri desktop host handles OS-level process management and SSH execution.
 - React frontend communicates via strictly typed Tauri IPC invoke channels.
 - UI state updates reactively without blocking terminal streams.
+
+## Infrastructure Inventory
+
+The Infrastructure inventory view shares the OpenForge design token system (`--of-color-*`, density, typography, and status indicators) with ClusterDeck's existing layout. The full UI redesign incorporating the infrastructure inventory alongside cluster profiles is specified in [design/ui-redesign.md](design/ui-redesign.md).

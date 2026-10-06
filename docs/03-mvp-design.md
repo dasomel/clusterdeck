@@ -106,6 +106,7 @@ commands/
   connection.rs      high-level connection workflow (SSH, kubeconfig fetch/backup/merge)
   local_runtime.rs   detect_local_hosts (Colima/Lima/Vagrant: Profile prefill + Settings dashboard)
   ca_trust.rs        discover/trust/replace/remove CA trust status (private CA local trust)
+  inventory.rs       discover_inventory, create_profile_from_environment (Infrastructure VM inventory)
 
 services/
   process.rs         executable discovery + async command runner
@@ -114,11 +115,13 @@ services/
                       context, for Profile-editor prefill and the read-only Settings dashboard
   k8s_endpoints.rs   Kubernetes API endpoint discovery (APISIX/Ingress/Istio/Gateway API/Service)
   ca_trust.rs        CA discovery, fingerprinting, and macOS login-keychain trust (private CA local trust)
+  inventory/         multi-provider VM inventory (Colima/VirtualBox/VMware Fusion/Vagrant), identity
+                      reconciliation, and environment profile generation (ADR-0008)
 ```
 
 The frontend adds `StatusBanner`, `KubeconfigManager`, and `ConfirmModal` components alongside
-`ProfileEditor`; see [ARCHITECTURE.md](ARCHITECTURE.md) sections 14-16 for the local runtime
-detection, Kubernetes endpoint discovery, and private CA local trust features.
+`ProfileEditor`; see [ARCHITECTURE.md](ARCHITECTURE.md) sections 14-17 for the local runtime
+detection, Kubernetes endpoint discovery, private CA local trust, and infrastructure VM inventory features.
 
 The existing process helper intentionally searches common macOS paths because bundled `.app` processes do not necessarily inherit the user's login-shell PATH. This follows the same defensive pattern used by KubeMetal.
 

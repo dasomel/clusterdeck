@@ -6,6 +6,11 @@ The format follows the principles of Keep a Changelog and uses semantic versioni
 
 ## [Unreleased]
 
+- Absorb InfraDeck into ClusterDeck: observe local VM inventory across Colima, VirtualBox, VMware Fusion, and Vagrant with exact-identity reconciliation (`runtime:runtime_id`), resource capacity totals (CPU, RAM, disk in GiB), and evidence-based Kubernetes detection ([ADR-0008](docs/adr/0008-vm-inventory-environment-source.md))
+- Add one-click "Set up cluster" action from observed multi-node environments, auto-saving a new profile via `store::upsert_profile` (superseding ADR-0005 D1 for this flow) and safely refreshing host address/port without overwriting custom profile settings
+- Enforce bounded provider process execution via `CommandRunner::run_bounded` (10s timeout, 2 MiB stream caps, `LC_ALL=C`, stdin null, `kill_on_drop(true)`) and strict path-segment validation before any local file read
+- Support built-in synthetic Demo mode (3-node Vagrant/VMware cluster) without running host commands; retire external InfraDeck repository and omit the standalone CLI binary to keep the Rust library API clean
+
 ## [0.4.1] - 2026-09-29
 
 - Skip remote kubeconfig candidates that have no authentication settings or broken context references, then continue probing later paths. Report the rejected candidate and remote read-permission guidance if no usable file is found.
