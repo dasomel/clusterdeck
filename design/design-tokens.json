@@ -1,0 +1,32 @@
+{
+  "$schema": "https://schemas.designtokens.org/format/2025-10/schema.json",
+  "source": {
+    "name": "OpenForge Design System",
+    "url": "https://www.figma.com/design/Y1JpRSOwctAKSwPjDNbe1g",
+    "snapshotDate": "2026-09-22",
+    "status": "repository-baseline",
+    "extraction": "unavailable-in-current-environment"
+  },
+  "color": {
+    "bgCanvas": { "value": "#0f141c", "cssVariable": "--of-color-bg-canvas" },
+    "bgSurface": { "value": "#161f2c", "cssVariable": "--of-color-bg-surface" },
+    "bgSurfaceSunken": { "value": "#0b0f16", "cssVariable": "--of-color-bg-subtle" },
+    "bgSurfaceRaised": { "value": "#1e2b3e", "cssVariable": "--of-color-bg-surface-raised" },
+    "textPrimary": { "value": "#f1f5f9", "cssVariable": "--of-color-text-primary" },
+    "textSecondary": { "value": "#cbd5e1", "cssVariable": "--of-color-text-secondary" },
+    "textMuted": { "value": "#94a3b8", "cssVariable": "--of-color-text-muted" },
+    "borderDefault": { "value": "#28374d", "cssVariable": "--of-color-border-default" },
+    "borderStrong": { "value": "#3e5270", "cssVariable": "--of-color-border-strong" },
+    "accentPrimary": { "value": "#38bdf8", "cssVariable": "--of-color-accent-primary" },
+    "accentContrast": { "value": "#031525", "cssVariable": "--of-color-accent-contrast" },
+    "focusRing": { "value": "#38bdf8", "cssVariable": "--of-color-focus-ring" },
+    "statusSuccess": { "value": "#22c55e", "cssVariable": "--of-color-status-success" },
+    "statusWarning": { "value": "#f59e0b", "cssVariable": "--of-color-status-warning" },
+    "statusDanger": { "value": "#ef4444", "cssVariable": "--of-color-status-danger" },
+    "statusInfo": { "value": "#38bdf8", "cssVariable": "--of-color-status-info" }
+  },
+  "typography": {
+    "ui": "-apple-system, BlinkMacSystemFont, \"SF Pro Display\", \"Segoe UI\", sans-serif",
+    "mono": "ui-monospace, \"SF Mono\", \"JetBrains Mono\", Menlo, Consolas, monospace"
+  }
+}
