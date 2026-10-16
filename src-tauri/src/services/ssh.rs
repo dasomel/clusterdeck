@@ -42,14 +42,52 @@ fn push_connection_options(args: &mut Vec<String>, host: &Host) {
     }
 }
 
-/// Formats a bastion as an SSH connection target: `user@address`, or `user@address:port` when
-/// the bastion isn't reachable on the default port 22.
-fn jump_target(b: &Bastion) -> String {
-    if b.port == 22 {
-        format!("{}@{}", b.user, b.address)
-    } else {
-        format!("{}@{}:{}", b.user, b.address, b.port)
+/// Quotes one ProxyCommand word. OpenSSH expands `%` tokens in ProxyCommand and then runs it via
+/// `/bin/sh -c`, so a profile value reaching it must be `%`-escaped and single-quoted --
+/// `is_safe_ssh_identifier` does not exclude shell metacharacters (`;`, `$`, spaces). `-i` still
+/// gets tilde expansion because ssh expands `~` in identity paths itself, not the shell.
+fn quote_proxy_command_word(s: &str) -> String {
+    format!("'{}'", s.replace('%', "%%").replace('\'', r"'\''"))
+}
+
+/// Pushes the bastion hop as `-o ProxyCommand=ssh ... -W %h:%p user@bastion`. Deliberately not
+/// `-J`/`ProxyJump`: the jump connection those spawn never receives the outer invocation's `-i`,
+/// so the bastion's own `identity_file` was silently ignored and the hop failed with
+/// `Permission denied (publickey)` unless the key happened to be loaded in ssh-agent. The hop
+/// also runs in BatchMode, so a rejected bastion login can never fall through to an interactive
+/// prompt (which sshpass would otherwise answer with the target's password).
+fn push_bastion_proxy_command(args: &mut Vec<String>, b: &Bastion) {
+    let mut words = vec![
+        "ssh".to_string(),
+        "-o".to_string(),
+        "BatchMode=yes".to_string(),
+        "-o".to_string(),
+        "ConnectTimeout=5".to_string(),
+        "-o".to_string(),
+        "StrictHostKeyChecking=accept-new".to_string(),
+        "-p".to_string(),
+        b.port.to_string(),
+    ];
+    if let Some(identity) = b.identity_file.as_deref().filter(|i| !i.is_empty()) {
+        // IdentitiesOnly keeps agent keys from exhausting the bastion's MaxAuthTries before the
+        // configured key is offered.
+        words.push("-o".to_string());
+        words.push("IdentitiesOnly=yes".to_string());
+        words.push("-i".to_string());
+        words.push(quote_proxy_command_word(identity));
     }
+    // Bracketed like OpenSSH's own ProxyJump expansion: a bare IPv6 target would make
+    // `-W addr:port` ambiguous.
+    words.push("-W".to_string());
+    words.push("'[%h]:%p'".to_string());
+    words.push("--".to_string());
+    words.push(quote_proxy_command_word(&format!(
+        "{}@{}",
+        b.user, b.address
+    )));
+
+    args.push("-o".to_string());
+    args.push(format!("ProxyCommand={}", words.join(" ")));
 }
 
 /// Forces an sshpass-driven connection down the password-only path. Without this, ssh tries
@@ -110,8 +148,7 @@ pub fn build_ssh_target_args(
     push_connection_options(&mut args, host);
 
     if let Some(b) = bastion {
-        args.push("-J".to_string());
-        args.push(jump_target(b));
+        push_bastion_proxy_command(&mut args, b);
     }
 
     args.push("--".to_string());
@@ -319,10 +356,10 @@ pub async fn probe_password_auth(
         };
     }
 
-    // Refuse rather than risk it: with no BatchMode on the -J jump hop (see below), a bastion
-    // whose own key auth fails would drop into an interactive password prompt -- for the
-    // BASTION, not the target -- and sshpass would answer it with the target's password,
-    // leaking that credential to the wrong host. Password auth here is target-host-only.
+    // Refuse rather than risk it: a jump hop without BatchMode whose own key auth fails would
+    // drop into an interactive password prompt -- for the BASTION, not the target -- and
+    // sshpass would answer it with the target's password, leaking that credential to the wrong
+    // host. Password auth here is target-host-only.
     if bastion.is_some() {
         return ProbeResult {
             host: host.name.clone(),
@@ -417,9 +454,7 @@ pub async fn deploy_public_key(
     push_password_auth_options(&mut args);
 
     if let Some(b) = bastion {
-        // ssh-copy-id has no -J flag; -o ProxyJump=<target> is the equivalent it does support.
-        args.push("-o".to_string());
-        args.push(format!("ProxyJump={}", jump_target(b)));
+        push_bastion_proxy_command(&mut args, b);
     }
 
     args.push("--".to_string());
@@ -619,8 +654,63 @@ mod tests {
             identity_file: None,
         };
         let args = build_ssh_target_args(&host(), Some(&bastion), &[]);
-        assert!(args.iter().any(|a| a == "-J"));
-        assert!(args.iter().any(|a| a.contains("ubuntu@10.0.0.10")));
+        assert!(!args.iter().any(|a| a == "-J"));
+        let proxy = args
+            .iter()
+            .find(|a| a.starts_with("ProxyCommand="))
+            .expect("bastion hop must be a ProxyCommand");
+        assert!(proxy.contains("-W '[%h]:%p'"));
+        assert!(proxy.contains("BatchMode=yes"));
+        assert!(proxy.contains("StrictHostKeyChecking=accept-new"));
+        assert!(proxy.ends_with("-- 'ubuntu@10.0.0.10'"));
+        assert!(!proxy.contains(" -i "));
+        assert!(!proxy.contains("IdentitiesOnly"));
+
+        let mut empty_identity = bastion.clone();
+        empty_identity.identity_file = Some(String::new());
+        let args = build_ssh_target_args(&host(), Some(&empty_identity), &[]);
+        assert!(!args.iter().any(|a| a.contains(" -i ")));
+    }
+
+    #[test]
+    fn bastion_proxy_command_carries_the_bastions_own_identity_file() {
+        // Regression: `-J` never forwarded the bastion's identity_file to the jump hop, so a
+        // bastion reachable only with that key failed with "Permission denied (publickey)".
+        use crate::services::config::Bastion;
+        let bastion = Bastion {
+            name: "b".into(),
+            address: "10.0.0.10".into(),
+            port: 2222,
+            user: "ubuntu".into(),
+            identity_file: Some("~/keys/bastion key.pem".into()),
+        };
+        let args = build_ssh_target_args(&host(), Some(&bastion), &[]);
+        let proxy = args
+            .iter()
+            .find(|a| a.starts_with("ProxyCommand="))
+            .unwrap();
+        assert!(proxy.contains("-p 2222"));
+        assert!(proxy.contains("-o IdentitiesOnly=yes -i '~/keys/bastion key.pem'"));
+    }
+
+    #[test]
+    fn bastion_proxy_command_quotes_shell_metacharacters_and_percent_tokens() {
+        // ProxyCommand goes through `%` expansion and then `/bin/sh -c`; is_safe_ssh_identifier
+        // still allows `;`, `$`, quotes and `%`, so those must arrive as literal text.
+        use crate::services::config::Bastion;
+        let bastion = Bastion {
+            name: "b".into(),
+            address: "h;touch /tmp/x".into(),
+            port: 22,
+            user: "o'k%h".into(),
+            identity_file: Some("/k/$(id)".into()),
+        };
+        let mut args = Vec::new();
+        push_bastion_proxy_command(&mut args, &bastion);
+        assert_eq!(
+            args[1],
+            r"ProxyCommand=ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new -p 22 -o IdentitiesOnly=yes -i '/k/$(id)' -W '[%h]:%p' -- 'o'\''k%%h@h;touch /tmp/x'"
+        );
     }
 
     #[test]
@@ -687,6 +777,28 @@ mod tests {
             assert!(!args.contains(&secret.to_string()));
             assert!(env.contains(&("SSHPASS".to_string(), secret.to_string())));
         }
+    }
+
+    #[tokio::test]
+    async fn deploy_public_key_routes_through_bastion_proxy_command() {
+        use crate::services::config::Bastion;
+        let bastion = Bastion {
+            name: "b".into(),
+            address: "10.0.0.10".into(),
+            port: 22,
+            user: "ubuntu".into(),
+            identity_file: Some("/k/bastion".into()),
+        };
+        let runner = EnvCapturingRunner {
+            calls: std::sync::Mutex::new(Vec::new()),
+        };
+        let _ = deploy_public_key(&runner, &host(), Some(&bastion), "irrelevant").await;
+        let calls = runner.calls.lock().unwrap();
+        let args = &calls[0].0;
+        assert!(!args.iter().any(|a| a.starts_with("ProxyJump=")));
+        assert!(args
+            .iter()
+            .any(|a| a.starts_with("ProxyCommand=") && a.contains("-i '/k/bastion'")));
     }
 
     #[tokio::test]
@@ -891,7 +1003,7 @@ mod tests {
     /// only caught by a real end-to-end SSH test, not FakeRunner unit tests.
     #[tokio::test]
     #[ignore = "spawns a real OS process; run manually with `cargo test -- --ignored`"]
-    async fn real_process_receives_batchmode_stricthostkeychecking_and_proxyjump_argv() {
+    async fn real_process_receives_batchmode_stricthostkeychecking_and_proxycommand_argv() {
         use crate::services::config::Bastion;
         use std::os::unix::fs::PermissionsExt;
 
@@ -940,11 +1052,11 @@ mod tests {
             "missing StrictHostKeyChecking=accept-new in real argv: {captured}"
         );
         assert!(
-            captured.contains("-J"),
-            "missing -J (ProxyJump) in real argv: {captured}"
+            captured.contains("ProxyCommand=ssh ") && captured.contains("-W '[%h]:%p'"),
+            "missing bastion ProxyCommand in real argv: {captured}"
         );
         assert!(
-            captured.contains("ubuntu@10.0.0.10"),
+            captured.contains("'ubuntu@10.0.0.10'"),
             "missing bastion target in real argv: {captured}"
         );
         assert!(
