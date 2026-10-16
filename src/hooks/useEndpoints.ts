@@ -193,7 +193,21 @@ export function useEndpoints(
       setDnsSkipped(res.skipped_hosts ?? []);
       void loadDnsStatus();
       if (profile.host_mapping === 'local_dns') {
-        pushStatus(res.success ? 'success' : 'warning', 'Local DNS Synced', [res.message]);
+        const outsideCount = (res.skipped_hosts ?? []).filter(
+          (s) => s.reason_kind === 'outside_zones',
+        ).length;
+        const approvedLower = (profile.approved_dns_zones ?? []).map((az) => az.toLowerCase());
+        const skippedZones = Array.from(
+          new Set((res.skipped_hosts ?? []).flatMap((s) => s.suggested_zones)),
+        ).filter((z) => !approvedLower.includes(z.toLowerCase()));
+        const details = [res.message];
+        if (outsideCount > 0 && skippedZones.length > 0) {
+          details.push(
+            `${outsideCount} endpoint${outsideCount === 1 ? ' is' : 's are'} not served: approve ${skippedZones.join(', ')} to publish ${outsideCount === 1 ? 'it' : 'them'}.`,
+          );
+        }
+        const isWarning = !res.success || Boolean(res.warning);
+        pushStatus(isWarning ? 'warning' : 'success', 'Local DNS Synced', details);
       } else {
         pushStatus('success', 'Hosts File Synced', [res.message]);
       }

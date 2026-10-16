@@ -38,6 +38,8 @@ pub struct SyncHostsResult {
     pub hosts_count: usize,
     pub endpoints: Vec<DiscoveredEndpoint>,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
     pub conflicts: Vec<crate::services::hosts_file::HostnameConflict>,
     /// Local-DNS (ADR-0011) outcome; empty/false for Hosts profiles.
     #[serde(default)]
@@ -545,6 +547,8 @@ pub async fn connect_profile(
 
     // Discover endpoints (Ingress, APISIX, Istio, Gateway API, Services)
     let mut endpoints = Vec::new();
+    let mut discovery_res: Result<Vec<DiscoveredEndpoint>, String> =
+        Err("kubernetes verification failed or kubeconfig missing".to_string());
     if verification.kubernetes && kubeconfig_exists {
         let default_ip = profile.hosts.first().map(|h| h.address.as_str());
         match crate::services::k8s_endpoints::discover_cluster_endpoints(
@@ -556,21 +560,54 @@ pub async fn connect_profile(
         .await
         {
             Ok(discovered) => {
-                endpoints = discovered;
+                endpoints = discovered.clone();
+                discovery_res = Ok(discovered);
             }
             Err(e) => {
                 errors.push(format!("endpoint discovery warning: {e}"));
+                discovery_res = Err(e);
             }
         }
+    } else if profile.kubeconfig.is_none() {
+        discovery_res = Ok(Vec::new());
     }
 
-    if profile.host_mapping == crate::services::config::HostMapping::Hosts {
+    let current_profile = store::load_profiles(&paths)
+        .ok()
+        .and_then(|ps| ps.into_iter().find(|p| p.id == profile_id))
+        .unwrap_or_else(|| profile.clone());
+
+    if current_profile.host_mapping == crate::services::config::HostMapping::Hosts {
         if let Err(e) = crate::services::hosts_file::upsert_hosts_block_with_endpoints(
-            &runner, &profile, &endpoints,
+            &runner,
+            &current_profile,
+            &endpoints,
         )
         .await
         {
             errors.push(format!("hosts file update failed: {e}"));
+        }
+    }
+
+    match crate::commands::local_dns::SystemDns::resolve() {
+        Ok(dns) => {
+            let discovery = discovery_res
+                .as_ref()
+                .map(|v| v.as_slice())
+                .map_err(|e| e.as_str());
+            crate::commands::local_dns::refresh_local_dns_on_connect(
+                &paths,
+                &dns.env(),
+                &profile_id,
+                discovery,
+                &mut errors,
+            )
+            .await;
+        }
+        Err(e) => {
+            if current_profile.host_mapping == crate::services::config::HostMapping::LocalDns {
+                errors.push(format!("local DNS resolution failed: {e}"));
+            }
         }
     }
 
@@ -623,20 +660,20 @@ pub async fn sync_hosts_file_cmd(profile_id: String) -> Result<SyncHostsResult, 
     let runner = SystemRunner;
     let kubeconfig_path = paths.kubeconfig_file(&profile_id);
 
-    let mut endpoints = Vec::new();
-    if kubeconfig_path.exists() {
+    let discovery_res: Result<Vec<DiscoveredEndpoint>, String> = if kubeconfig_path.exists() {
         let default_ip = profile.hosts.first().map(|h| h.address.as_str());
-        if let Ok(eps) = crate::services::k8s_endpoints::discover_cluster_endpoints(
+        crate::services::k8s_endpoints::discover_cluster_endpoints(
             &runner,
             &kubeconfig_path,
             default_ip,
             profile.gateway_address.as_deref(),
         )
         .await
-        {
-            endpoints = eps;
-        }
-    }
+    } else if profile.kubeconfig.is_none() {
+        Ok(Vec::new())
+    } else {
+        Err("kubeconfig not found for profile; please connect first".to_string())
+    };
 
     if profile.host_mapping == crate::services::config::HostMapping::LocalDns {
         let dns = crate::commands::local_dns::SystemDns::resolve()?;
@@ -645,11 +682,15 @@ pub async fn sync_hosts_file_cmd(profile_id: String) -> Result<SyncHostsResult, 
             &dns.env(),
             crate::commands::local_dns::hosts_path(),
             &profile,
-            endpoints,
+            match &discovery_res {
+                Ok(eps) => Ok(eps.clone()),
+                Err(e) => Err(e.as_str()),
+            },
         )
         .await;
     }
 
+    let endpoints = discovery_res.unwrap_or_default();
     crate::services::hosts_file::upsert_hosts_block_with_endpoints(&runner, &profile, &endpoints)
         .await?;
 
@@ -669,6 +710,7 @@ pub async fn sync_hosts_file_cmd(profile_id: String) -> Result<SyncHostsResult, 
         message: format!(
             "Successfully synced {hosts_count} host(s) and {endpoints_count} cluster endpoint(s) to /etc/hosts"
         ),
+        warning: None,
         conflicts,
         dns_conflicts: vec![],
         skipped_hosts: vec![],
@@ -730,6 +772,7 @@ pub async fn remove_hosts_file_cmd(profile_id: String) -> Result<SyncHostsResult
         hosts_count: 0,
         endpoints: vec![],
         message: format!("Successfully removed entries for profile '{profile_id}' from /etc/hosts"),
+        warning: None,
         conflicts: vec![],
         dns_conflicts: vec![],
         skipped_hosts: vec![],
