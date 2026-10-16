@@ -3,6 +3,9 @@
 use crate::services::k8s_endpoints::DiscoveredEndpoint;
 
 pub const HOSTS_FILE_PATH: &str = "/etc/hosts";
+/// Run as root right after /etc/hosts is replaced, so name lookups see the new entries.
+const FLUSH_DNS_CACHE: &str =
+    "/usr/bin/dscacheutil -flushcache; /usr/bin/killall -HUP mDNSResponder";
 
 pub fn render_hosts_block(profile: &crate::services::config::Profile) -> Result<String, String> {
     render_hosts_block_with_endpoints(profile, &[])
@@ -344,8 +347,12 @@ pub async fn write_hosts_file(
     }
 
     let tmp_path_str = tmp_path.to_string_lossy();
+    // macOS keeps answering from its resolver cache after /etc/hosts changes, so a browser
+    // would still reach the previous address (Issue #84). Flush in the same privileged call
+    // (no extra admin prompt); `|| true` keeps a failed flush from failing a successful copy,
+    // while `&&` still reports a failed copy.
     let script = format!(
-        "do shell script \"cp '{tmp_path_str}' {HOSTS_FILE_PATH}\" with administrator privileges"
+        "do shell script \"cp '{tmp_path_str}' {HOSTS_FILE_PATH} && {{ {FLUSH_DNS_CACHE} || true; }}\" with administrator privileges"
     );
 
     let res = runner.run("osascript", &["-e".to_string(), script]).await;
@@ -483,6 +490,46 @@ mod write_tests {
                 success: false,
             })
         }
+    }
+
+    struct ScriptCapturingRunner {
+        script: std::sync::Mutex<String>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::services::process::CommandRunner for ScriptCapturingRunner {
+        async fn run(
+            &self,
+            _bin: &str,
+            args: &[String],
+        ) -> Result<crate::services::process::CommandOutput, String> {
+            *self.script.lock().unwrap() = args.last().cloned().unwrap_or_default();
+            Ok(crate::services::process::CommandOutput {
+                stdout: String::new(),
+                stderr: String::new(),
+                success: true,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn write_hosts_file_flushes_dns_cache_in_the_same_privileged_call() {
+        let runner = ScriptCapturingRunner {
+            script: std::sync::Mutex::new(String::new()),
+        };
+        write_hosts_file(&runner, "127.0.0.1 localhost\n")
+            .await
+            .unwrap();
+        let script = runner.script.lock().unwrap().clone();
+        let cp = script.find("cp '").expect("copy step");
+        let flush = script.find("dscacheutil -flushcache").expect("flush step");
+        assert!(cp < flush, "{script}");
+        assert!(
+            script.contains("killall -HUP mDNSResponder || true; }"),
+            "{script}"
+        );
+        assert!(script.contains("/etc/hosts && {"), "{script}");
+        assert_eq!(script.matches("with administrator privileges").count(), 1);
     }
 
     #[tokio::test]
