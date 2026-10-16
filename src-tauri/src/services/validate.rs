@@ -236,6 +236,51 @@ pub fn validate_profile(profile: &crate::services::config::Profile) -> Result<()
     Ok(())
 }
 
+/// Private-use / reserved TLDs a ClusterDeck local-DNS zone may end in (ADR-0011 D3, plan R4).
+/// A zone is served authoritatively, which hides real DNS below it, so it must never be a
+/// public name a cluster tenant could pick (e.g. an ingress host `github.com`). Widening this
+/// list is an ADR change.
+pub const PRIVATE_ZONE_TLDS: [&str; 7] = [
+    "internal",
+    "test",
+    "example",
+    "local",
+    "home.arpa",
+    "localhost",
+    "invalid",
+];
+
+/// Sink validator for a local-DNS zone that may become an `/etc/resolver/<zone>` file name and
+/// an authoritative zone: a safe lowercase host domain with at least three labels that ends in
+/// one of `PRIVATE_ZONE_TLDS` (the TLD itself or a two-label private suffix never qualifies).
+pub fn is_allowed_private_zone(zone: &str) -> bool {
+    if zone != zone.to_ascii_lowercase() || !is_safe_host_domain(zone) {
+        return false;
+    }
+    let labels = zone.split('.').count();
+    labels >= 3
+        && PRIVATE_ZONE_TLDS
+            .iter()
+            .any(|tld| zone.ends_with(&format!(".{tld}")))
+}
+
+/// DNS label for a profile's node-alias zone `<label>.clusterdeck.local` (plan R5): profile ids
+/// may contain `_` and run to 64 chars, which DNS labels may not. `None` when nothing usable is
+/// left; callers must also reject two profiles that map to the same label.
+pub fn profile_dns_label(profile_id: &str) -> Option<String> {
+    if !is_safe_profile_id(profile_id) {
+        return None;
+    }
+    let mapped: String = profile_id
+        .to_ascii_lowercase()
+        .chars()
+        .map(|c| if c == '_' { '-' } else { c })
+        .collect();
+    let trimmed: String = mapped.trim_matches('-').chars().take(63).collect();
+    let trimmed = trimmed.trim_end_matches('-').to_string();
+    (!trimmed.is_empty()).then_some(trimmed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -550,5 +595,35 @@ mod tests {
         assert!(!is_safe_path_segment("has\0null"));
         assert!(!is_safe_path_segment("has\nnewline"));
         assert!(!is_safe_path_segment("has\rreturn"));
+    }
+
+    #[test]
+    fn allowed_private_zone_requires_private_tld_and_three_labels() {
+        assert!(is_allowed_private_zone("local.example.internal"));
+        assert!(is_allowed_private_zone("lab.clusterdeck.local"));
+        assert!(is_allowed_private_zone("a.b.home.arpa"));
+        assert!(!is_allowed_private_zone("example.internal"));
+        assert!(!is_allowed_private_zone("internal"));
+        assert!(!is_allowed_private_zone("apps.github.com"));
+        assert!(!is_allowed_private_zone("evil.internal.com"));
+        assert!(!is_allowed_private_zone("Upper.example.internal"));
+        assert!(!is_allowed_private_zone("bad_label.example.internal"));
+        assert!(!is_allowed_private_zone("../x.internal"));
+    }
+
+    #[test]
+    fn profile_dns_label_maps_ids_to_valid_labels() {
+        assert_eq!(
+            profile_dns_label("kakao_beluga").as_deref(),
+            Some("kakao-beluga")
+        );
+        assert_eq!(profile_dns_label("Lab").as_deref(), Some("lab"));
+        assert_eq!(profile_dns_label("_x_").as_deref(), Some("x"));
+        assert_eq!(profile_dns_label("___"), None);
+        assert_eq!(profile_dns_label("a/b"), None);
+        assert_eq!(
+            profile_dns_label(&"a".repeat(64)).map(|l| l.len()),
+            Some(63)
+        );
     }
 }
