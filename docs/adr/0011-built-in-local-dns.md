@@ -1,6 +1,6 @@
 # ADR-0011: Built-in local DNS with per-zone `/etc/resolver` entries instead of `/etc/hosts`
 
-- Status: Proposed (verification spike passed 2026-10-16; awaiting acceptance)
+- Status: Accepted (verification spike passed 2026-10-16)
 - Date: 2026-10-16
 - Issue: #86
 - Relates to: [ADR-0004](0004-hosts-file-toctou-mitigation.md), [ADR-0009](0009-bastion-api-tunnel.md), [ADR-0010](0010-profile-gateway-address.md)
