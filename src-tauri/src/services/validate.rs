@@ -264,6 +264,12 @@ pub fn is_allowed_private_zone(zone: &str) -> bool {
             .any(|tld| zone.ends_with(&format!(".{tld}")))
 }
 
+/// `clusterdeck.local` and everything under it is reserved for the implicit per-profile
+/// node-alias zones (`<label>.clusterdeck.local`); users may not approve it as a zone.
+pub fn is_reserved_clusterdeck_zone(zone: &str) -> bool {
+    zone == "clusterdeck.local" || zone.ends_with(".clusterdeck.local")
+}
+
 /// DNS label for a profile's node-alias zone `<label>.clusterdeck.local` (plan R5): profile ids
 /// may contain `_` and run to 64 chars, which DNS labels may not. `None` when nothing usable is
 /// left; callers must also reject two profiles that map to the same label.
@@ -320,7 +326,8 @@ mod tests {
             bastion: None,
             bootstrap: BootstrapPolicy::default(),
             kubeconfig: None,
-            manage_hosts_file: false,
+            host_mapping: crate::services::config::HostMapping::Off,
+            approved_dns_zones: Vec::new(),
             gateway_address: None,
             trusted_cas: Vec::new(),
             local_runtime: None,
@@ -354,7 +361,8 @@ mod tests {
             bastion: None,
             bootstrap: BootstrapPolicy::default(),
             kubeconfig: None,
-            manage_hosts_file: false,
+            host_mapping: crate::services::config::HostMapping::Off,
+            approved_dns_zones: Vec::new(),
             gateway_address: None,
             trusted_cas: Vec::new(),
             local_runtime: None,
@@ -447,7 +455,8 @@ mod tests {
                 local_path: "".into(),
                 context: "cka-lab".into(),
             }),
-            manage_hosts_file: false,
+            host_mapping: crate::services::config::HostMapping::Off,
+            approved_dns_zones: Vec::new(),
             gateway_address: None,
             trusted_cas: Vec::new(),
             local_runtime: None,
@@ -561,7 +570,8 @@ mod tests {
             bastion: None,
             bootstrap: BootstrapPolicy::default(),
             kubeconfig: None,
-            manage_hosts_file: false,
+            host_mapping: crate::services::config::HostMapping::Off,
+            approved_dns_zones: Vec::new(),
             gateway_address: None,
             trusted_cas: Vec::new(),
             local_runtime: Some(crate::services::config::LocalRuntimeSource {

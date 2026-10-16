@@ -115,25 +115,7 @@ impl ZoneTable {
                         rec.name, entry.zone
                     ));
                 }
-                // R5: check general IP safety first, then enforce IPv4-only for Phase 1.
-                if !is_safe_ip_address(&rec.ipv4) {
-                    return Err(format!(
-                        "invalid IP address '{}' for record '{}'",
-                        rec.ipv4, rec.name
-                    ));
-                }
-                let ipv4: Ipv4Addr = rec.ipv4.parse().map_err(|_| {
-                    format!(
-                        "IPv6 address '{}' is not supported for record '{}'",
-                        rec.ipv4, rec.name
-                    )
-                })?;
-                if ipv4.is_unspecified() {
-                    return Err(format!(
-                        "unspecified IPv4 address '{}' is not allowed for record '{}'",
-                        rec.ipv4, rec.name
-                    ));
-                }
+                let ipv4 = validate_record_ipv4(&rec.name, &rec.ipv4)?;
 
                 let addrs = records.entry(fqdn).or_default();
                 if !addrs.contains(&ipv4) {
@@ -163,6 +145,26 @@ impl ZoneTable {
     pub fn zones(&self) -> &BTreeSet<String> {
         &self.zones
     }
+}
+
+/// The single rule for a record's address, shared with `zones_builder` so the builder never
+/// emits a record that would make `load_and_validate` reject the whole file (R5): general IP
+/// safety first, then IPv4-only, and never the unspecified address.
+pub fn validate_record_ipv4(record_name: &str, ip: &str) -> Result<Ipv4Addr, String> {
+    if !is_safe_ip_address(ip) {
+        return Err(format!(
+            "invalid IP address '{ip}' for record '{record_name}'"
+        ));
+    }
+    let ipv4: Ipv4Addr = ip
+        .parse()
+        .map_err(|_| format!("IPv6 address '{ip}' is not supported for record '{record_name}'"))?;
+    if ipv4.is_unspecified() {
+        return Err(format!(
+            "unspecified IPv4 address '{ip}' is not allowed for record '{record_name}'"
+        ));
+    }
+    Ok(ipv4)
 }
 
 /// Returns true when `name` is equal to `zone` or is a subdomain under `zone` (both lowercase,

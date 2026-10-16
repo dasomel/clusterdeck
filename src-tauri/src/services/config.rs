@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(from = "ProfileWire")]
 pub struct Profile {
     pub id: String,
     pub name: String,
@@ -10,8 +11,14 @@ pub struct Profile {
     pub bastion: Option<Bastion>,
     pub bootstrap: BootstrapPolicy,
     pub kubeconfig: Option<KubeconfigSource>,
+    /// How this profile's discovered names are resolved locally (ADR-0011). Replaces the old
+    /// `manage_hosts_file` bool; `store.rs` migrates and dual-writes it (plan R9).
     #[serde(default)]
-    pub manage_hosts_file: bool,
+    pub host_mapping: HostMapping,
+    /// Local-DNS zones the user approved for this profile. A zone has at most one owner
+    /// profile (enforced in `store`); validated with `validate::is_allowed_private_zone`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub approved_dns_zones: Vec<String>,
     #[serde(default)]
     pub trusted_cas: Vec<crate::services::ca_trust::TrustedCa>,
     /// Externally reachable address of the cluster's ingress/gateway (for example a cloud
@@ -32,6 +39,69 @@ pub struct Profile {
     /// Connection/Connect fail with "Connection refused" against it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_runtime: Option<LocalRuntimeSource>,
+}
+
+/// Deserialization shape of `Profile`: accepts the legacy `manage_hosts_file` bool so YAML
+/// and old IPC payloads share one migration path (`HostMapping::migrate`, plan R9).
+#[derive(Deserialize)]
+struct ProfileWire {
+    id: String,
+    name: String,
+    hosts: Vec<Host>,
+    bastion: Option<Bastion>,
+    bootstrap: BootstrapPolicy,
+    kubeconfig: Option<KubeconfigSource>,
+    #[serde(default)]
+    manage_hosts_file: bool,
+    #[serde(default)]
+    host_mapping: Option<HostMapping>,
+    #[serde(default)]
+    approved_dns_zones: Vec<String>,
+    #[serde(default)]
+    trusted_cas: Vec<crate::services::ca_trust::TrustedCa>,
+    #[serde(default)]
+    gateway_address: Option<String>,
+    #[serde(default)]
+    local_runtime: Option<LocalRuntimeSource>,
+}
+
+impl From<ProfileWire> for Profile {
+    fn from(w: ProfileWire) -> Self {
+        Profile {
+            id: w.id,
+            name: w.name,
+            hosts: w.hosts,
+            bastion: w.bastion,
+            bootstrap: w.bootstrap,
+            kubeconfig: w.kubeconfig,
+            host_mapping: HostMapping::migrate(w.host_mapping, w.manage_hosts_file),
+            approved_dns_zones: w.approved_dns_zones,
+            trusted_cas: w.trusted_cas,
+            gateway_address: w.gateway_address,
+            local_runtime: w.local_runtime,
+        }
+    }
+}
+
+/// Name-resolution strategy for a profile. `Hosts` is the old `manage_hosts_file == true`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum HostMapping {
+    #[default]
+    Off,
+    LocalDns,
+    Hosts,
+}
+
+impl HostMapping {
+    /// `host_mapping` wins when present; otherwise the legacy bool decides.
+    pub fn migrate(mapping: Option<HostMapping>, legacy_manage_hosts_file: bool) -> HostMapping {
+        mapping.unwrap_or(if legacy_manage_hosts_file {
+            HostMapping::Hosts
+        } else {
+            HostMapping::Off
+        })
+    }
 }
 
 /// Identifies the local Colima/Lima instance a `Profile`'s host was created from. See
@@ -114,4 +184,40 @@ fn default_retries() -> u32 {
 
 fn default_retry_delay_secs() -> u64 {
     5
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BASE: &str =
+        r#"{"id":"a","name":"A","hosts":[],"bastion":null,"bootstrap":{},"kubeconfig":null"#;
+
+    #[test]
+    fn ipc_payload_with_legacy_bool_migrates() {
+        let on: Profile =
+            serde_json::from_str(&format!(r#"{BASE},"manage_hosts_file":true}}"#)).unwrap();
+        assert_eq!(on.host_mapping, HostMapping::Hosts);
+        let off: Profile = serde_json::from_str(&format!("{BASE}}}")).unwrap();
+        assert_eq!(off.host_mapping, HostMapping::Off);
+    }
+
+    #[test]
+    fn host_mapping_wins_over_legacy_bool_for_json_and_yaml() {
+        let j: Profile = serde_json::from_str(&format!(
+            r#"{BASE},"manage_hosts_file":true,"host_mapping":"local_dns"}}"#
+        ))
+        .unwrap();
+        assert_eq!(j.host_mapping, HostMapping::LocalDns);
+        let y: Profile = serde_yaml::from_str(
+            "id: a\nname: A\nhosts: []\nbastion: null\nbootstrap: {}\nkubeconfig: null\nmanage_hosts_file: true\nhost_mapping: off\n",
+        )
+        .unwrap();
+        assert_eq!(y.host_mapping, HostMapping::Off);
+        let legacy: Profile = serde_yaml::from_str(
+            "id: a\nname: A\nhosts: []\nbastion: null\nbootstrap: {}\nkubeconfig: null\nmanage_hosts_file: true\n",
+        )
+        .unwrap();
+        assert_eq!(legacy.host_mapping, HostMapping::Hosts);
+    }
 }

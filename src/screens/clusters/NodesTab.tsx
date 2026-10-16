@@ -23,7 +23,7 @@ export default function NodesTab({ profile, lastResult, hostsStatus, onOpenSsh }
       term: '/etc/hosts',
       detail: (
         <span>
-          {hostsStatus?.is_synced ? 'Synced' : profile.manage_hosts_file ? 'Auto-sync' : 'Manual'}
+          {hostsStatus?.is_synced ? 'Synced' : profile.host_mapping === 'hosts' ? 'Auto-sync' : 'Manual'}
         </span>
       ),
     },

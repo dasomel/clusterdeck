@@ -8,6 +8,7 @@ import {
   type LocalKubeContext,
   type DiscoveredLocalHost,
   type LocalRuntimeSource,
+  type HostMapping,
 } from '../api/tauri';
 
 export type ProfileEditorProps = {
@@ -73,8 +74,8 @@ export default function ProfileEditor({ initial, onClose, onSaved, onDeleteReque
     initial?.kubeconfig?.context ?? (initial?.id ?? '')
   );
 
-  const [manageHostsFile, setManageHostsFile] = useState(
-    initial?.manage_hosts_file ?? false
+  const [hostMapping, setHostMapping] = useState<HostMapping>(
+    initial?.host_mapping ?? 'off'
   );
   const [gatewayAddress, setGatewayAddress] = useState(
     initial?.gateway_address ?? ''
@@ -360,7 +361,8 @@ export default function ProfileEditor({ initial, onClose, onSaved, onDeleteReque
             context: kubeContext.trim(),
           }
         : null,
-      manage_hosts_file: manageHostsFile,
+      host_mapping: hostMapping,
+      approved_dns_zones: initial?.approved_dns_zones ?? [],
       gateway_address: gatewayAddress.trim() || null,
       trusted_cas: initial?.trusted_cas ?? [],
       local_runtime: localRuntime,
@@ -812,14 +814,16 @@ export default function ProfileEditor({ initial, onClose, onSaved, onDeleteReque
 
           {/* Manage /etc/hosts */}
           <div className="form-section">
-            <label className="form-checkbox-label">
-              <input
-                type="checkbox"
-                checked={manageHostsFile}
-                onChange={(e) => setManageHostsFile(e.target.checked)}
-              />
-              Manage /etc/hosts file entries
-            </label>
+            <label className="form-label">Host name mapping</label>
+            <select
+              className="form-select"
+              value={hostMapping}
+              onChange={(e) => setHostMapping(e.target.value as HostMapping)}
+            >
+              <option value="off">Off</option>
+              <option value="hosts">Manage /etc/hosts file entries</option>
+              <option value="local_dns">Local DNS (zones approved separately)</option>
+            </select>
             <p className="form-helper" style={{ marginLeft: '24px', marginTop: '2px' }}>
               Automatically maps profile host aliases in /etc/hosts bracketed by # BEGIN CLUSTERDECK MANAGED and # END CLUSTERDECK MANAGED markers.
             </p>
