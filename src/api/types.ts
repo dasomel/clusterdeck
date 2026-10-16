@@ -74,6 +74,11 @@ export type DiscoveredEndpoint = {
   resource_name: string;
 };
 
+export type ScanEndpointsResult = {
+  endpoints: DiscoveredEndpoint[];
+  warning?: string | null;
+};
+
 export type CaTrustStatus = 'new' | 'trusted' | 'rotated';
 
 export type DiscoveredCaView = {
@@ -160,6 +165,7 @@ export type DnsApplyView = {
   skipped_hosts: DnsSkippedHost[];
   prompted: boolean;
   cancelled: boolean;
+  zone_records?: Record<string, number>;
 };
 
 export type DiscoveredHost = { address: string; ssh_open: boolean };

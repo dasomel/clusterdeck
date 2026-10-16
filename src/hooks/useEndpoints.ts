@@ -44,6 +44,7 @@ export function useEndpoints(
   const [dnsSkipped, setDnsSkipped] = useState<DnsSkippedHost[]>([]);
   const [dnsStatus, setDnsStatus] = useState<LocalDnsStatus | null>(null);
   const [approvingZone, setApprovingZone] = useState<string | null>(null);
+  const [scanWarning, setScanWarning] = useState<string | null>(null);
 
   const loadHostsStatus = useCallback(async (profileId?: string) => {
     const id = profileId ?? profile?.id;
@@ -102,7 +103,9 @@ export function useEndpoints(
     if (!profile) return;
     setDiscoveringEndpoints(true);
     try {
-      const eps = await api.discoverClusterEndpoints(profile.id);
+      const res = await api.discoverClusterEndpoints(profile.id);
+      const eps = res.endpoints;
+      setScanWarning(res.warning ?? null);
       setLastResult((prev) => {
         if (!prev) {
           return {
@@ -110,11 +113,15 @@ export function useEndpoints(
             kubeconfig: null,
             verification: { ...EMPTY_VERIFICATION, kubernetes: true },
             endpoints: eps,
-            errors: [],
+            errors: res.warning ? [res.warning] : [],
             hosts: [],
           };
         }
-        return { ...prev, endpoints: eps };
+        return {
+          ...prev,
+          endpoints: eps,
+          errors: res.warning ? [res.warning] : [],
+        };
       });
       try {
         setCaViews(await api.discoverClusterCas(profile.id, eps));
@@ -122,10 +129,17 @@ export function useEndpoints(
         console.error('[ClusterDeck] discoverClusterCas failed during endpoint scan:', caErr);
         setCaViews([]);
       }
-      pushStatus('success', 'Endpoints Discovered', [
-        `Found ${eps.length} external cluster endpoint(s) (APISIX, Ingress, Gateways)`,
-      ]);
+      if (res.warning) {
+        pushStatus('warning', 'Endpoint Discovery Warning', [
+          `Found ${eps.length} external cluster endpoint(s), but cache could not be updated: ${res.warning}`,
+        ]);
+      } else {
+        pushStatus('success', 'Endpoints Discovered', [
+          `Found ${eps.length} external cluster endpoint(s) (APISIX, Ingress, Gateways)`,
+        ]);
+      }
     } catch (err) {
+      setScanWarning(null);
       pushStatus('error', 'Endpoint Discovery failed', [String(err)]);
     } finally {
       setDiscoveringEndpoints(false);
@@ -238,16 +252,27 @@ export function useEndpoints(
           `${zone} was approved, but DNS conflicts need resolution: ${view.conflicts.map((c) => c.zone).join(', ')}.`,
         ]);
       } else {
-        pushStatus('success', 'DNS Zone Approved', [
-          `${zone} is now served by local DNS for ${profile.name}.`,
-        ]);
+        const recordCount = view.zone_records?.[zone] ?? 0;
+        if (scanWarning) {
+          pushStatus('warning', 'DNS Zone Approved with Warning', [
+            `${zone} approved, but endpoint cache was not updated during scan (${scanWarning}); press Scan or Sync.`,
+          ]);
+        } else if (recordCount > 0) {
+          pushStatus('success', 'DNS Zone Approved', [
+            `${zone} is now served by local DNS for ${profile.name}.`,
+          ]);
+        } else {
+          pushStatus('warning', 'DNS Zone Approved', [
+            `${zone} approved, but no endpoints are cached yet; press Scan or Sync.`,
+          ]);
+        }
       }
     } catch (err) {
       pushStatus('error', 'Approve zone failed', [String(err)]);
     } finally {
       setApprovingZone(null);
     }
-  }, [profile, reloadProfiles, loadDnsStatus, pushStatus]);
+  }, [profile, reloadProfiles, loadDnsStatus, pushStatus, scanWarning]);
 
   const clearHosts = useCallback(async () => {
     if (!profile) return;

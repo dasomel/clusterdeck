@@ -45,6 +45,10 @@ impl ClusterDeckPaths {
         self.base.join("state.json")
     }
 
+    pub fn endpoints_cache_file(&self) -> PathBuf {
+        self.base.join("dns").join("endpoints.json")
+    }
+
     pub fn ensure_dirs(&self) -> Result<(), String> {
         std::fs::create_dir_all(self.ssh_dir()).map_err(|e| e.to_string())?;
         std::fs::create_dir_all(self.kubeconfigs_dir()).map_err(|e| e.to_string())?;

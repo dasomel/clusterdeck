@@ -20,6 +20,7 @@ import type {
   ManagedProfileKubeconfig,
   MergeKubeconfigResult,
   Profile,
+  ScanEndpointsResult,
   SuggestedDnsZones,
   SyncHostsResult,
   TrustedCa,
@@ -78,7 +79,7 @@ export const api = {
   openLocalRuntimeContext: (provider: LocalRuntimeLifecycleProvider, instanceName: string) =>
     invoke<void>('open_local_runtime_context', { provider, instanceName }),
   discoverClusterEndpoints: (profileId: string) =>
-    invoke<DiscoveredEndpoint[]>('discover_cluster_endpoints_cmd', { profileId }),
+    invoke<ScanEndpointsResult>('discover_cluster_endpoints_cmd', { profileId }),
   syncHostsFile: (profileId: string) =>
     invoke<SyncHostsResult>('sync_hosts_file_cmd', { profileId }),
   getHostsFileStatus: (profileId: string) =>

@@ -283,6 +283,8 @@ mod test_support {
 use crate::services::resolver_files::render_resolver_file;
 use test_support::*;
 
+mod round4;
+
 fn zone_names(f: &Fake) -> Vec<String> {
     f.served().into_iter().map(|(z, _)| z).collect()
 }
@@ -1010,6 +1012,11 @@ async fn connect_discovery_result_branches() {
     let p = profile("cka", HostMapping::LocalDns, &["lab.example.internal"]);
     store::upsert_profile(&paths, p.clone()).unwrap();
 
+    // First sync to establish the resolver files so zones are installed.
+    sync_local_dns_profile(&paths, &f.env(), &f.hosts, &p, Ok(vec![]))
+        .await
+        .unwrap();
+
     // 1. Success branch with endpoints: cache updated, records served, no errors
     let eps = vec![ep("api.lab.example.internal", "192.0.2.60")];
     let mut errors = Vec::new();
@@ -1064,7 +1071,7 @@ async fn connect_local_dns_is_non_fatal_on_cancel_or_error() {
     f.set_cancel_osascript(true);
     let mut errors = Vec::new();
 
-    // Since this is the first write and requires a prompt, cancelling the prompt reports the warning.
+    // Resolver files are not installed; Connect must not prompt and must report pending state without crashing.
     refresh_local_dns_on_connect(
         &paths,
         &f.env(),
@@ -1075,7 +1082,12 @@ async fn connect_local_dns_is_non_fatal_on_cancel_or_error() {
     .await;
 
     assert_eq!(errors.len(), 1);
-    assert!(errors[0].contains("cancelled"));
+    assert!(errors[0].contains("Local DNS changes pending: press Sync to local DNS"));
+    assert_eq!(
+        f.count("osascript"),
+        0,
+        "must not prompt for uninstalled resolver files"
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -1135,7 +1147,7 @@ async fn connect_profile_switched_to_hosts_results_in_no_reapply_and_no_prompt()
 }
 
 #[tokio::test(start_paused = true)]
-async fn connect_profile_switched_to_localdns_results_in_reapply() {
+async fn connect_profile_switched_to_localdns_records_pending_without_prompt() {
     let f = Fake::new();
     let paths = f.cd_paths();
     // Simulate user switching profile from Hosts to LocalDns during Connect
@@ -1146,22 +1158,18 @@ async fn connect_profile_switched_to_localdns_results_in_reapply() {
     let mut errors = Vec::new();
     refresh_local_dns_on_connect(&paths, &f.env(), "cka", Ok(&eps), &mut errors).await;
 
-    assert!(errors.is_empty());
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].contains("Local DNS changes pending: press Sync to local DNS"));
+    assert_eq!(
+        f.count("osascript"),
+        0,
+        "Connect must never prompt for uninstalled resolver files"
+    );
     let cache = cache_load(&cache_path(&f.env()));
     assert_eq!(
         cache.get("cka").map(|v| v.as_slice()),
         Some(eps.as_slice()),
-        "profile switched to LocalDns must store discovered endpoints in cache"
-    );
-    assert_eq!(
-        records_of(&f, "lab.example.internal"),
-        vec!["api.lab.example.internal"],
-        "profile switched to LocalDns must reapply and serve records"
-    );
-    assert_eq!(
-        f.count("osascript"),
-        1,
-        "first apply for LocalDns profile writes resolver and prompts"
+        "endpoints are cached so sync can serve them immediately"
     );
 }
 
@@ -1359,4 +1367,302 @@ fn suggest_dns_zones_caps_input_and_drops_invalid_hosts() {
     assert!(!res.by_host.contains_key("../malicious.example.internal"));
     assert!(!res.by_host.contains_key(""));
     assert!(!res.by_host.contains_key("foo;bar"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn critic_partial_discovery_erases_last_known_records() {
+    struct Partial;
+    #[async_trait::async_trait]
+    impl crate::services::process::CommandRunner for Partial {
+        async fn run(
+            &self,
+            bin: &str,
+            args: &[String],
+        ) -> Result<crate::services::process::CommandOutput, String> {
+            if bin == "kubectl" && args.last().map(String::as_str) == Some("/api/v1/services") {
+                Ok(crate::services::process::CommandOutput {
+                    stdout: "{\"items\":[]}".into(),
+                    stderr: String::new(),
+                    success: true,
+                })
+            } else {
+                Err("connection reset".into())
+            }
+        }
+    }
+    let f = Fake::new();
+    let paths = f.cd_paths();
+    let p = profile("cka", HostMapping::LocalDns, &["lab.example.internal"]);
+    store::upsert_profile(&paths, p.clone()).unwrap();
+    sync_local_dns_profile(
+        &paths,
+        &f.env(),
+        &f.hosts,
+        &p,
+        Ok(vec![ep("api.lab.example.internal", "192.0.2.60")]),
+    )
+    .await
+    .unwrap();
+    let detailed = crate::services::k8s_endpoints::discover_cluster_endpoints_detailed(
+        &Partial,
+        &f.home.join("missing-kubeconfig"),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(detailed.endpoints.is_empty());
+    assert_eq!(detailed.succeeded_kinds, vec!["service"]);
+    assert!(!detailed.failed_kinds.is_empty());
+
+    let mut errors = vec![];
+    refresh_local_dns_on_connect_detailed(&paths, &f.env(), "cka", Ok(&detailed), &mut errors)
+        .await;
+
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("Partial endpoint discovery: failed querying")),
+        "errors should warn about failed queries: {errors:?}"
+    );
+    assert_eq!(
+        records_of(&f, "lab.example.internal"),
+        vec!["api.lab.example.internal"],
+        "records of failed kinds must be preserved"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn critic_stale_save_reintroduces_hosts_after_off() {
+    let f = Fake::new();
+    let paths = f.cd_paths();
+    let old = profile("cka", HostMapping::LocalDns, &[]);
+    store::upsert_profile(&paths, old.clone()).unwrap();
+    sync_local_dns_profile(&paths, &f.env(), &f.hosts, &old, Ok(vec![]))
+        .await
+        .unwrap();
+    let mut intermediate = old.clone();
+    intermediate.host_mapping = HostMapping::Hosts;
+    store::upsert_profile(&paths, intermediate.clone()).unwrap();
+    // A second save completes while the first is between the write lock and DNS lane lock.
+    let mut latest = intermediate.clone();
+    latest.host_mapping = HostMapping::Off;
+    store::upsert_profile(&paths, latest).unwrap();
+    reapply_after_save(&paths, &f.env(), &f.hosts, Some(&old), &intermediate)
+        .await
+        .unwrap();
+    assert_eq!(
+        store::get_profile(&paths, "cka").unwrap().host_mapping,
+        HostMapping::Off
+    );
+    assert!(!std::fs::read_to_string(&f.hosts)
+        .unwrap()
+        .contains("ClusterDeck BEGIN"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn critic_scan_approval_has_no_records() {
+    let f = Fake::new();
+    let paths = f.cd_paths();
+    let mut p = profile("cka", HostMapping::LocalDns, &[]);
+    store::upsert_profile(&paths, p.clone()).unwrap();
+    // Scan returns data to React only; approve mutates the store and reapplies with no record.
+    p.approved_dns_zones.push("lab.example.internal".into());
+    store::upsert_profile(&paths, p).unwrap();
+    let view = reapply(&paths, &f.env(), None, None, None).await.unwrap();
+    assert!(!view.cancelled && view.conflicts.is_empty());
+    assert_eq!(
+        view.zone_records.get("lab.example.internal").copied(),
+        Some(0)
+    );
+    assert!(records_of(&f, "lab.example.internal").is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn critic_connect_retries_cancelled_approval_prompt() {
+    let f = Fake::new();
+    let paths = f.cd_paths();
+    let p = profile("cka", HostMapping::LocalDns, &[]);
+    store::upsert_profile(&paths, p).unwrap();
+    f.set_cancel_osascript(true);
+    let cancelled = reapply(&paths, &f.env(), None, None, None).await.unwrap();
+    assert!(cancelled.cancelled);
+    let before = f.count("osascript");
+    let mut errors = vec![];
+    refresh_local_dns_on_connect(&paths, &f.env(), "cka", Ok(&[]), &mut errors).await;
+    assert_eq!(
+        f.count("osascript"),
+        before,
+        "Connect must not retry prompt"
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("Local DNS changes pending: press Sync to local DNS")),
+        "must report pending state: {errors:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn scan_stores_endpoints_in_cache_for_subsequent_approval() {
+    let f = Fake::new();
+    let paths = f.cd_paths();
+    let mut p = profile("cka", HostMapping::LocalDns, &[]);
+    store::upsert_profile(&paths, p.clone()).unwrap();
+
+    // Scan persists validated endpoints into cache
+    let eps = vec![ep("api.lab.example.internal", "192.0.2.50")];
+    update_endpoint_cache(&cache_path(&f.env()), "cka", &eps, None).unwrap();
+
+    // Now user approves the zone
+    p.approved_dns_zones.push("lab.example.internal".into());
+    store::upsert_profile(&paths, p).unwrap();
+    let view = reapply(&paths, &f.env(), None, None, None).await.unwrap();
+    assert_eq!(
+        view.zone_records.get("lab.example.internal").copied(),
+        Some(1)
+    );
+    assert_eq!(
+        records_of(&f, "lab.example.internal"),
+        vec!["api.lab.example.internal"]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn rereview_connect_after_cancelled_revoke_must_not_prompt() {
+    let f = Fake::new();
+    let paths = f.cd_paths();
+    let mut p = profile("cka", HostMapping::LocalDns, &["lab.example.internal"]);
+    store::upsert_profile(&paths, p.clone()).unwrap();
+    reapply(&paths, &f.env(), None, None, None).await.unwrap();
+    p.approved_dns_zones.clear();
+    store::upsert_profile(&paths, p).unwrap();
+    f.set_cancel_osascript(true);
+    assert!(
+        reapply(&paths, &f.env(), None, None, None)
+            .await
+            .unwrap()
+            .cancelled
+    );
+    let before = f.count("osascript");
+    let mut errors = vec![];
+    refresh_local_dns_on_connect(&paths, &f.env(), "cka", Ok(&[]), &mut errors).await;
+    assert_eq!(
+        f.count("osascript"),
+        before,
+        "Connect retried cancelled revoke: {errors:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn rereview_forbidden_must_preserve_cached_ingress() {
+    struct Forbidden;
+    #[async_trait::async_trait]
+    impl crate::services::process::CommandRunner for Forbidden {
+        async fn run(
+            &self,
+            bin: &str,
+            args: &[String],
+        ) -> Result<crate::services::process::CommandOutput, String> {
+            let services = args.last().is_some_and(|s| s.ends_with("/api/v1/services"));
+            Ok(crate::services::process::CommandOutput {
+                success: services || bin == "curl",
+                stdout: if services {
+                    r#"{"items":[]}"#
+                } else {
+                    r#"{"kind":"Status","status":"Failure","reason":"Forbidden","code":403}"#
+                }
+                .into(),
+                stderr: String::new(),
+            })
+        }
+    }
+    let f = Fake::new();
+    let paths = f.cd_paths();
+    let p = profile("cka", HostMapping::LocalDns, &["lab.example.internal"]);
+    store::upsert_profile(&paths, p).unwrap();
+    update_endpoint_cache(
+        &cache_path(&f.env()),
+        "cka",
+        &[ep("api.lab.example.internal", "192.0.2.60")],
+        None,
+    )
+    .unwrap();
+    let kc = f.home.join("test-kubeconfig");
+    std::fs::write(
+        &kc,
+        "clusters:\n- cluster:\n    server: https://192.0.2.1:6443\n",
+    )
+    .unwrap();
+    let res = crate::services::k8s_endpoints::discover_cluster_endpoints_detailed(
+        &Forbidden, &kc, None, None,
+    )
+    .await
+    .unwrap();
+    let mut errors = vec![];
+    refresh_local_dns_on_connect_detailed(&paths, &f.env(), "cka", Ok(&res), &mut errors).await;
+    assert_eq!(
+        cache_load(&cache_path(&f.env()))["cka"].len(),
+        1,
+        "Forbidden classified as success: {res:?}"
+    );
+    assert!(res.failed_kinds.contains(&"ingress".to_string()));
+}
+
+#[tokio::test(start_paused = true)]
+async fn malformed_list_must_preserve_cached_records() {
+    struct MalformedRunner;
+    #[async_trait::async_trait]
+    impl crate::services::process::CommandRunner for MalformedRunner {
+        async fn run(
+            &self,
+            bin: &str,
+            args: &[String],
+        ) -> Result<crate::services::process::CommandOutput, String> {
+            let services = args.last().is_some_and(|s| s.ends_with("/api/v1/services"));
+            Ok(crate::services::process::CommandOutput {
+                success: services || bin == "curl",
+                stdout: if services {
+                    r#"{"items":[]}"#
+                } else {
+                    r#"{"kind":"IngressList","metadata":{}}"#
+                }
+                .into(),
+                stderr: String::new(),
+            })
+        }
+    }
+    let f = Fake::new();
+    let paths = f.cd_paths();
+    let p = profile("cka", HostMapping::LocalDns, &["lab.example.internal"]);
+    store::upsert_profile(&paths, p).unwrap();
+    update_endpoint_cache(
+        &cache_path(&f.env()),
+        "cka",
+        &[ep("api.lab.example.internal", "192.0.2.60")],
+        None,
+    )
+    .unwrap();
+    let kc = f.home.join("test-kubeconfig-malformed");
+    std::fs::write(
+        &kc,
+        "clusters:\n- cluster:\n    server: https://192.0.2.1:6443\n",
+    )
+    .unwrap();
+    let res = crate::services::k8s_endpoints::discover_cluster_endpoints_detailed(
+        &MalformedRunner,
+        &kc,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let mut errors = vec![];
+    refresh_local_dns_on_connect_detailed(&paths, &f.env(), "cka", Ok(&res), &mut errors).await;
+    assert_eq!(
+        cache_load(&cache_path(&f.env()))["cka"].len(),
+        1,
+        "Malformed list classified as success: {res:?}"
+    );
+    assert!(res.failed_kinds.contains(&"ingress".to_string()));
 }

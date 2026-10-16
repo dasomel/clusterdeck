@@ -29,7 +29,7 @@ use crate::services::resolver_files::{
 };
 use crate::services::store::{self, ProfileWriteGuard};
 use crate::services::validate::{
-    is_allowed_private_zone, is_reserved_clusterdeck_zone, is_safe_host_domain,
+    is_allowed_private_zone, is_reserved_clusterdeck_zone, is_safe_host_domain, is_safe_ip_address,
 };
 
 const ENDPOINTS_CACHE_FILE: &str = "endpoints.json";
@@ -74,6 +74,8 @@ pub struct DnsApplyView {
     pub skipped_hosts: Vec<DnsSkippedHost>,
     pub prompted: bool,
     pub cancelled: bool,
+    #[serde(default)]
+    pub zone_records: HashMap<String, usize>,
 }
 
 impl DnsApplyView {
@@ -146,7 +148,7 @@ impl SystemDns {
 
 type EndpointCache = HashMap<String, Vec<DiscoveredEndpoint>>;
 
-fn cache_path(env: &ManagerEnv<'_>) -> PathBuf {
+pub(crate) fn cache_path(env: &ManagerEnv<'_>) -> PathBuf {
     env.paths.dns_dir.join(ENDPOINTS_CACHE_FILE)
 }
 
@@ -164,6 +166,148 @@ fn cache_update(path: &Path, f: impl FnOnce(&mut EndpointCache)) -> Result<(), S
     f(&mut cache);
     let json = serde_json::to_vec(&cache).map_err(|e| e.to_string())?;
     agent::atomic_write(path, &json, 0o600)
+}
+
+#[derive(Debug, Clone)]
+pub struct EndpointDiscoveryInput {
+    pub endpoints: Vec<DiscoveredEndpoint>,
+    pub succeeded_kinds: Option<Vec<String>>,
+    pub failed_kinds: Vec<String>,
+}
+
+impl From<Vec<DiscoveredEndpoint>> for EndpointDiscoveryInput {
+    fn from(endpoints: Vec<DiscoveredEndpoint>) -> Self {
+        Self {
+            endpoints,
+            succeeded_kinds: None,
+            failed_kinds: Vec::new(),
+        }
+    }
+}
+
+impl From<&[DiscoveredEndpoint]> for EndpointDiscoveryInput {
+    fn from(endpoints: &[DiscoveredEndpoint]) -> Self {
+        Self {
+            endpoints: endpoints.to_vec(),
+            succeeded_kinds: None,
+            failed_kinds: Vec::new(),
+        }
+    }
+}
+
+impl From<&Vec<DiscoveredEndpoint>> for EndpointDiscoveryInput {
+    fn from(endpoints: &Vec<DiscoveredEndpoint>) -> Self {
+        Self {
+            endpoints: endpoints.clone(),
+            succeeded_kinds: None,
+            failed_kinds: Vec::new(),
+        }
+    }
+}
+
+impl From<crate::services::k8s_endpoints::DiscoveryResult> for EndpointDiscoveryInput {
+    fn from(res: crate::services::k8s_endpoints::DiscoveryResult) -> Self {
+        Self {
+            endpoints: res.endpoints,
+            succeeded_kinds: Some(res.succeeded_kinds),
+            failed_kinds: res.failed_kinds,
+        }
+    }
+}
+
+impl From<&crate::services::k8s_endpoints::DiscoveryResult> for EndpointDiscoveryInput {
+    fn from(res: &crate::services::k8s_endpoints::DiscoveryResult) -> Self {
+        Self {
+            endpoints: res.endpoints.clone(),
+            succeeded_kinds: Some(res.succeeded_kinds.clone()),
+            failed_kinds: res.failed_kinds.clone(),
+        }
+    }
+}
+
+pub struct EndpointRecordUpdate<'a> {
+    pub profile_id: &'a str,
+    pub endpoints: &'a [DiscoveredEndpoint],
+    pub succeeded_kinds: Option<&'a [String]>,
+}
+
+impl<'a> From<(&'a str, &'a [DiscoveredEndpoint])> for EndpointRecordUpdate<'a> {
+    fn from((profile_id, endpoints): (&'a str, &'a [DiscoveredEndpoint])) -> Self {
+        Self {
+            profile_id,
+            endpoints,
+            succeeded_kinds: None,
+        }
+    }
+}
+
+/// Last-known endpoints of one profile (empty when there is no cache entry).
+pub(crate) fn cached_endpoints(cache_file: &Path, profile_id: &str) -> Vec<DiscoveredEndpoint> {
+    cache_load(cache_file)
+        .remove(profile_id)
+        .unwrap_or_default()
+}
+
+/// Drops a deleted profile's entry (any mapping: Hosts mode writes the cache too), so a later
+/// profile with the same id never inherits its kind attribution.
+pub(crate) fn remove_cached_endpoints(cache_file: &Path, profile_id: &str) -> Result<(), String> {
+    cache_update(cache_file, |c| {
+        c.remove(profile_id);
+    })
+}
+
+/// Kinds in `succeeded` are replaced by exactly their fresh results; everything else already
+/// known is kept. `None` means "the whole list is fresh".
+pub(crate) fn merge_endpoints(
+    existing: Vec<DiscoveredEndpoint>,
+    discovered: &[DiscoveredEndpoint],
+    succeeded_kinds: Option<&[String]>,
+) -> Vec<DiscoveredEndpoint> {
+    match succeeded_kinds {
+        Some(succeeded) => {
+            let mut merged: Vec<DiscoveredEndpoint> = existing
+                .into_iter()
+                .filter(|ep| !succeeded.iter().any(|k| k == &ep.source))
+                .collect();
+            for ep in discovered {
+                if succeeded.iter().any(|k| k == &ep.source)
+                    && is_safe_host_domain(&ep.host)
+                    && is_safe_ip_address(&ep.ip)
+                {
+                    merged.push(ep.clone());
+                }
+            }
+            let mut dedup_map = std::collections::BTreeMap::new();
+            for ep in merged {
+                if !dedup_map.contains_key(&ep.host) {
+                    dedup_map.insert(ep.host.clone(), ep);
+                }
+            }
+            dedup_map.into_values().collect()
+        }
+        None => discovered
+            .iter()
+            .filter(|ep| is_safe_host_domain(&ep.host) && is_safe_ip_address(&ep.ip))
+            .cloned()
+            .collect(),
+    }
+}
+
+pub fn update_endpoint_cache(
+    cache_file: &Path,
+    profile_id: &str,
+    discovered: &[DiscoveredEndpoint],
+    succeeded_kinds: Option<&[String]>,
+) -> Result<Vec<DiscoveredEndpoint>, String> {
+    let _guard = CACHE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut cache = cache_load(cache_file);
+    let existing = cache.remove(profile_id).unwrap_or_default();
+    let updated = merge_endpoints(existing, discovered, succeeded_kinds);
+
+    cache.insert(profile_id.to_string(), updated.clone());
+    let json = serde_json::to_vec(&cache).map_err(|e| e.to_string())?;
+    agent::atomic_write(cache_file, &json, 0o600)?;
+    Ok(updated)
 }
 
 // ---------- core ----------
@@ -248,12 +392,71 @@ async fn disable(
     Ok(view)
 }
 
-async fn reapply_locked(
+fn skipped_hosts_view(
+    build: &crate::services::local_dns::zones_builder::BuildOutput,
+) -> Vec<DnsSkippedHost> {
+    build
+        .skipped
+        .iter()
+        .map(|s| DnsSkippedHost {
+            profile_id: s.profile_id.clone(),
+            host: s.host.clone(),
+            reason: s.reason.clone(),
+            reason_kind: s.reason_kind,
+            suggested_zones: if s.reason_kind == SkippedReasonKind::OutsideZones {
+                suggested_zones(&s.host)
+            } else {
+                Vec::new()
+            },
+        })
+        .collect()
+}
+
+fn zone_record_counts(
+    build: &crate::services::local_dns::zones_builder::BuildOutput,
+) -> HashMap<String, usize> {
+    build
+        .zones
+        .zones
+        .iter()
+        .map(|z| (z.zone.clone(), z.records.len()))
+        .collect()
+}
+
+/// Refreshes the records of the zones already installed for every `LocalDns` profile without any
+/// /etc/resolver change, so it can never raise a privileged prompt -- in particular not for
+/// another profile's pending or cancelled zones. Pending resolver changes stay pending until
+/// the user's explicit Sync / approve action.
+async fn reapply_records_only_locked(
+    paths: &ClusterDeckPaths,
+    env: &ManagerEnv<'_>,
+) -> Result<DnsApplyView, String> {
+    let profiles = store::load_profiles(paths)?;
+    let cached = cache_load(&cache_path(env));
+    let build = build_zones(&profiles, &cached, 0, env.port);
+    manager::apply_records_only(env, &build.zones.zones).await?;
+    Ok(DnsApplyView {
+        conflicts: build
+            .conflicts
+            .iter()
+            .map(|c| DnsConflict {
+                zone: c.zone.clone(),
+                kind: "claimed_by_multiple".to_string(),
+                profile_ids: c.profile_ids.clone(),
+            })
+            .collect(),
+        skipped_hosts: skipped_hosts_view(&build),
+        zone_records: zone_record_counts(&build),
+        ..DnsApplyView::default()
+    })
+}
+
+pub(crate) async fn reapply_locked<'a>(
     paths: &ClusterDeckPaths,
     env: &ManagerEnv<'_>,
     exclude: Option<&str>,
     hosts: Option<HostsUpdate<'_>>,
-    record: Option<(&str, &[DiscoveredEndpoint])>,
+    record: Option<EndpointRecordUpdate<'a>>,
 ) -> Result<(DnsApplyView, EndpointCache), String> {
     let profiles: Vec<Profile> = store::load_profiles(paths)?
         .into_iter()
@@ -261,12 +464,15 @@ async fn reapply_locked(
         .collect();
 
     let cache_file = cache_path(env);
-    if let Some((id, endpoints)) = record {
+    if let Some(rec) = record {
         // Under the lane mutex, only write cache entries for profiles that still exist.
-        if profiles.iter().any(|p| p.id == id) {
-            cache_update(&cache_file, |c| {
-                c.insert(id.to_string(), endpoints.to_vec());
-            })?;
+        if profiles.iter().any(|p| p.id == rec.profile_id) {
+            let _ = update_endpoint_cache(
+                &cache_file,
+                rec.profile_id,
+                rec.endpoints,
+                rec.succeeded_kinds,
+            )?;
         }
     }
     if let Some(id) = exclude {
@@ -329,21 +535,8 @@ async fn reapply_locked(
         }
     }));
 
-    let skipped_hosts = build
-        .skipped
-        .iter()
-        .map(|s| DnsSkippedHost {
-            profile_id: s.profile_id.clone(),
-            host: s.host.clone(),
-            reason: s.reason.clone(),
-            reason_kind: s.reason_kind,
-            suggested_zones: if s.reason_kind == SkippedReasonKind::OutsideZones {
-                suggested_zones(&s.host)
-            } else {
-                Vec::new()
-            },
-        })
-        .collect();
+    let skipped_hosts = skipped_hosts_view(&build);
+    let zone_records = zone_record_counts(&build);
 
     Ok((
         DnsApplyView {
@@ -351,6 +544,7 @@ async fn reapply_locked(
             skipped_hosts,
             prompted: result.prompted,
             cancelled: result.cancelled,
+            zone_records,
         },
         cached,
     ))
@@ -367,15 +561,51 @@ pub async fn reapply(
     record: Option<(&str, &[DiscoveredEndpoint])>,
 ) -> Result<DnsApplyView, String> {
     let _lane_guard = lock_lane().await;
-    let (view, _) = reapply_locked(paths, env, exclude, hosts, record).await?;
+    let rec = record.map(|(id, endpoints)| EndpointRecordUpdate {
+        profile_id: id,
+        endpoints,
+        succeeded_kinds: None,
+    });
+    let (view, _) = reapply_locked(paths, env, exclude, hosts, rec).await?;
     Ok(view)
 }
 
 /// Whether /etc/hosts still has this profile's block, so a hosts step (and its prompt) is only
 /// requested when there is something to strip.
-fn stale_block_present(hosts_path: &Path, profile_id: &str) -> bool {
+pub fn stale_block_present(hosts_path: &Path, profile_id: &str) -> bool {
     let existing = std::fs::read_to_string(hosts_path).unwrap_or_default();
     get_profile_hosts_block(&existing, profile_id).is_some()
+}
+
+/// Whether a save of `latest` must also strip a leftover /etc/hosts block. A `Hosts` profile
+/// owns its block, so its mere presence is not stale (D-STALE: counting it made every Hosts
+/// save run a full reapply).
+pub fn stale_block_after_save(hosts_path: &Path, latest: &Profile) -> bool {
+    latest.host_mapping != HostMapping::Hosts && stale_block_present(hosts_path, &latest.id)
+}
+
+/// Removes only this profile's hosts block (one prompt), leaving resolver files and every
+/// other profile's zones alone.
+async fn strip_stale_block(
+    env: &ManagerEnv<'_>,
+    hosts_path: &Path,
+    profile_id: &str,
+) -> Result<DnsApplyView, String> {
+    let mut view = DnsApplyView {
+        prompted: true,
+        ..DnsApplyView::default()
+    };
+    match crate::services::hosts_file::remove_hosts_block_at(env.runner, hosts_path, profile_id)
+        .await
+    {
+        Ok(()) => Ok(view),
+        // AppleScript error -128 is "User canceled" (same test as the manager's script runner).
+        Err(e) if e.contains("User canceled") || e.contains("(-128)") => {
+            view.cancelled = true;
+            Ok(view)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 fn sanitize_discovery_error(err: &str) -> String {
@@ -417,12 +647,56 @@ pub const DISCOVERY_FAILED_WARNING: &str =
 
 /// `sync_hosts_file_cmd` for a `LocalDns` profile. A leftover /etc/hosts block from the Hosts
 /// mode is removed in the same privileged script as the resolver changes.
+#[allow(dead_code)]
 pub async fn sync_local_dns_profile(
     paths: &ClusterDeckPaths,
     env: &ManagerEnv<'_>,
     hosts_path: &Path,
     profile: &Profile,
     endpoints: Result<Vec<DiscoveredEndpoint>, &str>,
+) -> Result<SyncHostsResult, String> {
+    let (input, err) = match endpoints {
+        Ok(eps) => (
+            Some(EndpointDiscoveryInput {
+                endpoints: eps,
+                succeeded_kinds: None,
+                failed_kinds: Vec::new(),
+            }),
+            None,
+        ),
+        Err(e) => (None, Some(e)),
+    };
+    sync_local_dns_profile_impl(paths, env, hosts_path, profile, input, err).await
+}
+
+pub async fn sync_local_dns_profile_detailed(
+    paths: &ClusterDeckPaths,
+    env: &ManagerEnv<'_>,
+    hosts_path: &Path,
+    profile: &Profile,
+    discovery: Result<crate::services::k8s_endpoints::DiscoveryResult, &str>,
+) -> Result<SyncHostsResult, String> {
+    let (input, err) = match discovery {
+        Ok(res) => (
+            Some(EndpointDiscoveryInput {
+                endpoints: res.endpoints,
+                succeeded_kinds: Some(res.succeeded_kinds),
+                failed_kinds: res.failed_kinds,
+            }),
+            None,
+        ),
+        Err(e) => (None, Some(e)),
+    };
+    sync_local_dns_profile_impl(paths, env, hosts_path, profile, input, err).await
+}
+
+async fn sync_local_dns_profile_impl(
+    paths: &ClusterDeckPaths,
+    env: &ManagerEnv<'_>,
+    hosts_path: &Path,
+    profile: &Profile,
+    input_opt: Option<EndpointDiscoveryInput>,
+    discovery_err: Option<&str>,
 ) -> Result<SyncHostsResult, String> {
     let id = profile.id.clone();
     let strip = move |existing: &str| compute_updated_hosts_content(existing, &id, None);
@@ -431,36 +705,49 @@ pub async fn sync_local_dns_profile(
         compute: &strip,
     });
 
-    let (record, discovery_err) = match &endpoints {
-        Ok(eps) => (Some((profile.id.as_str(), eps.as_slice())), None),
-        Err(e) => (None, Some(*e)),
-    };
+    let record = input_opt.as_ref().map(|inp| EndpointRecordUpdate {
+        profile_id: profile.id.as_str(),
+        endpoints: &inp.endpoints,
+        succeeded_kinds: inp.succeeded_kinds.as_deref(),
+    });
+
+    let failed_kinds = input_opt
+        .as_ref()
+        .map(|inp| inp.failed_kinds.clone())
+        .unwrap_or_default();
 
     let _lane_guard = lock_lane().await;
     let (view, cached) = reapply_locked(paths, env, None, hosts, record).await?;
     let view = view.for_profile(&profile.id);
 
-    let served_endpoints = match endpoints {
-        Ok(eps) => eps,
-        Err(_) => cached.get(&profile.id).cloned().unwrap_or_default(),
-    };
-
+    let served_endpoints = cached.get(&profile.id).cloned().unwrap_or_default();
     let hosts_count = profile.hosts.len() + usize::from(profile.bastion.is_some());
     let endpoints_count = served_endpoints.len();
 
-    let warning_msg = discovery_err.map(|e| {
-        let sanitized = sanitize_discovery_error(e);
-        let down = is_connection_or_tunnel_down(e) || sanitized.is_empty();
-        if down {
-            if sanitized.is_empty() {
-                DISCOVERY_FAILED_WARNING.to_string()
+    let warning_msg = if !failed_kinds.is_empty() {
+        let names: Vec<&str> = failed_kinds
+            .iter()
+            .map(|k| crate::services::k8s_endpoints::display_kind_name(k))
+            .collect();
+        Some(format!(
+            "Partial endpoint discovery: failed querying {}; keeping cached records.",
+            names.join(", ")
+        ))
+    } else {
+        discovery_err.map(|e| {
+            let sanitized = sanitize_discovery_error(e);
+            let down = is_connection_or_tunnel_down(e) || sanitized.is_empty();
+            if down {
+                if sanitized.is_empty() {
+                    DISCOVERY_FAILED_WARNING.to_string()
+                } else {
+                    format!("Could not discover endpoints (Connect first); serving the last known records: {sanitized}")
+                }
             } else {
-                format!("Could not discover endpoints (Connect first); serving the last known records: {sanitized}")
+                format!("Endpoint discovery failed: {sanitized}; serving the last known records.")
             }
-        } else {
-            format!("Endpoint discovery failed: {sanitized}; serving the last known records.")
-        }
-    });
+        })
+    };
 
     let message = if view.cancelled {
         "Admin approval was cancelled; local DNS was not changed".to_string()
@@ -493,11 +780,55 @@ pub async fn sync_local_dns_profile(
 /// Reloads the profile inside the lane mutex: does nothing (and touches no cache) unless
 /// the current profile is LocalDns.
 /// Non-fatal on cancel, conflicts or errors: reports them into `errors` and never fails.
+#[allow(dead_code)]
 pub async fn refresh_local_dns_on_connect(
     paths: &ClusterDeckPaths,
     env: &ManagerEnv<'_>,
     profile_id: &str,
     discovery: Result<&[DiscoveredEndpoint], &str>,
+    errors: &mut Vec<String>,
+) {
+    let (input, err) = match discovery {
+        Ok(eps) => (
+            Some(EndpointDiscoveryInput {
+                endpoints: eps.to_vec(),
+                succeeded_kinds: None,
+                failed_kinds: Vec::new(),
+            }),
+            None,
+        ),
+        Err(e) => (None, Some(e)),
+    };
+    refresh_local_dns_on_connect_impl(paths, env, profile_id, input, err, errors).await;
+}
+
+pub async fn refresh_local_dns_on_connect_detailed(
+    paths: &ClusterDeckPaths,
+    env: &ManagerEnv<'_>,
+    profile_id: &str,
+    discovery: Result<&crate::services::k8s_endpoints::DiscoveryResult, &str>,
+    errors: &mut Vec<String>,
+) {
+    let (input, err) = match discovery {
+        Ok(res) => (
+            Some(EndpointDiscoveryInput {
+                endpoints: res.endpoints.clone(),
+                succeeded_kinds: Some(res.succeeded_kinds.clone()),
+                failed_kinds: res.failed_kinds.clone(),
+            }),
+            None,
+        ),
+        Err(e) => (None, Some(e)),
+    };
+    refresh_local_dns_on_connect_impl(paths, env, profile_id, input, err, errors).await;
+}
+
+async fn refresh_local_dns_on_connect_impl(
+    paths: &ClusterDeckPaths,
+    env: &ManagerEnv<'_>,
+    profile_id: &str,
+    input_opt: Option<EndpointDiscoveryInput>,
+    discovery_err: Option<&str>,
     errors: &mut Vec<String>,
 ) {
     let _lane_guard = lock_lane().await;
@@ -508,46 +839,80 @@ pub async fn refresh_local_dns_on_connect(
             return;
         }
     };
-    let Some(current) = profiles.into_iter().find(|p| p.id == profile_id) else {
+    let Some(current) = profiles.iter().find(|p| p.id == profile_id) else {
         return;
     };
     if current.host_mapping != HostMapping::LocalDns {
         return;
     }
 
-    let record = match discovery {
-        Ok(eps) => Some((profile_id, eps)),
-        Err(err) => {
-            let sanitized = sanitize_discovery_error(err);
-            if sanitized.is_empty() {
-                errors.push(
-                    "Could not discover endpoints; serving the last known records.".to_string(),
-                );
-            } else {
-                errors.push(format!(
-                    "Could not discover endpoints; serving the last known records: {sanitized}"
-                ));
-            }
-            None
+    let cache_file = cache_path(env);
+    if let Some(inp) = input_opt {
+        if let Err(e) = update_endpoint_cache(
+            &cache_file,
+            profile_id,
+            &inp.endpoints,
+            inp.succeeded_kinds.as_deref(),
+        ) {
+            errors.push(format!("Could not update endpoint cache: {e}"));
+        }
+        if !inp.failed_kinds.is_empty() {
+            let names: Vec<&str> = inp
+                .failed_kinds
+                .iter()
+                .map(|k| crate::services::k8s_endpoints::display_kind_name(k))
+                .collect();
+            errors.push(format!(
+                "Partial endpoint discovery: failed querying {}; keeping cached records.",
+                names.join(", ")
+            ));
+        }
+    } else if let Some(err) = discovery_err {
+        let sanitized = sanitize_discovery_error(err);
+        if sanitized.is_empty() {
+            errors
+                .push("Could not discover endpoints; serving the last known records.".to_string());
+        } else {
+            errors.push(format!(
+                "Could not discover endpoints; serving the last known records: {sanitized}"
+            ));
+        }
+    }
+
+    let listing = match manager::read_resolver_listing(env.resolver_dir) {
+        Ok(l) => l,
+        Err(e) => {
+            errors.push(format!("Could not inspect resolver files: {e}"));
+            return;
         }
     };
 
-    match reapply_locked(paths, env, None, None, record).await {
-        Ok((view, _)) => {
-            let view = view.for_profile(profile_id);
-            if view.cancelled {
-                errors.push("Admin approval was cancelled; local DNS was not changed".to_string());
-            }
-            for conflict in view.conflicts {
-                errors.push(format!(
-                    "Local DNS conflict on zone {}: {}",
-                    conflict.zone, conflict.kind
-                ));
-            }
-        }
-        Err(e) => {
-            errors.push(format!("Local DNS update failed: {e}"));
-        }
+    let cached = cache_load(&cache_file);
+    let build = build_zones(&profiles, &cached, 0, env.port);
+
+    let desired_for_profile: std::collections::HashSet<String> = build
+        .zones
+        .zones
+        .iter()
+        .filter(|z| z.profile_id == profile_id)
+        .map(|z| z.zone.clone())
+        .collect();
+
+    let installed_for_profile: std::collections::HashSet<String> = listing
+        .files
+        .iter()
+        .filter(|(_, content)| parse_marker(content).as_deref() == Some(profile_id))
+        .map(|(name, _)| name.clone())
+        .collect();
+
+    if desired_for_profile != installed_for_profile {
+        errors.push("Local DNS changes pending: press Sync to local DNS".to_string());
+    }
+
+    // Connect's refresh updates records only for currently installed resolver zones (ours on disk),
+    // with NO /etc/resolver change and NO privileged prompt.
+    if let Err(e) = manager::apply_records_only(env, &build.zones.zones).await {
+        errors.push(format!("Local DNS update failed: {e}"));
     }
 }
 
@@ -586,6 +951,7 @@ pub async fn remove_local_dns_profile(
 
 /// Called after a profile was removed from the store. Its zones leave local DNS; the last
 /// `LocalDns` profile takes the agent with it.
+#[allow(dead_code)]
 pub async fn reapply_after_delete(
     paths: &ClusterDeckPaths,
     env: &ManagerEnv<'_>,
@@ -619,6 +985,7 @@ pub fn needs_reapply_after_save(old: Option<&Profile>, new: &Profile) -> bool {
 /// Called after a profile was saved. Re-applies only when a `LocalDns` profile's DNS-relevant
 /// settings changed; a Hosts<->LocalDns switch carries the matching hosts change into the same
 /// privileged script (one prompt, never a window with neither mapping, R11).
+#[allow(dead_code)]
 pub async fn reapply_after_save(
     paths: &ClusterDeckPaths,
     env: &ManagerEnv<'_>,
@@ -626,25 +993,63 @@ pub async fn reapply_after_save(
     old: Option<&Profile>,
     new: &Profile,
 ) -> Result<Option<DnsApplyView>, String> {
-    if !needs_reapply_after_save(old, new) {
+    let _lane_guard = lock_lane().await;
+    reapply_after_save_locked(paths, env, hosts_path, old, new).await
+}
+
+pub(crate) async fn reapply_after_save_locked(
+    paths: &ClusterDeckPaths,
+    env: &ManagerEnv<'_>,
+    hosts_path: &Path,
+    old: Option<&Profile>,
+    new: &Profile,
+) -> Result<Option<DnsApplyView>, String> {
+    // Inside the lock, fetch the LATEST stored profile.
+    let latest = store::get_profile(paths, &new.id).unwrap_or_else(|_| new.clone());
+
+    let needs_dns = needs_reapply_after_save(old, &latest);
+    let stale = stale_block_after_save(hosts_path, &latest);
+    if !needs_dns && !stale {
         return Ok(None);
+    }
+    if !needs_dns {
+        return strip_stale_block(env, hosts_path, &latest.id)
+            .await
+            .map(Some);
     }
 
     let old_mapping = old.map_or(HostMapping::Off, |p| p.host_mapping);
-    let id = new.id.clone();
+    // Same mapping and same approved zones: only records changed (aliases, gateway), so the
+    // resolver files stay as they are and no prompt can involve another profile's zones.
+    if old_mapping == HostMapping::LocalDns
+        && latest.host_mapping == HostMapping::LocalDns
+        && old.is_some_and(|p| p.approved_dns_zones == latest.approved_dns_zones)
+    {
+        let mut view = reapply_records_only_locked(paths, env).await?;
+        if stale {
+            let stripped = strip_stale_block(env, hosts_path, &latest.id).await?;
+            view.prompted |= stripped.prompted;
+            view.cancelled |= stripped.cancelled;
+        }
+        return Ok(Some(view));
+    }
+    let id = latest.id.clone();
     let strip = {
         let id = id.clone();
         move |existing: &str| compute_updated_hosts_content(existing, &id, None)
     };
-    let block = if old_mapping == HostMapping::LocalDns && new.host_mapping == HostMapping::Hosts {
+    let block = if old_mapping == HostMapping::LocalDns && latest.host_mapping == HostMapping::Hosts
+    {
         let cached = cache_load(&cache_path(env)).remove(&id).unwrap_or_default();
-        Some(render_hosts_block_with_endpoints(new, &cached)?)
+        Some(render_hosts_block_with_endpoints(&latest, &cached)?)
     } else {
         None
     };
     let add = move |existing: &str| compute_updated_hosts_content(existing, &id, block.as_deref());
-    let hosts = match (old_mapping, new.host_mapping) {
-        (HostMapping::Hosts, HostMapping::LocalDns) if stale_block_present(hosts_path, &new.id) => {
+    let hosts = match (old_mapping, latest.host_mapping) {
+        (HostMapping::Hosts, HostMapping::LocalDns)
+            if stale_block_present(hosts_path, &latest.id) =>
+        {
             Some(HostsUpdate {
                 path: hosts_path,
                 compute: &strip,
@@ -654,9 +1059,14 @@ pub async fn reapply_after_save(
             path: hosts_path,
             compute: &add,
         }),
+        (_, HostMapping::Off) if stale_block_present(hosts_path, &latest.id) => Some(HostsUpdate {
+            path: hosts_path,
+            compute: &strip,
+        }),
         _ => None,
     };
-    reapply(paths, env, None, hosts, None).await.map(Some)
+    let (view, _) = reapply_locked(paths, env, None, hosts, None).await?;
+    Ok(Some(view))
 }
 
 pub async fn status_with(env: &ManagerEnv<'_>) -> LocalDnsStatus {
@@ -734,16 +1144,16 @@ async fn mutate_then_apply(
     mutate: impl FnOnce(&ClusterDeckPaths, &str) -> Result<(), String>,
 ) -> Result<DnsApplyView, String> {
     let paths = ClusterDeckPaths::resolve()?;
-    let profile = {
-        let _lock = guard.lock().await;
-        mutate(&paths, profile_id)?;
-        store::get_profile(&paths, profile_id)?
-    };
+    let _write_lock = guard.lock().await;
+    let _lane_lock = lock_lane().await;
+    mutate(&paths, profile_id)?;
+    let profile = store::get_profile(&paths, profile_id)?;
     if profile.host_mapping != HostMapping::LocalDns {
         return Ok(DnsApplyView::default());
     }
     let dns = SystemDns::resolve()?;
-    reapply(&paths, &dns.env(), None, None, None).await
+    let (view, _) = reapply_locked(&paths, &dns.env(), None, None, None).await?;
+    Ok(view)
 }
 
 #[tauri::command]

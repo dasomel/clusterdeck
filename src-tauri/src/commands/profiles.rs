@@ -56,23 +56,26 @@ pub(crate) async fn save_profile_internal<R>(
 where
     R: FnOnce() -> Result<crate::commands::local_dns::SystemDns, String>,
 {
-    let old = {
-        let _lock = guard.lock().await;
-        let old = store::get_profile(paths, &profile.id).ok();
-        save_profile_with_paths(paths, profile.clone())?;
-        old
-    };
-    if !crate::commands::local_dns::needs_reapply_after_save(old.as_ref(), &profile) {
+    let _write_lock = guard.lock().await;
+    let _lane_lock = crate::commands::local_dns::lock_lane().await;
+
+    let old = store::get_profile(paths, &profile.id).ok();
+    save_profile_with_paths(paths, profile.clone())?;
+
+    let latest = store::get_profile(paths, &profile.id).unwrap_or(profile);
+    if !crate::commands::local_dns::needs_reapply_after_save(old.as_ref(), &latest)
+        && !crate::commands::local_dns::stale_block_after_save(hosts_path, &latest)
+    {
         return Ok(None);
     }
-    // Outside the write lock: this may wait on an admin prompt.
+
     let dns = resolve_dns()?;
-    crate::commands::local_dns::reapply_after_save(
+    crate::commands::local_dns::reapply_after_save_locked(
         paths,
         &dns.env(),
         hosts_path,
         old.as_ref(),
-        &profile,
+        &latest,
     )
     .await
     .map_err(|e| format!("profile saved, but updating local DNS failed: {e}"))
@@ -83,39 +86,55 @@ pub async fn delete_profile_cmd(
     guard: tauri::State<'_, crate::services::store::ProfileWriteGuard>,
     profile_id: String,
 ) -> Result<Option<DnsApplyView>, String> {
+    let paths = ClusterDeckPaths::resolve()?;
+    delete_profile_internal(&paths, &guard, profile_id).await
+}
+
+pub(crate) async fn delete_profile_internal(
+    paths: &ClusterDeckPaths,
+    guard: &crate::services::store::ProfileWriteGuard,
+    profile_id: String,
+) -> Result<Option<DnsApplyView>, String> {
     if !crate::services::validate::is_safe_profile_id(&profile_id) {
         return Err("invalid profile id".to_string());
     }
-    let paths = ClusterDeckPaths::resolve()?;
-    let was_local_dns = {
-        let _lock = guard.lock().await;
-        let runner = crate::services::process::SystemRunner;
+    let _write_lock = guard.lock().await;
+    let _lane_lock = crate::commands::local_dns::lock_lane().await;
+    let runner = crate::services::process::SystemRunner;
 
-        let _ = crate::services::hosts_file::remove_hosts_block(&runner, &profile_id).await;
+    let _ = crate::services::hosts_file::remove_hosts_block(&runner, &profile_id).await;
 
-        let ssh_conf = paths.ssh_conf(&profile_id);
-        if ssh_conf.exists() {
-            let _ = std::fs::remove_file(ssh_conf);
-        }
-        let kc_file = paths.kubeconfig_file(&profile_id);
-        if kc_file.exists() {
-            let _ = std::fs::remove_file(kc_file);
-        }
-        crate::services::tunnel::global()
-            .stop_tunnel(&profile_id)
-            .await;
-        let _ = crate::services::state::delete_status(&paths, &profile_id);
+    let ssh_conf = paths.ssh_conf(&profile_id);
+    if ssh_conf.exists() {
+        let _ = std::fs::remove_file(ssh_conf);
+    }
+    let kc_file = paths.kubeconfig_file(&profile_id);
+    if kc_file.exists() {
+        let _ = std::fs::remove_file(kc_file);
+    }
+    crate::services::tunnel::global()
+        .stop_tunnel(&profile_id)
+        .await;
+    let _ = crate::services::state::delete_status(paths, &profile_id);
 
-        delete_stored_profile(&paths, &profile_id)?
-    };
+    let was_local_dns = delete_stored_profile(paths, &profile_id)?;
+    crate::commands::local_dns::remove_cached_endpoints(
+        &paths.endpoints_cache_file(),
+        &profile_id,
+    )?;
     if !was_local_dns {
         return Ok(None);
     }
-    // Outside the write lock: this may wait on an admin prompt.
     let dns = crate::commands::local_dns::SystemDns::resolve()?;
-    let view = crate::commands::local_dns::reapply_after_delete(&paths, &dns.env(), &profile_id)
-        .await
-        .map_err(|e| format!("profile deleted, but updating local DNS failed: {e}"))?;
+    let (view, _) = crate::commands::local_dns::reapply_locked(
+        paths,
+        &dns.env(),
+        Some(&profile_id),
+        None,
+        None,
+    )
+    .await
+    .map_err(|e| format!("profile deleted, but updating local DNS failed: {e}"))?;
     Ok(Some(view))
 }
 

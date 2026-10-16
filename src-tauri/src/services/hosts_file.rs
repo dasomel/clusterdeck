@@ -508,17 +508,26 @@ pub async fn upsert_hosts_block(
     upsert_hosts_block_with_endpoints(runner, profile, &[]).await
 }
 
+pub async fn upsert_hosts_block_with_endpoints_at(
+    runner: &dyn crate::services::process::CommandRunner,
+    hosts_path: &std::path::Path,
+    profile: &crate::services::config::Profile,
+    endpoints: &[DiscoveredEndpoint],
+) -> Result<(), String> {
+    let block = render_hosts_block_with_endpoints(profile, endpoints)?;
+    write_hosts_block_checked_at(runner, hosts_path, &profile.id, Some(&block)).await
+}
+
 pub async fn upsert_hosts_block_with_endpoints(
     runner: &dyn crate::services::process::CommandRunner,
     profile: &crate::services::config::Profile,
     endpoints: &[DiscoveredEndpoint],
 ) -> Result<(), String> {
-    let block = render_hosts_block_with_endpoints(profile, endpoints)?;
-    write_hosts_block_checked_at(
+    upsert_hosts_block_with_endpoints_at(
         runner,
         std::path::Path::new(HOSTS_FILE_PATH),
-        &profile.id,
-        Some(&block),
+        profile,
+        endpoints,
     )
     .await
 }
@@ -527,13 +536,15 @@ pub async fn remove_hosts_block(
     runner: &dyn crate::services::process::CommandRunner,
     profile_id: &str,
 ) -> Result<(), String> {
-    write_hosts_block_checked_at(
-        runner,
-        std::path::Path::new(HOSTS_FILE_PATH),
-        profile_id,
-        None,
-    )
-    .await
+    remove_hosts_block_at(runner, std::path::Path::new(HOSTS_FILE_PATH), profile_id).await
+}
+
+pub async fn remove_hosts_block_at(
+    runner: &dyn crate::services::process::CommandRunner,
+    hosts_path: &std::path::Path,
+    profile_id: &str,
+) -> Result<(), String> {
+    write_hosts_block_checked_at(runner, hosts_path, profile_id, None).await
 }
 
 #[cfg(test)]
