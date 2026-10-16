@@ -793,6 +793,25 @@ pub async fn discover_cluster_endpoints_detailed(
     let services_failed = failed_kinds.iter().any(|k| k == "service");
     let ips_unreliable = services_failed && !gateway_address.is_some_and(is_safe_gateway_address);
 
+    // D3 (#102): classify nonempty resource lists before parsers drop unresolved IPs.
+    // Conservatively retain cached dependent kinds; true empty lists/absent CRDs still
+    // remove records. Per-resource dependency tracking can relax this if needed later.
+    let reliable_targets = |result: Result<Option<serde_json::Value>, String>| {
+        result.and_then(|value| {
+            if ips_unreliable
+                && value.as_ref().is_some_and(|v| {
+                    v.get("items")
+                        .and_then(|i| i.as_array())
+                        .is_some_and(|items| !items.is_empty())
+                })
+            {
+                Err("target IPs depend on the Services lookup, which failed".to_string())
+            } else {
+                Ok(value)
+            }
+        })
+    };
+
     let effective_fallback_ip = svc_info.first_lb_ip.as_deref().or(default_ip);
 
     // 2-5. Ingresses, APISIX routes, Istio VirtualServices, and Gateway HTTPRoutes run concurrently.
@@ -803,7 +822,7 @@ pub async fn discover_cluster_endpoints_detailed(
             "/apis/networking.k8s.io/v1/ingresses",
         )
         .await;
-        match res {
+        match reliable_targets(res) {
             Ok(Some(ing_val)) if is_valid_k8s_list(&ing_val) => (
                 Some("ingress".to_string()),
                 None,
@@ -829,7 +848,7 @@ pub async fn discover_cluster_endpoints_detailed(
             "/apis/apisix.apache.org/v2/apisixroutes",
         )
         .await;
-        match res {
+        match reliable_targets(res) {
             Ok(Some(apisix_val)) if is_valid_k8s_list(&apisix_val) => (
                 Some("apisix".to_string()),
                 None,
@@ -867,7 +886,7 @@ pub async fn discover_cluster_endpoints_detailed(
             }
             Err(e) => Err(e),
         };
-        match res {
+        match reliable_targets(res) {
             Ok(Some(v)) if is_valid_k8s_list(&v) => (
                 Some("istio".to_string()),
                 None,
@@ -893,7 +912,7 @@ pub async fn discover_cluster_endpoints_detailed(
             "/apis/gateway.networking.k8s.io/v1/httproutes",
         )
         .await;
-        match res {
+        match reliable_targets(res) {
             Ok(Some(gw_val)) if is_valid_k8s_list(&gw_val) => (
                 Some("gateway-api".to_string()),
                 None,
@@ -915,16 +934,7 @@ pub async fn discover_cluster_endpoints_detailed(
     let (ing_out, apisix_out, istio_out, gw_out) =
         tokio::join!(ingress_query, apisix_query, istio_query, gateway_query);
 
-    for (mut succ, mut fail, mut eps) in [ing_out, apisix_out, istio_out, gw_out] {
-        if ips_unreliable && !eps.is_empty() {
-            if let Some(kind) = succ.take() {
-                fail = Some((
-                    kind,
-                    "target IPs depend on the Services lookup, which failed".to_string(),
-                ));
-                eps.clear();
-            }
-        }
+    for (succ, fail, eps) in [ing_out, apisix_out, istio_out, gw_out] {
         if let Some(s) = succ {
             succeeded_kinds.push(s);
         }

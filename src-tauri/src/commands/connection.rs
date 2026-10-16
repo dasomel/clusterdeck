@@ -742,7 +742,18 @@ pub async fn discover_cluster_endpoints_internal(
     )
     .await?;
 
-    let mut warning = None;
+    // D4 (#102): retain discovery errors alongside cache errors; a partial scan is not
+    // authoritative. One combined warning keeps the IPC stable; split it if UI needs categories.
+    let mut warnings: Vec<String> = discovery
+        .errors_by_kind
+        .iter()
+        .map(|(kind, error)| {
+            format!(
+                "{}: {error}",
+                crate::services::k8s_endpoints::display_kind_name(kind)
+            )
+        })
+        .collect();
     match cache_path_res {
         Ok(cache_file) => {
             // Discovery ran without any lock: a delete may have completed meanwhile, and an
@@ -755,18 +766,18 @@ pub async fn discover_cluster_endpoints_internal(
                     &discovery.endpoints,
                     Some(&discovery.succeeded_kinds),
                 ) {
-                    warning = Some(format!("failed to update endpoint cache: {e}"));
+                    warnings.push(format!("failed to update endpoint cache: {e}"));
                 }
             }
         }
         Err(e) => {
-            warning = Some(format!("failed to initialize DNS environment: {e}"));
+            warnings.push(format!("failed to initialize DNS environment: {e}"));
         }
     }
 
     Ok(ScanEndpointsResult {
         endpoints: discovery.endpoints,
-        warning,
+        warning: (!warnings.is_empty()).then(|| warnings.join("; ")),
     })
 }
 
@@ -774,9 +785,8 @@ pub async fn discover_cluster_endpoints_internal(
 /// results (a host a succeeded kind no longer reports is gone); only FAILED kinds keep their
 /// previous records. Attribution comes from the endpoints cache as it was BEFORE this update;
 /// an old /etc/hosts line is re-added only when the cache ties it to a failed kind. When the
-/// cache holds no kind information at all (no entry, or only unknown sources) a line cannot be
-/// attributed and is presumed to belong to a failed kind (D4-a), so partial failures never lose
-/// records that predate the cache.
+/// cache cannot attribute a host, preserve it during partial failure and persist that unknown
+/// attribution until a fully successful discovery can replace it.
 pub fn merge_discovered_endpoints(
     cache_path: &Path,
     hosts_path: &Path,
@@ -787,36 +797,24 @@ pub fn merge_discovered_endpoints(
 ) -> Vec<DiscoveredEndpoint> {
     if failed_kinds.is_empty() {
         let _ = crate::commands::local_dns::update_endpoint_cache(
-            cache_path,
-            profile_id,
-            discovered,
-            Some(succeeded_kinds),
+            cache_path, profile_id, discovered, None,
         );
         return discovered.to_vec();
     }
 
     let previous = crate::commands::local_dns::cached_endpoints(cache_path, profile_id);
     let is_known_kind = |src: &str| crate::services::k8s_endpoints::DISCOVERY_KINDS.contains(&src);
-    let have_kind_info = previous.iter().any(|ep| is_known_kind(&ep.source));
     let kind_of: std::collections::HashMap<&str, &str> = previous
         .iter()
         .filter(|ep| is_known_kind(&ep.source))
         .map(|ep| (ep.host.as_str(), ep.source.as_str()))
         .collect();
 
-    let mut merged = match crate::commands::local_dns::update_endpoint_cache(
-        cache_path,
-        profile_id,
+    let mut merged = crate::commands::local_dns::merge_endpoints(
+        previous.clone(),
         discovered,
         Some(succeeded_kinds),
-    ) {
-        Ok(eps) => eps,
-        Err(_) => crate::commands::local_dns::merge_endpoints(
-            previous.clone(),
-            discovered,
-            Some(succeeded_kinds),
-        ),
-    };
+    );
 
     if let Ok(hosts_content) = std::fs::read_to_string(hosts_path) {
         if let Some(lines) =
@@ -831,7 +829,7 @@ pub fn merge_discovered_endpoints(
                 let (ip, host) = (parts[0], parts[1]);
                 let keep = match kind_of.get(host) {
                     Some(kind) => failed_kinds.iter().any(|k| k == kind),
-                    None => !have_kind_info,
+                    None => true,
                 };
                 if keep
                     && !host.ends_with(&node_suffix)
@@ -850,6 +848,10 @@ pub fn merge_discovered_endpoints(
         }
     }
 
+    // D2 (#102): persist recovered legacy hosts too. Unknown attribution may retain stale
+    // records during failures; a fully successful scan replaces the cache above.
+    let _ =
+        crate::commands::local_dns::update_endpoint_cache(cache_path, profile_id, &merged, None);
     merged
 }
 
@@ -909,6 +911,14 @@ pub async fn sync_hosts_file_with_deps(
             },
         )
         .await;
+    }
+
+    // D1 (#102): discovery stays outside the lane to avoid blocking saves on network I/O.
+    // Re-read under the lane before any mutation; a mode change requires a new Sync action.
+    let _lane = crate::commands::local_dns::lock_lane().await;
+    let profile = store::get_profile(paths, profile_id)?;
+    if profile.host_mapping != crate::services::config::HostMapping::Hosts {
+        return Err("Host mapping changed or is off; refresh the profile before syncing".into());
     }
 
     let endpoints = hosts_endpoints_for(
