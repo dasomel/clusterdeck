@@ -385,6 +385,13 @@ impl TunnelManager {
             .then(|| entry.target.clone())
     }
 
+    /// Stops the profile's tunnel and forgets its persisted target, for a kubeconfig that no
+    /// longer points at the tunnel (ADR-0009 Security), so Verify cannot revive it.
+    pub async fn retire(&self, paths: &ClusterDeckPaths, profile_id: &str) {
+        self.stop_tunnel(profile_id).await;
+        let _ = crate::services::state::clear_tunnel_target(paths, profile_id);
+    }
+
     /// Waits for this profile's in-flight `ensure_tunnel` (if any), then kills its tunnel.
     pub async fn stop_tunnel(&self, profile_id: &str) {
         let slot = self.slots.lock().await.get(profile_id).cloned();

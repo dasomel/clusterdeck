@@ -317,10 +317,26 @@ async fn ensure_verify_tunnel(
             "no API tunnel target recorded; reconnect to re-establish the API tunnel".to_string()
         })?,
     };
+    // ADR-0009 Security: never (re)start a tunnel for a stored kubeconfig that would not be
+    // pointed at it -- fail closed when the file cannot be read.
+    let raw = std::fs::read_to_string(kubeconfig_path)
+        .map_err(|e| format!("API tunnel refused: cannot read kubeconfig: {e}"))?;
+    if let Some(reason) = crate::services::kubeconfig::tunnel_refusal_for_yaml(&raw) {
+        return Err(reason.to_string());
+    }
     let port = tunnels
         .ensure_tunnel(runner, paths, profile, &target.host, target.port)
         .await
         .map_err(|e| format!("API tunnel failed: {e}"))?;
+    // A concurrent Connect may have replaced the file with a refused (direct) kubeconfig while
+    // the tunnel was starting; re-check so the tunnel and its target don't outlive it.
+    let still_allowed = std::fs::read_to_string(kubeconfig_path)
+        .ok()
+        .is_some_and(|raw| crate::services::kubeconfig::tunnel_refusal_for_yaml(&raw).is_none());
+    if !still_allowed {
+        tunnels.retire(paths, &profile.id).await;
+        return Err("API tunnel refused: kubeconfig changed while the tunnel was starting".into());
+    }
     crate::services::kubeconfig::retarget_tunnel_port(kubeconfig_path, port)
 }
 
@@ -1157,6 +1173,7 @@ mod tests {
         let manager = crate::services::tunnel::TunnelManager::new(std::sync::Arc::new(
             crate::services::tunnel::SystemPortProbe,
         ));
+        write_test_kubeconfig(&paths, "      certificate-authority-data: ZmFrZS1jYQ==");
         // AlwaysSucceedsRunner keeps the default `spawn_background`, which is unsupported.
         let runner = AlwaysSucceedsRunner {
             calls: AtomicUsize::new(0),
@@ -1172,5 +1189,53 @@ mod tests {
         .unwrap_err();
         assert!(err.contains("API tunnel failed"), "{err}");
         std::fs::remove_dir_all(&paths.base).ok();
+    }
+
+    fn write_test_kubeconfig(paths: &ClusterDeckPaths, tls_lines: &str) {
+        paths.ensure_dirs().unwrap();
+        std::fs::write(
+            paths.kubeconfig_file("test"),
+            format!(
+                "clusters:\n  - name: test\n    cluster:\n      server: https://127.0.0.1:16500\n{tls_lines}\ncontexts:\n  - name: test\n    context:\n      cluster: test\n      user: test\nusers:\n  - name: test\n    user:\n      token: t\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn ensure_verify_tunnel_never_spawns_for_unpinned_or_insecure_kubeconfig() {
+        for (name, tls) in [
+            (
+                "insecure",
+                "      certificate-authority-data: ZmFrZS1jYQ==\n      insecure-skip-tls-verify: yes",
+            ),
+            ("noca", "      tls-server-name: 127.0.0.1"),
+        ] {
+            let paths = tunnel_test_paths(name);
+            state::save_tunnel_target(
+                &paths,
+                "test",
+                &crate::services::tunnel::TunnelTarget {
+                    host: "127.0.0.1".to_string(),
+                    port: 6443,
+                },
+            )
+            .unwrap();
+            write_test_kubeconfig(&paths, tls);
+            let manager = crate::services::tunnel::TunnelManager::new(std::sync::Arc::new(
+                crate::services::tunnel::SystemPortProbe,
+            ));
+            let err = ensure_verify_tunnel(
+                &manager,
+                &NeverCalledRunner,
+                &paths,
+                &bastion_profile(),
+                &paths.kubeconfig_file("test"),
+            )
+            .await
+            .unwrap_err();
+            assert!(err.contains("API tunnel refused"), "{name}: {err}");
+            std::fs::remove_dir_all(&paths.base).ok();
+        }
     }
 }

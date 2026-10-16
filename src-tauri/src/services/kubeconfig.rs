@@ -207,6 +207,41 @@ fn cluster_skips_tls_verify(val: &serde_yaml::Value) -> bool {
 }
 
 const INSECURE_TUNNEL_REFUSAL: &str = "API tunnel refused: kubeconfig disables TLS verification (insecure-skip-tls-verify); a loopback endpoint could be impersonated by any local process";
+const UNPINNED_TUNNEL_REFUSAL: &str = "API tunnel refused: kubeconfig has no inline cluster CA (certificate-authority-data); without a pinned CA any root in the macOS trust store could vouch for an impostor on the loopback port";
+const UNREADABLE_TUNNEL_REFUSAL: &str =
+    "API tunnel refused: kubeconfig TLS settings could not be read";
+
+fn non_empty_str(v: Option<&serde_yaml::Value>) -> bool {
+    v.and_then(|v| v.as_str())
+        .is_some_and(|s| !s.trim().is_empty())
+}
+
+/// ADR-0009 Security: why this kubeconfig must not be pointed at a loopback tunnel, if at all.
+/// TLS verification against a CA the kubeconfig itself pins is the only thing stopping another
+/// local process (or user) that squats the port while the tunnel is down from receiving the
+/// credentials. Skipped verification fails that outright; no CA would fall back to the system
+/// trust store, where any installed root (e.g. an antivirus HTTPS-scanning root) could sign for
+/// the original host. With a CA set, client-go trusts only that CA.
+fn tunnel_tls_refusal(val: &serde_yaml::Value) -> Option<&'static str> {
+    let cluster = &val["clusters"][0]["cluster"];
+    if cluster_skips_tls_verify(val) {
+        return Some(INSECURE_TUNNEL_REFUSAL);
+    }
+    // Only inline data counts: a `certificate-authority` path in a fetched kubeconfig names a
+    // file on the remote node, and a local path could be one another local user can write.
+    if !non_empty_str(cluster.get("certificate-authority-data")) {
+        return Some(UNPINNED_TUNNEL_REFUSAL);
+    }
+    None
+}
+
+/// `tunnel_tls_refusal` for raw kubeconfig text; fails closed when it cannot be parsed.
+pub(crate) fn tunnel_refusal_for_yaml(raw_yaml: &str) -> Option<&'static str> {
+    match serde_yaml::from_str::<serde_yaml::Value>(raw_yaml) {
+        Ok(val) => tunnel_tls_refusal(&val),
+        Err(_) => Some(UNREADABLE_TUNNEL_REFUSAL),
+    }
+}
 
 /// Points an already-written profile kubeconfig at a (possibly different) local tunnel port.
 /// Used when the tunnel is re-established on a new port after an app restart. Returns whether
@@ -217,8 +252,8 @@ pub(crate) fn retarget_tunnel_port(
 ) -> Result<bool, String> {
     let raw = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
     let mut val: serde_yaml::Value = serde_yaml::from_str(&raw).map_err(|e| e.to_string())?;
-    // ADR-0009 Security: never move credentials onto a loopback port without TLS verification.
-    if cluster_skips_tls_verify(&val) {
+    // ADR-0009 Security: never move credentials onto a loopback port without pinned TLS.
+    if tunnel_tls_refusal(&val).is_some() {
         return Ok(false);
     }
     let Some(server) = val
@@ -290,8 +325,10 @@ pub fn normalize_with_endpoint(
         return Err("multi-cluster kubeconfig is not supported in MVP".to_string());
     }
     // Defense in depth (ADR-0009 Security); callers already avoid this combination.
-    if matches!(endpoint, ApiEndpoint::Tunnel { .. }) && cluster_skips_tls_verify(&val) {
-        return Err(INSECURE_TUNNEL_REFUSAL.to_string());
+    if matches!(endpoint, ApiEndpoint::Tunnel { .. }) {
+        if let Some(refusal) = tunnel_tls_refusal(&val) {
+            return Err(refusal.to_string());
+        }
     }
 
     let profile_val = serde_yaml::Value::String(profile_id.to_string());
@@ -555,6 +592,38 @@ fn build_candidate_read_cmd(candidate: &str) -> String {
     format!("sudo -n cat {quoted_path} 2>/dev/null || cat {quoted_path}")
 }
 
+fn write_profile_kubeconfig(
+    paths: &ClusterDeckPaths,
+    profile_id: &str,
+    normalized_yaml: &str,
+) -> Result<std::path::PathBuf, String> {
+    paths
+        .ensure_dirs()
+        .map_err(|e| format!("failed to create kubeconfigs directory: {e}"))?;
+    let dest_path = paths.kubeconfig_file(profile_id);
+
+    #[cfg(unix)]
+    {
+        use std::fs::OpenOptions;
+        use std::io::Write;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&dest_path)
+            .map_err(|e| format!("failed to create kubeconfig file: {e}"))?;
+        file.write_all(normalized_yaml.as_bytes())
+            .map_err(|e| format!("failed to write kubeconfig file: {e}"))?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(&dest_path, normalized_yaml)
+            .map_err(|e| format!("failed to write kubeconfig file: {e}"))?;
+    }
+    Ok(dest_path)
+}
+
 pub async fn fetch_and_store(
     runner: &dyn CommandRunner,
     paths: &ClusterDeckPaths,
@@ -598,16 +667,12 @@ pub async fn fetch_and_store(
     // direct endpoint, exactly the pre-tunnel behaviour, and report why.
     let mut tunnel_error = None;
     let mut endpoint = ApiEndpoint::Direct;
-    // Security (ADR-0009): TLS verification is the only thing stopping another local process
-    // from squatting the loopback port while the tunnel is down, so a cluster that skips
-    // verification is never tunnelled. A cluster with no CA configured is fine: it is verified
-    // against the system trust roots for the original host, which a local impostor cannot
-    // satisfy.
-    let insecure = serde_yaml::from_str::<serde_yaml::Value>(&raw_yaml)
-        .map(|v| cluster_skips_tls_verify(&v))
-        .unwrap_or(false);
-    if insecure && profile.bastion.is_some() {
-        tunnel_error = Some(INSECURE_TUNNEL_REFUSAL.to_string());
+    // Security (ADR-0009): only a kubeconfig with verified, CA-pinned TLS is tunnelled (see
+    // tunnel_tls_refusal). Fails closed on unparseable YAML, which normalize rejects below
+    // anyway -- a tunnel spawned first would be left without a kubeconfig using it.
+    let refusal = tunnel_refusal_for_yaml(&raw_yaml);
+    if let (Some(reason), true) = (refusal, profile.bastion.is_some()) {
+        tunnel_error = Some(reason.to_string());
     } else if profile.bastion.is_some() {
         let ensured = match original_api_target(&raw_yaml) {
             Ok((orig_host, orig_port)) => {
@@ -623,32 +688,23 @@ pub async fn fetch_and_store(
         }
     }
 
-    let normalized_yaml = normalize_with_endpoint(&raw_yaml, &profile.id, Some(host), endpoint)?;
-
-    paths
-        .ensure_dirs()
-        .map_err(|e| format!("failed to create kubeconfigs directory: {e}"))?;
-    let dest_path = paths.kubeconfig_file(&profile.id);
-
-    #[cfg(unix)]
-    {
-        use std::fs::OpenOptions;
-        use std::io::Write;
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&dest_path)
-            .map_err(|e| format!("failed to create kubeconfig file: {e}"))?;
-        file.write_all(normalized_yaml.as_bytes())
-            .map_err(|e| format!("failed to write kubeconfig file: {e}"))?;
+    let normalized = normalize_with_endpoint(&raw_yaml, &profile.id, Some(host), endpoint);
+    // Whenever this fetch does not end with a kubeconfig pointing at the tunnel (refused, failed,
+    // or normalize error), retire any tunnel and persisted target from an earlier fetch. This
+    // runs only after the file is written: a concurrent Verify that already passed its pre-spawn
+    // check either gets its tunnel killed here or sees the new file in its post-spawn re-check.
+    let retire = profile.bastion.is_some()
+        && (normalized.is_err() || !matches!(endpoint, ApiEndpoint::Tunnel { .. }));
+    let written = match normalized {
+        Ok(normalized_yaml) => write_profile_kubeconfig(paths, &profile.id, &normalized_yaml),
+        Err(e) => Err(e),
+    };
+    if retire {
+        crate::services::tunnel::global()
+            .retire(paths, &profile.id)
+            .await;
     }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(&dest_path, normalized_yaml)
-            .map_err(|e| format!("failed to write kubeconfig file: {e}"))?;
-    }
+    let dest_path = written?;
 
     Ok(KubeconfigSummary {
         cluster_name: profile.id.clone(),
@@ -3166,8 +3222,39 @@ users:
     fn insecure_sample(value: &str) -> String {
         SAMPLE.replace(
             "      certificate-authority-data: ZmFrZS1jYQ==",
-            &format!("      insecure-skip-tls-verify: {value}"),
+            &format!(
+                "      certificate-authority-data: ZmFrZS1jYQ==\n      insecure-skip-tls-verify: {value}"
+            ),
         )
+    }
+
+    #[test]
+    fn tunnel_requires_a_pinned_cluster_ca() {
+        let no_ca = SAMPLE.replace("      certificate-authority-data: ZmFrZS1jYQ==\n", "");
+        assert_ne!(no_ca, SAMPLE, "fixture must contain the CA line");
+        let err = normalize_with_endpoint(
+            &no_ca,
+            "lab",
+            None,
+            ApiEndpoint::Tunnel { local_port: 16500 },
+        )
+        .unwrap_err();
+        assert!(err.contains("no inline cluster CA"), "{err}");
+        assert!(normalize_with_endpoint(&no_ca, "lab", None, ApiEndpoint::Direct).is_ok());
+
+        let file_ca = SAMPLE.replace(
+            "certificate-authority-data: ZmFrZS1jYQ==",
+            "certificate-authority: /etc/ca.crt",
+        );
+        assert!(tunnel_refusal_for_yaml(&file_ca).is_some());
+
+        let empty_ca = SAMPLE.replace("ZmFrZS1jYQ==", "\"\"");
+        assert!(tunnel_refusal_for_yaml(&empty_ca).is_some());
+        assert_eq!(
+            tunnel_refusal_for_yaml("{not: [valid"),
+            Some(UNREADABLE_TUNNEL_REFUSAL)
+        );
+        assert_eq!(tunnel_refusal_for_yaml(SAMPLE), None);
     }
 
     #[test]
@@ -3221,6 +3308,21 @@ users:
         }
     }
 
+    #[test]
+    fn retarget_is_a_noop_on_kubeconfig_without_inline_ca() {
+        let path = std::env::temp_dir().join(format!(
+            "clusterdeck-retarget-noca-{}.yaml",
+            std::process::id()
+        ));
+        let raw = SAMPLE
+            .replace("      certificate-authority-data: ZmFrZS1jYQ==\n", "")
+            .replace("https://192.0.2.10:6443", "https://127.0.0.1:16443");
+        std::fs::write(&path, &raw).unwrap();
+        assert!(!retarget_tunnel_port(&path, 16500).unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), raw);
+        std::fs::remove_file(&path).ok();
+    }
+
     struct SpawnCountingRunner {
         inner: FakeSshRunner,
         spawns: std::sync::atomic::AtomicUsize,
@@ -3239,6 +3341,118 @@ users:
             self.spawns.fetch_add(1, Ordering::SeqCst);
             Err("spawn must not be reached".to_string())
         }
+    }
+
+    fn tunnel_lab_profile(with_bastion: bool) -> Profile {
+        let mut profile = Profile {
+            id: "lab".to_string(),
+            name: "Lab".to_string(),
+            hosts: vec![Host {
+                name: "m1".to_string(),
+                address: "10.0.0.10".to_string(),
+                port: 22,
+                user: "root".to_string(),
+                identity_file: None,
+                auth: AuthMode::Key,
+            }],
+            bastion: Some(crate::services::config::Bastion {
+                name: "bastion".to_string(),
+                address: "203.0.113.5".to_string(),
+                port: 22,
+                user: "ops".to_string(),
+                identity_file: None,
+            }),
+            bootstrap: BootstrapPolicy::default(),
+            kubeconfig: Some(KubeconfigSource {
+                remote_path: "/etc/kubernetes/admin.conf".to_string(),
+                control_plane: "m1".to_string(),
+                local_path: String::new(),
+                context: "lab".to_string(),
+            }),
+            manage_hosts_file: false,
+            trusted_cas: Vec::new(),
+            local_runtime: None,
+        };
+        if !with_bastion {
+            profile.bastion = None;
+        }
+        profile
+    }
+
+    /// Runs fetch_and_store over `yaml` with a stale persisted tunnel target; returns
+    /// (result, spawn attempts, target still persisted).
+    async fn fetch_with_stale_target(
+        name: &str,
+        yaml: String,
+        with_bastion: bool,
+    ) -> (Result<KubeconfigSummary, String>, usize, bool) {
+        let paths = ClusterDeckPaths::at(
+            std::env::temp_dir().join(format!("clusterdeck-kc-{name}-{}", std::process::id())),
+        );
+        crate::services::state::save_tunnel_target(
+            &paths,
+            "lab",
+            &crate::services::tunnel::TunnelTarget {
+                host: "127.0.0.1".to_string(),
+                port: 6443,
+            },
+        )
+        .unwrap();
+        let runner = SpawnCountingRunner {
+            inner: FakeSshRunner {
+                sample_yaml: yaml,
+                ssh_called: AtomicBool::new(false),
+            },
+            spawns: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let result =
+            fetch_and_store(&runner, &paths, &tunnel_lab_profile(with_bastion), None).await;
+        let kept = crate::services::state::get_tunnel_target(&paths, "lab")
+            .unwrap()
+            .is_some();
+        std::fs::remove_dir_all(&paths.base).ok();
+        (result, runner.spawns.load(Ordering::SeqCst), kept)
+    }
+
+    #[tokio::test]
+    async fn fetch_and_store_rejected_fetch_spawns_nothing_and_keeps_existing_state() {
+        // The fetch itself rejects a multi-cluster or unparseable kubeconfig before any tunnel
+        // decision; the stored file is untouched, so the existing tunnel state stays consistent.
+        let multi = SAMPLE.replace(
+            "contexts:",
+            "  - name: second\n    cluster:\n      server: https://192.0.2.11:6443\n      certificate-authority-data: ZmFrZS1jYQ==\ncontexts:",
+        );
+        for (name, yaml) in [
+            ("multi", multi),
+            ("garbage", "clusters: [unclosed".to_string()),
+        ] {
+            let (result, spawns, kept) = fetch_with_stale_target(name, yaml, true).await;
+            assert!(result.is_err(), "{name}");
+            assert_eq!(spawns, 0, "{name}");
+            assert!(kept, "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_and_store_refuses_tunnel_without_inline_ca() {
+        let no_ca = SAMPLE.replace("      certificate-authority-data: ZmFrZS1jYQ==\n", "");
+        let (result, spawns, kept) = fetch_with_stale_target("noca", no_ca, true).await;
+        assert!(result
+            .unwrap()
+            .tunnel_error
+            .unwrap()
+            .contains("no inline cluster CA"));
+        assert_eq!(spawns, 0);
+        assert!(!kept);
+    }
+
+    #[tokio::test]
+    async fn fetch_and_store_leaves_tunnel_state_alone_for_direct_profiles() {
+        let (result, spawns, kept) =
+            fetch_with_stale_target("direct", insecure_sample("true"), false).await;
+        assert!(result.unwrap().tunnel_error.is_none());
+        assert_eq!(spawns, 0);
+        assert!(kept, "direct profiles never touch tunnel state");
     }
 
     #[tokio::test]
@@ -3275,6 +3489,16 @@ users:
             trusted_cas: Vec::new(),
             local_runtime: None,
         };
+        // A target persisted by an earlier, secure fetch must not survive the refusal.
+        crate::services::state::save_tunnel_target(
+            &paths,
+            "lab",
+            &crate::services::tunnel::TunnelTarget {
+                host: "127.0.0.1".to_string(),
+                port: 6443,
+            },
+        )
+        .unwrap();
         let runner = SpawnCountingRunner {
             inner: FakeSshRunner {
                 sample_yaml: insecure_sample("\"true\""),
@@ -3289,6 +3513,10 @@ users:
         assert!(summary.tunnel_error.unwrap().contains("API tunnel refused"));
         let written = std::fs::read_to_string(paths.kubeconfig_file("lab")).unwrap();
         assert!(!written.contains("127.0.0.1"), "{written}");
+        assert_eq!(
+            crate::services::state::get_tunnel_target(&paths, "lab").unwrap(),
+            None
+        );
         std::fs::remove_dir_all(&paths.base).ok();
     }
 }

@@ -67,6 +67,15 @@ pub fn get_tunnel_target(
     Ok(load_state(paths)?.tunnels.get(profile_id).cloned())
 }
 
+pub fn clear_tunnel_target(paths: &ClusterDeckPaths, profile_id: &str) -> Result<(), String> {
+    let mut state = load_state(paths)?;
+    if state.tunnels.remove(profile_id).is_some() {
+        let json = serde_json::to_string_pretty(&state).map_err(|e| e.to_string())?;
+        std::fs::write(paths.state_file(), json).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 pub fn delete_status(paths: &ClusterDeckPaths, profile_id: &str) -> Result<(), String> {
     let mut state = load_state(paths)?;
     let removed_status = state.profiles.remove(profile_id).is_some();
