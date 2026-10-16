@@ -620,3 +620,225 @@ mod write_tests {
         )
     }
 }
+
+/// A hostname this profile maps that is also mapped, to a different IP, elsewhere in /etc/hosts.
+/// The resolver uses the FIRST matching line, so only one side is ever reachable.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct HostnameConflict {
+    pub hostname: String,
+    pub our_ip: String,
+    pub other_ip: String,
+    /// Profile id owning the other entry, or `None` for an unmanaged line.
+    pub other_owner: Option<String>,
+    /// True when our entry appears earlier in the file than the other one.
+    pub we_win: bool,
+}
+
+/// D1: reports CURRENT reality, not a prediction. The hostnames checked are those present in this
+/// profile's own (properly terminated) block, and "who wins" uses the real line positions, which
+/// is what the resolver uses right now (first matching line). If the block does not exist there
+/// is nothing to report. Reporting only: never edits `hosts_content`.
+/// Lines inside an unterminated/mismatched block are treated as unmanaged, so a broken block of
+/// ours cannot hide later lines from comparison. IPs are compared semantically (`IpAddr`), so
+/// differently written IPv6 is not a conflict; an IPv4 and an IPv6 mapping for one host still is
+/// (the resolver may pick either family). Identical destinations are not conflicts.
+pub fn find_hostname_conflicts(hosts_content: &str, profile_id: &str) -> Vec<HostnameConflict> {
+    const BEGIN: &str = "# >>> ClusterDeck BEGIN (profile: ";
+    const END: &str = "# <<< ClusterDeck END (profile: ";
+    type Entry = (usize, Option<String>, String, String); // (line, owner, ip, lowercase host)
+    fn flush(
+        entries: &mut Vec<Entry>,
+        pending: &mut Vec<(usize, String, String)>,
+        owner: Option<&str>,
+    ) {
+        for (i, ip, h) in pending.drain(..) {
+            entries.push((i, owner.map(str::to_string), ip, h));
+        }
+    }
+    let mut entries: Vec<Entry> = Vec::new();
+    let mut open: Option<String> = None;
+    let mut pending: Vec<(usize, String, String)> = Vec::new();
+    for (idx, raw) in hosts_content.lines().enumerate() {
+        let line = raw.trim();
+        if let Some(id) = line
+            .strip_prefix(BEGIN)
+            .and_then(|r| r.strip_suffix(") >>>"))
+        {
+            flush(&mut entries, &mut pending, None); // previous block never closed
+            open = Some(id.to_string());
+            continue;
+        }
+        if let Some(id) = line.strip_prefix(END).and_then(|r| r.strip_suffix(") <<<")) {
+            let owner = if open.as_deref() == Some(id) {
+                open.as_deref()
+            } else {
+                None
+            };
+            flush(&mut entries, &mut pending, owner);
+            open = None;
+            continue;
+        }
+        let content = line.split('#').next().unwrap_or("");
+        let mut parts = content.split_whitespace();
+        let Some(ip) = parts.next() else { continue };
+        for host in parts {
+            if open.is_some() {
+                pending.push((idx, ip.to_string(), host.to_ascii_lowercase()));
+            } else {
+                entries.push((idx, None, ip.to_string(), host.to_ascii_lowercase()));
+            }
+        }
+    }
+    flush(&mut entries, &mut pending, None); // EOF inside an open block
+
+    let own = |o: &Option<String>| o.as_deref() == Some(profile_id);
+    let same_ip =
+        |a: &str, b: &str| match (a.parse::<std::net::IpAddr>(), b.parse::<std::net::IpAddr>()) {
+            (Ok(x), Ok(y)) => x == y,
+            _ => a.eq_ignore_ascii_case(b),
+        };
+
+    let mut out = Vec::new();
+    let mut seen: Vec<&str> = Vec::new();
+    for (our_idx, o, our_ip, host) in &entries {
+        if !own(o) || seen.contains(&host.as_str()) {
+            continue;
+        }
+        seen.push(host);
+        for (idx, owner, ip, h) in &entries {
+            if own(owner) || h != host || same_ip(ip, our_ip) {
+                continue;
+            }
+            out.push(HostnameConflict {
+                hostname: host.clone(),
+                our_ip: our_ip.clone(),
+                other_ip: ip.clone(),
+                other_owner: owner.clone(),
+                we_win: our_idx < idx,
+            });
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod conflict_tests {
+    use super::*;
+
+    fn blk(id: &str, body: &str) -> String {
+        format!("# >>> ClusterDeck BEGIN (profile: {id}) >>>\n{body}\n# <<< ClusterDeck END (profile: {id}) <<<\n")
+    }
+
+    #[test]
+    fn other_profile_block_first_we_lose() {
+        let f = format!(
+            "127.0.0.1 localhost\n{}\n{}",
+            blk("vagrant", "192.0.2.10 argocd.example.internal"),
+            blk("cloud", "198.51.100.5 argocd.example.internal")
+        );
+        let c = find_hostname_conflicts(&f, "cloud");
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].other_owner.as_deref(), Some("vagrant"));
+        assert_eq!(c[0].other_ip, "192.0.2.10");
+        assert_eq!(c[0].our_ip, "198.51.100.5");
+        assert!(!c[0].we_win);
+    }
+
+    #[test]
+    fn other_profile_block_after_we_win() {
+        let f = format!(
+            "{}\n{}",
+            blk("cloud", "198.51.100.5 argocd.example.internal"),
+            blk("vagrant", "192.0.2.10 argocd.example.internal")
+        );
+        let c = find_hostname_conflicts(&f, "cloud");
+        assert_eq!(c.len(), 1);
+        assert!(c[0].we_win);
+    }
+
+    #[test]
+    fn unmanaged_line_is_reported_with_no_owner() {
+        let f = format!(
+            "192.0.2.77 app.example.internal\n{}",
+            blk("cloud", "198.51.100.5 app.example.internal")
+        );
+        let c = find_hostname_conflicts(&f, "cloud");
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].other_owner, None);
+        assert!(!c[0].we_win);
+    }
+
+    #[test]
+    fn case_insensitive_multiple_hostnames_tabs_and_inline_comment() {
+        let f = format!(
+            "192.0.2.77\talpha.example.internal\tAPP.Example.Internal # note\n{}",
+            blk("cloud", "198.51.100.5 app.example.internal")
+        );
+        let c = find_hostname_conflicts(&f, "cloud");
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].other_ip, "192.0.2.77");
+    }
+
+    #[test]
+    fn inline_comment_does_not_become_a_hostname() {
+        let f = format!(
+            "192.0.2.77 other.example.internal # app.example.internal\n{}",
+            blk("cloud", "198.51.100.5 app.example.internal")
+        );
+        assert!(find_hostname_conflicts(&f, "cloud").is_empty());
+    }
+
+    #[test]
+    fn no_own_block_or_no_overlap_gives_no_conflicts() {
+        let f = "192.0.2.77 app.example.internal\n# 192.0.2.8 x.example.internal\n\n";
+        assert!(find_hostname_conflicts(f, "cloud").is_empty());
+        let g = format!("{f}{}", blk("cloud", "198.51.100.5 b.example.internal"));
+        assert!(find_hostname_conflicts(&g, "cloud").is_empty());
+    }
+
+    #[test]
+    fn unterminated_own_block_does_not_swallow_later_unmanaged_lines() {
+        let f = "# >>> ClusterDeck BEGIN (profile: cloud) >>>\n198.51.100.5 a.example.internal\n";
+        assert!(find_hostname_conflicts(f, "cloud").is_empty());
+        // An unterminated block of another profile precedes ours: its lines stay comparable.
+        let g = format!(
+            "# >>> ClusterDeck BEGIN (profile: broken) >>>\n192.0.2.1 a.example.internal\n{}",
+            blk("cloud", "198.51.100.5 a.example.internal")
+        );
+        let c = find_hostname_conflicts(&g, "cloud");
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].other_owner, None);
+        assert!(!c[0].we_win);
+        // Lines after an unterminated block of OURS followed by an unmanaged line are not owned.
+        let h = "# >>> ClusterDeck BEGIN (profile: cloud) >>>\n198.51.100.5 a.example.internal\n";
+        let h = format!(
+            "{h}# <<< ClusterDeck END (profile: other) <<<\n192.0.2.9 a.example.internal\n"
+        );
+        assert!(find_hostname_conflicts(&h, "cloud").is_empty());
+    }
+
+    #[test]
+    fn mismatched_end_resets_to_unmanaged() {
+        let f = format!(
+            "# >>> ClusterDeck BEGIN (profile: x) >>>\n192.0.2.1 a.example.internal\n# <<< ClusterDeck END (profile: y) <<<\n{}",
+            blk("cloud", "198.51.100.5 a.example.internal")
+        );
+        let c = find_hostname_conflicts(&f, "cloud");
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].other_owner, None);
+    }
+
+    #[test]
+    fn ipv6_compared_semantically_and_v4_vs_v6_conflicts() {
+        let same = format!(
+            "2001:db8::1 a.example.internal\n{}",
+            blk("cloud", "2001:0DB8:0:0:0:0:0:1 a.example.internal")
+        );
+        assert!(find_hostname_conflicts(&same, "cloud").is_empty());
+        let mixed = format!(
+            "2001:db8::1 a.example.internal\n{}",
+            blk("cloud", "192.0.2.5 a.example.internal")
+        );
+        assert_eq!(find_hostname_conflicts(&mixed, "cloud").len(), 1);
+    }
+}

@@ -32,6 +32,7 @@ export default function EndpointsTab({
 }: EndpointsTabProps) {
   const isSynced = hostsStatus?.is_synced ?? false;
   const endpoints = lastResult?.endpoints ?? [];
+  const conflicts = hostsStatus?.conflicts ?? [];
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
@@ -90,6 +91,27 @@ export default function EndpointsTab({
         <p style={{ margin: '8px 0 0', fontSize: '12px', color: 'var(--text-secondary)' }}>
           Maps *.{profile.id}.clusterdeck.local node aliases and discovered Ingress/APISIX/Gateway hosts into /etc/hosts.
         </p>
+
+        {conflicts.length > 0 && (
+          <div className="status-banner warning" style={{ marginTop: '10px', fontSize: '12px' }}>
+            <div style={{ fontWeight: 600, marginBottom: '4px' }}>
+              Duplicate hostnames in /etc/hosts. The first entry wins, so the other cluster may answer.
+            </div>
+            <ul style={{ margin: 0, paddingLeft: '18px' }}>
+              {conflicts.map((c, i) => (
+                <li key={`${i}-${c.hostname}-${c.other_owner ?? 'unmanaged'}-${c.other_ip}`}>
+                  <span style={{ fontFamily: 'var(--font-mono)' }}>{c.hostname}</span> is also mapped by{' '}
+                  {c.other_owner ? `profile ${c.other_owner}` : 'an unmanaged /etc/hosts line'} →{' '}
+                  <span style={{ fontFamily: 'var(--font-mono)' }}>{c.other_ip}</span>;{' '}
+                  {c.we_win ? 'this profile wins' : 'this profile loses'} (ours: {c.our_ip}).
+                </li>
+              ))}
+            </ul>
+            <div style={{ marginTop: '4px', color: 'var(--text-secondary)' }}>
+              Clear the other profile&apos;s /etc/hosts block (or the unmanaged line) to resolve this.
+            </div>
+          </div>
+        )}
       </div>
 
       {/* Node FQDNs */}

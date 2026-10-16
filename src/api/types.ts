@@ -101,12 +101,23 @@ export type ConnectionResult = {
   errors: string[];
 };
 
+export type HostnameConflict = {
+  hostname: string;
+  our_ip: string;
+  other_ip: string;
+  /** Profile id owning the other entry; null for an unmanaged /etc/hosts line. */
+  other_owner: string | null;
+  /** True when our entry appears first in /etc/hosts (the resolver uses the first match). */
+  we_win: boolean;
+};
+
 export type SyncHostsResult = {
   success: boolean;
   endpoints_count: number;
   hosts_count: number;
   endpoints: DiscoveredEndpoint[];
   message: string;
+  conflicts: HostnameConflict[];
 };
 
 export type DiscoveredHost = { address: string; ssh_open: boolean };
@@ -192,6 +203,7 @@ export type HostsFileStatus = {
   is_synced: boolean;
   active_entries: string[];
   pending_entries: string[];
+  conflicts: HostnameConflict[];
 };
 
 export type LocalRuntimeLifecycleProvider = 'colima' | 'lima';
