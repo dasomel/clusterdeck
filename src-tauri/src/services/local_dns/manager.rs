@@ -112,17 +112,17 @@ enum ScriptError {
 }
 
 #[derive(Debug, Default)]
-struct Listing {
+pub(crate) struct Listing {
     /// Readable regular files: `(name, content)`, sorted.
-    files: Vec<(String, String)>,
+    pub files: Vec<(String, String)>,
     /// Names of symlinks, non-regular files and files whose content could not be read.
-    unreadable: Vec<String>,
+    pub unreadable: Vec<String>,
 }
 
 /// Fails (rather than returning a partial view) when the directory cannot be listed: planning
 /// against a guess could remove or overwrite files we cannot see. A missing directory is an
 /// empty listing.
-fn read_resolver_listing(dir: &Path) -> Result<Listing, String> {
+pub(crate) fn read_resolver_listing(dir: &Path) -> Result<Listing, String> {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Listing::default()),
@@ -617,6 +617,47 @@ pub async fn apply(env: &ManagerEnv<'_>, req: ApplyRequest<'_>) -> Result<ApplyR
         result.published = served_names(env);
     }
     Ok(result)
+}
+
+/// Rebuilds zones.json for the currently installed resolver zones (ours on disk) with no
+/// changes to /etc/resolver and no privileged prompts. Used during Connect to refresh records.
+///
+/// While any of our resolver files exists the OS points at the responder, so a dead agent, a
+/// responder that does not load the new generation, or a foreign listener is reported as an
+/// error. Nothing is removed here: that needs privilege and is the explicit Sync/apply path's
+/// D-DEAD cleanup.
+pub async fn apply_records_only(env: &ManagerEnv<'_>, desired: &[ZoneEntry]) -> Result<(), String> {
+    const UNAVAILABLE: &str = "Local DNS responder unavailable; press Sync to local DNS";
+    let _guard = MANAGER_MUTEX.lock().await;
+    let listing = read_resolver_listing(env.resolver_dir)?;
+    let previous = read_previous_zones(env.paths);
+    let entries = reconcile_entries(&listing.files, desired, previous.as_ref());
+    let generation = next_generation(env.paths);
+    publish(env, entries, generation)?;
+    if remaining_marker_files(&listing).is_empty() {
+        return Ok(());
+    }
+    let uid = agent::current_uid(env.runner)
+        .await
+        .map_err(|e| format!("{UNAVAILABLE} ({e})"))?;
+    let running = agent::agent_pid(env.runner, uid)
+        .await
+        .map_err(|e| format!("{UNAVAILABLE} ({e})"))?
+        .is_some();
+    if !running {
+        return Err(format!("{UNAVAILABLE} (agent is not running)"));
+    }
+    let status = wait_for_status(env, generation)
+        .await
+        .map_err(|e| format!("{UNAVAILABLE} ({e})"))?;
+    match agent::ownership_ok(env.runner, uid, env.port, &status).await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(format!(
+            "{UNAVAILABLE} (port {} is not owned by the ClusterDeck DNS agent)",
+            env.port
+        )),
+        Err(e) => Err(format!("{UNAVAILABLE} ({e})")),
+    }
 }
 
 fn served_generation(env: &ManagerEnv<'_>) -> Option<u64> {

@@ -24,6 +24,49 @@ pub(crate) fn decode_base64(input: &str) -> Option<Vec<u8>> {
     BASE64_STANDARD.decode(clean).ok()
 }
 
+pub(crate) fn is_not_found(val: &serde_json::Value) -> bool {
+    val.get("kind").and_then(|k| k.as_str()) == Some("Status")
+        && val.get("code").and_then(|c| c.as_u64()) == Some(404)
+        && val.get("reason").and_then(|r| r.as_str()) == Some("NotFound")
+}
+
+pub(crate) fn check_status_error(val: &serde_json::Value) -> Option<String> {
+    if is_not_found(val) {
+        return None;
+    }
+    let is_status = val.get("kind").and_then(|k| k.as_str()) == Some("Status");
+    let is_failure = val.get("status").and_then(|s| s.as_str()) == Some("Failure");
+    let code = val.get("code").and_then(|c| c.as_u64());
+    let is_error_code = code.is_some_and(|c| !(200..=299).contains(&c));
+
+    if is_status || is_failure || is_error_code {
+        let reason = val
+            .get("reason")
+            .and_then(|r| r.as_str())
+            .unwrap_or("Error");
+        let msg = val
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("Kubernetes API error");
+        let code_str = code.map(|c| format!(" (code {c})")).unwrap_or_default();
+        return Some(format!("k8s Status {reason}{code_str}: {msg}"));
+    }
+    None
+}
+
+/// kubectl's wording for a missing resource type / API group (`get --raw` prints
+/// `Error from server (NotFound): the server could not find the requested resource`).
+fn stderr_says_not_found(stderr: &str) -> bool {
+    stderr.contains("(NotFound)")
+        || stderr.contains("the server doesn't have a resource type")
+        || stderr.contains("the server could not find the requested resource")
+}
+
+pub(crate) fn is_valid_k8s_list(val: &serde_json::Value) -> bool {
+    val.get("kind").and_then(|k| k.as_str()) != Some("Status")
+        && val.get("items").and_then(|i| i.as_array()).is_some()
+}
+
 pub async fn query_k8s_api_json(
     runner: &dyn CommandRunner,
     kubeconfig_path: &Path,
@@ -39,13 +82,21 @@ pub async fn query_k8s_api_json(
     ];
 
     if let Ok(output) = runner.run("kubectl", &args).await {
-        if output.success {
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&output.stdout) {
-                if is_not_found(&val) {
-                    return Ok(None);
-                }
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&output.stdout) {
+            if is_not_found(&val) {
+                return Ok(None);
+            }
+            if let Some(err) = check_status_error(&val) {
+                return Err(err);
+            }
+            if output.success {
                 return Ok(Some(val));
             }
+        }
+        // An absent CRD is reported by kubectl on stderr only. The curl fallback cannot use
+        // exec-plugin credentials (401), so it must never be the verdict for "not installed".
+        if !output.success && stderr_says_not_found(&output.stderr) {
+            return Ok(None);
         }
     }
 
@@ -57,6 +108,9 @@ pub async fn query_k8s_api_json(
 
     if is_not_found(&parsed) {
         return Ok(None);
+    }
+    if let Some(err) = check_status_error(&parsed) {
+        return Err(err);
     }
 
     Ok(Some(parsed))
@@ -281,24 +335,15 @@ pub(crate) async fn curl_k8s_api(
 
     let output = res.map_err(|e| format!("curl execution failed: {e}"))?;
     if !output.success {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&output.stdout) {
+            if val.get("kind").and_then(|k| k.as_str()) == Some("Status") {
+                return Ok(output.stdout);
+            }
+        }
         return Err(format!("curl failed: {}", output.stderr));
     }
 
     Ok(output.stdout)
-}
-
-fn is_not_found(val: &serde_json::Value) -> bool {
-    if let Some(code) = val.get("code").and_then(|c| c.as_u64()) {
-        if code == 404 {
-            return true;
-        }
-    }
-    if let Some(reason) = val.get("reason").and_then(|r| r.as_str()) {
-        if reason == "NotFound" {
-            return true;
-        }
-    }
-    false
 }
 
 pub struct ServiceDiscoveryInfo {
@@ -671,117 +716,238 @@ pub fn parse_gateway_httproutes(
     endpoints
 }
 
-pub async fn discover_cluster_endpoints(
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscoveryResult {
+    pub endpoints: Vec<DiscoveredEndpoint>,
+    pub succeeded_kinds: Vec<String>,
+    pub failed_kinds: Vec<String>,
+    pub errors_by_kind: Vec<(String, String)>,
+}
+
+/// Every `DiscoveredEndpoint::source` / `DiscoveryResult` kind the discovery can produce.
+pub const DISCOVERY_KINDS: [&str; 5] = ["service", "ingress", "apisix", "istio", "gateway-api"];
+
+pub fn display_kind_name(kind: &str) -> &'static str {
+    match kind {
+        "service" => "Services",
+        "ingress" => "Ingress",
+        "apisix" => "APISIX",
+        "istio" => "Istio",
+        "gateway-api" => "Gateway",
+        _ => "Unknown",
+    }
+}
+
+pub async fn discover_cluster_endpoints_detailed(
     runner: &dyn CommandRunner,
     kubeconfig_path: &Path,
     default_ip: Option<&str>,
     gateway_address: Option<&str>,
-) -> Result<Vec<DiscoveredEndpoint>, String> {
+) -> Result<DiscoveryResult, String> {
     let mut all_endpoints = Vec::new();
+    let mut succeeded_kinds = Vec::new();
+    let mut failed_kinds = Vec::new();
+    let mut errors_by_kind = Vec::new();
 
-    // Step 1 (services) is the baseline endpoint listing: if even it fails, the cluster is
-    // effectively unusable, so its error propagates via `?`. Steps 2-5 below query optional
-    // resources (their CRDs may not be installed, or RBAC may forbid them), so each is
-    // best-effort -- a failure there must not discard endpoints already found.
     // 1. Query Services to find LoadBalancer IPs
-    let svc_val = query_k8s_api_json(runner, kubeconfig_path, "/api/v1/services").await?;
-    let svc_info = svc_val
-        .as_ref()
-        .map(parse_services)
-        .unwrap_or_else(|| ServiceDiscoveryInfo {
-            service_ips: HashMap::new(),
-            first_lb_ip: None,
-            endpoints: Vec::new(),
-        });
+    let svc_res = query_k8s_api_json(runner, kubeconfig_path, "/api/v1/services").await;
+    let svc_info = match svc_res {
+        Ok(Some(val)) if is_valid_k8s_list(&val) => {
+            succeeded_kinds.push("service".to_string());
+            parse_services(&val)
+        }
+        Ok(Some(_)) => {
+            let err = "malformed k8s list: missing items array".to_string();
+            failed_kinds.push("service".to_string());
+            errors_by_kind.push(("service".to_string(), err));
+            ServiceDiscoveryInfo {
+                service_ips: HashMap::new(),
+                first_lb_ip: None,
+                endpoints: Vec::new(),
+            }
+        }
+        Ok(None) => {
+            succeeded_kinds.push("service".to_string());
+            ServiceDiscoveryInfo {
+                service_ips: HashMap::new(),
+                first_lb_ip: None,
+                endpoints: Vec::new(),
+            }
+        }
+        Err(e) => {
+            failed_kinds.push("service".to_string());
+            errors_by_kind.push(("service".to_string(), e));
+            ServiceDiscoveryInfo {
+                service_ips: HashMap::new(),
+                first_lb_ip: None,
+                endpoints: Vec::new(),
+            }
+        }
+    };
 
     all_endpoints.extend(svc_info.endpoints);
 
+    // Ingress/APISIX/Istio/Gateway targets come from the Services/LB lookup (or the profile's
+    // fallback address). When that lookup failed, their IPs are guesses that must not replace
+    // good cached ones, unless a gateway override pins every IP anyway.
+    let services_failed = failed_kinds.iter().any(|k| k == "service");
+    let ips_unreliable = services_failed && !gateway_address.is_some_and(is_safe_gateway_address);
+
     let effective_fallback_ip = svc_info.first_lb_ip.as_deref().or(default_ip);
 
-    // 2-5. Ingresses, APISIX routes, Istio VirtualServices, and Gateway HTTPRoutes don't
-    // depend on each other (only on step 1's service_ips/fallback_ip), so run them
-    // concurrently instead of sequentially awaiting each one.
+    // 2-5. Ingresses, APISIX routes, Istio VirtualServices, and Gateway HTTPRoutes run concurrently.
     let ingress_query = async {
-        // 2. Query Ingresses (networking.k8s.io/v1)
-        if let Ok(Some(ing_val)) = query_k8s_api_json(
+        let res = query_k8s_api_json(
             runner,
             kubeconfig_path,
             "/apis/networking.k8s.io/v1/ingresses",
         )
-        .await
-        {
-            parse_ingresses(&ing_val, effective_fallback_ip)
-        } else {
-            Vec::new()
+        .await;
+        match res {
+            Ok(Some(ing_val)) if is_valid_k8s_list(&ing_val) => (
+                Some("ingress".to_string()),
+                None,
+                parse_ingresses(&ing_val, effective_fallback_ip),
+            ),
+            Ok(Some(_)) => (
+                None,
+                Some((
+                    "ingress".to_string(),
+                    "malformed k8s list: missing items array".to_string(),
+                )),
+                Vec::new(),
+            ),
+            Ok(None) => (Some("ingress".to_string()), None, Vec::new()),
+            Err(e) => (None, Some(("ingress".to_string(), e)), Vec::new()),
         }
     };
 
     let apisix_query = async {
-        // 3. Query APISIX (apisix.apache.org/v2 ApisixRoute)
-        if let Ok(Some(apisix_val)) = query_k8s_api_json(
+        let res = query_k8s_api_json(
             runner,
             kubeconfig_path,
             "/apis/apisix.apache.org/v2/apisixroutes",
         )
-        .await
-        {
-            parse_apisix_routes(&apisix_val, &svc_info.service_ips, effective_fallback_ip)
-        } else {
-            Vec::new()
+        .await;
+        match res {
+            Ok(Some(apisix_val)) if is_valid_k8s_list(&apisix_val) => (
+                Some("apisix".to_string()),
+                None,
+                parse_apisix_routes(&apisix_val, &svc_info.service_ips, effective_fallback_ip),
+            ),
+            Ok(Some(_)) => (
+                None,
+                Some((
+                    "apisix".to_string(),
+                    "malformed k8s list: missing items array".to_string(),
+                )),
+                Vec::new(),
+            ),
+            Ok(None) => (Some("apisix".to_string()), None, Vec::new()),
+            Err(e) => (None, Some(("apisix".to_string(), e)), Vec::new()),
         }
     };
 
     let istio_query = async {
-        // 4. Query Istio VirtualServices (networking.istio.io/v1beta1, falling back to
-        // v1alpha3 sequentially — the two API versions are mutually exclusive per cluster).
-        let istio_val = match query_k8s_api_json(
+        let res = match query_k8s_api_json(
             runner,
             kubeconfig_path,
             "/apis/networking.istio.io/v1beta1/virtualservices",
         )
         .await
         {
-            Ok(Some(v)) => Some(v),
-            _ => query_k8s_api_json(
-                runner,
-                kubeconfig_path,
-                "/apis/networking.istio.io/v1alpha3/virtualservices",
-            )
-            .await
-            .unwrap_or(None),
-        };
-        match istio_val {
-            Some(v) => {
-                parse_istio_virtual_services(&v, &svc_info.service_ips, effective_fallback_ip)
+            Ok(Some(v)) => Ok(Some(v)),
+            Ok(None) => {
+                query_k8s_api_json(
+                    runner,
+                    kubeconfig_path,
+                    "/apis/networking.istio.io/v1alpha3/virtualservices",
+                )
+                .await
             }
-            None => Vec::new(),
+            Err(e) => Err(e),
+        };
+        match res {
+            Ok(Some(v)) if is_valid_k8s_list(&v) => (
+                Some("istio".to_string()),
+                None,
+                parse_istio_virtual_services(&v, &svc_info.service_ips, effective_fallback_ip),
+            ),
+            Ok(Some(_)) => (
+                None,
+                Some((
+                    "istio".to_string(),
+                    "malformed k8s list: missing items array".to_string(),
+                )),
+                Vec::new(),
+            ),
+            Ok(None) => (Some("istio".to_string()), None, Vec::new()),
+            Err(e) => (None, Some(("istio".to_string(), e)), Vec::new()),
         }
     };
 
     let gateway_query = async {
-        // 5. Query Gateway API HTTPRoutes (gateway.networking.k8s.io/v1)
-        if let Ok(Some(gw_val)) = query_k8s_api_json(
+        let res = query_k8s_api_json(
             runner,
             kubeconfig_path,
             "/apis/gateway.networking.k8s.io/v1/httproutes",
         )
-        .await
-        {
-            parse_gateway_httproutes(&gw_val, effective_fallback_ip)
-        } else {
-            Vec::new()
+        .await;
+        match res {
+            Ok(Some(gw_val)) if is_valid_k8s_list(&gw_val) => (
+                Some("gateway-api".to_string()),
+                None,
+                parse_gateway_httproutes(&gw_val, effective_fallback_ip),
+            ),
+            Ok(Some(_)) => (
+                None,
+                Some((
+                    "gateway-api".to_string(),
+                    "malformed k8s list: missing items array".to_string(),
+                )),
+                Vec::new(),
+            ),
+            Ok(None) => (Some("gateway-api".to_string()), None, Vec::new()),
+            Err(e) => (None, Some(("gateway-api".to_string(), e)), Vec::new()),
         }
     };
 
-    let (ingress_endpoints, apisix_endpoints, istio_endpoints, gateway_endpoints) =
+    let (ing_out, apisix_out, istio_out, gw_out) =
         tokio::join!(ingress_query, apisix_query, istio_query, gateway_query);
 
-    // Keep the same extend order as before (ingress, apisix, istio, gateway) so the
-    // "keep first occurrence" dedup below is unaffected by running the queries concurrently.
-    all_endpoints.extend(ingress_endpoints);
-    all_endpoints.extend(apisix_endpoints);
-    all_endpoints.extend(istio_endpoints);
-    all_endpoints.extend(gateway_endpoints);
+    for (mut succ, mut fail, mut eps) in [ing_out, apisix_out, istio_out, gw_out] {
+        if ips_unreliable && !eps.is_empty() {
+            if let Some(kind) = succ.take() {
+                fail = Some((
+                    kind,
+                    "target IPs depend on the Services lookup, which failed".to_string(),
+                ));
+                eps.clear();
+            }
+        }
+        if let Some(s) = succ {
+            succeeded_kinds.push(s);
+        }
+        if let Some(f) = fail {
+            failed_kinds.push(f.0.clone());
+            errors_by_kind.push(f);
+        }
+        all_endpoints.extend(eps);
+    }
+
+    // If all queries failed, return the primary error
+    if succeeded_kinds.is_empty() {
+        let err_summary = errors_by_kind
+            .iter()
+            .map(|(k, e)| format!("{}: {e}", display_kind_name(k)))
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(if err_summary.is_empty() {
+            "all resource queries failed during discovery".to_string()
+        } else {
+            err_summary
+        });
+    }
 
     // Deduplicate by host (keep first occurrence, sorted by host)
     let mut dedup_map = BTreeMap::new();
@@ -793,17 +959,30 @@ pub async fn discover_cluster_endpoints(
 
     let mut endpoints: Vec<DiscoveredEndpoint> = dedup_map.into_values().collect();
 
-    // An operator-supplied gateway address wins over LB IPs and the control-plane fallback:
-    // Kubernetes cannot know an external cloud LB's address (the gateway Service is typically
-    // NodePort behind it), so anything it reports is a private address the user cannot reach.
-    // Re-validated here because this is the single place the override reaches endpoint data.
     if let Some(gw) = gateway_address.filter(|g| is_safe_gateway_address(g)) {
         for ep in &mut endpoints {
             ep.ip = gw.to_string();
         }
     }
 
-    Ok(endpoints)
+    Ok(DiscoveryResult {
+        endpoints,
+        succeeded_kinds,
+        failed_kinds,
+        errors_by_kind,
+    })
+}
+
+pub async fn discover_cluster_endpoints(
+    runner: &dyn CommandRunner,
+    kubeconfig_path: &Path,
+    default_ip: Option<&str>,
+    gateway_address: Option<&str>,
+) -> Result<Vec<DiscoveredEndpoint>, String> {
+    let res =
+        discover_cluster_endpoints_detailed(runner, kubeconfig_path, default_ip, gateway_address)
+            .await?;
+    Ok(res.endpoints)
 }
 
 #[cfg(test)]

@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::services::config::{AuthMode, Profile};
 use crate::services::k8s_endpoints::DiscoveredEndpoint;
@@ -547,11 +547,11 @@ pub async fn connect_profile(
 
     // Discover endpoints (Ingress, APISIX, Istio, Gateway API, Services)
     let mut endpoints = Vec::new();
-    let mut discovery_res: Result<Vec<DiscoveredEndpoint>, String> =
+    let mut discovery_res: Result<crate::services::k8s_endpoints::DiscoveryResult, String> =
         Err("kubernetes verification failed or kubeconfig missing".to_string());
     if verification.kubernetes && kubeconfig_exists {
         let default_ip = profile.hosts.first().map(|h| h.address.as_str());
-        match crate::services::k8s_endpoints::discover_cluster_endpoints(
+        match crate::services::k8s_endpoints::discover_cluster_endpoints_detailed(
             &runner,
             &kubeconfig_path,
             default_ip,
@@ -560,7 +560,7 @@ pub async fn connect_profile(
         .await
         {
             Ok(discovered) => {
-                endpoints = discovered.clone();
+                endpoints = discovered.endpoints.clone();
                 discovery_res = Ok(discovered);
             }
             Err(e) => {
@@ -569,7 +569,12 @@ pub async fn connect_profile(
             }
         }
     } else if profile.kubeconfig.is_none() {
-        discovery_res = Ok(Vec::new());
+        discovery_res = Ok(crate::services::k8s_endpoints::DiscoveryResult {
+            endpoints: Vec::new(),
+            succeeded_kinds: Vec::new(),
+            failed_kinds: Vec::new(),
+            errors_by_kind: Vec::new(),
+        });
     }
 
     let current_profile = store::load_profiles(&paths)
@@ -577,25 +582,22 @@ pub async fn connect_profile(
         .and_then(|ps| ps.into_iter().find(|p| p.id == profile_id))
         .unwrap_or_else(|| profile.clone());
 
-    if current_profile.host_mapping == crate::services::config::HostMapping::Hosts {
-        if let Err(e) = crate::services::hosts_file::upsert_hosts_block_with_endpoints(
-            &runner,
-            &current_profile,
-            &endpoints,
-        )
-        .await
-        {
-            errors.push(format!("hosts file update failed: {e}"));
-        }
+    if let Err(e) = write_connect_hosts_block(
+        &runner,
+        &paths,
+        Path::new(crate::services::hosts_file::HOSTS_FILE_PATH),
+        &current_profile,
+        &discovery_res,
+    )
+    .await
+    {
+        errors.push(e);
     }
 
     match crate::commands::local_dns::SystemDns::resolve() {
         Ok(dns) => {
-            let discovery = discovery_res
-                .as_ref()
-                .map(|v| v.as_slice())
-                .map_err(|e| e.as_str());
-            crate::commands::local_dns::refresh_local_dns_on_connect(
+            let discovery = discovery_res.as_ref().map_err(|e| e.as_str());
+            crate::commands::local_dns::refresh_local_dns_on_connect_detailed(
                 &paths,
                 &dns.env(),
                 &profile_id,
@@ -630,87 +632,333 @@ pub async fn connect_profile(
     })
 }
 
+/// Every discovery kind as owned strings: a total discovery failure is "all kinds failed".
+fn all_discovery_kinds() -> Vec<String> {
+    crate::services::k8s_endpoints::DISCOVERY_KINDS
+        .iter()
+        .map(|k| k.to_string())
+        .collect()
+}
+
+/// Endpoints for a Hosts-mode block write: a total discovery failure keeps every previous record
+/// exactly like a partial one keeps its failed kinds' records.
+fn hosts_endpoints_for(
+    cache_path: &Path,
+    hosts_path: &Path,
+    profile_id: &str,
+    discovery: &Result<crate::services::k8s_endpoints::DiscoveryResult, String>,
+) -> Vec<DiscoveredEndpoint> {
+    match discovery {
+        Ok(res) => merge_discovered_endpoints(
+            cache_path,
+            hosts_path,
+            profile_id,
+            &res.endpoints,
+            &res.succeeded_kinds,
+            &res.failed_kinds,
+        ),
+        Err(_) => merge_discovered_endpoints(
+            cache_path,
+            hosts_path,
+            profile_id,
+            &[],
+            &[],
+            &all_discovery_kinds(),
+        ),
+    }
+}
+
+/// Hosts-mode part of Connect: writes the profile's /etc/hosts block from this discovery.
+/// Runs inside the local DNS lane and re-reads the profile there (D-LANE): a save to Off or
+/// LocalDns that completed after Connect loaded its snapshot must not get its block back.
+/// Lock order stays profile write lock -> lane -> MANAGER_MUTEX -> tunnel slots (only the lane
+/// is taken here).
+pub(crate) async fn write_connect_hosts_block(
+    runner: &dyn CommandRunner,
+    paths: &ClusterDeckPaths,
+    hosts_path: &Path,
+    snapshot: &Profile,
+    discovery_res: &Result<crate::services::k8s_endpoints::DiscoveryResult, String>,
+) -> Result<(), String> {
+    let _lane_lock = crate::commands::local_dns::lock_lane().await;
+    let Ok(current) = store::get_profile(paths, &snapshot.id) else {
+        return Ok(());
+    };
+    if current.host_mapping != crate::services::config::HostMapping::Hosts {
+        return Ok(());
+    }
+    let hosts_endpoints = hosts_endpoints_for(
+        &paths.endpoints_cache_file(),
+        hosts_path,
+        &current.id,
+        discovery_res,
+    );
+    crate::services::hosts_file::upsert_hosts_block_with_endpoints_at(
+        runner,
+        hosts_path,
+        &current,
+        &hosts_endpoints,
+    )
+    .await
+    .map_err(|e| format!("hosts file update failed: {e}"))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScanEndpointsResult {
+    pub endpoints: Vec<DiscoveredEndpoint>,
+    pub warning: Option<String>,
+}
+
 #[tauri::command]
 pub async fn discover_cluster_endpoints_cmd(
     profile_id: String,
-) -> Result<Vec<DiscoveredEndpoint>, String> {
+) -> Result<ScanEndpointsResult, String> {
     let paths = ClusterDeckPaths::resolve()?;
     let runner = SystemRunner;
-    let profile = load_profile_fresh(&runner, &paths, &profile_id).await?;
-    let kubeconfig_path = paths.kubeconfig_file(&profile_id);
+    let cache_res = crate::commands::local_dns::SystemDns::resolve()
+        .map(|dns| crate::commands::local_dns::cache_path(&dns.env()));
+    discover_cluster_endpoints_internal(&runner, &paths, cache_res, &profile_id).await
+}
+
+pub async fn discover_cluster_endpoints_internal(
+    runner: &dyn CommandRunner,
+    paths: &ClusterDeckPaths,
+    cache_path_res: Result<PathBuf, String>,
+    profile_id: &str,
+) -> Result<ScanEndpointsResult, String> {
+    let profile = load_profile_fresh(runner, paths, profile_id).await?;
+    let kubeconfig_path = paths.kubeconfig_file(profile_id);
 
     if !kubeconfig_path.exists() {
         return Err("kubeconfig not found for profile; please connect first".to_string());
     }
 
     let default_ip = profile.hosts.first().map(|h| h.address.as_str());
-    crate::services::k8s_endpoints::discover_cluster_endpoints(
-        &runner,
+    let discovery = crate::services::k8s_endpoints::discover_cluster_endpoints_detailed(
+        runner,
         &kubeconfig_path,
         default_ip,
         profile.gateway_address.as_deref(),
     )
-    .await
+    .await?;
+
+    let mut warning = None;
+    match cache_path_res {
+        Ok(cache_file) => {
+            // Discovery ran without any lock: a delete may have completed meanwhile, and an
+            // unguarded write would resurrect the deleted profile's cache entry.
+            let _lane_lock = crate::commands::local_dns::lock_lane().await;
+            if store::get_profile(paths, profile_id).is_ok() {
+                if let Err(e) = crate::commands::local_dns::update_endpoint_cache(
+                    &cache_file,
+                    profile_id,
+                    &discovery.endpoints,
+                    Some(&discovery.succeeded_kinds),
+                ) {
+                    warning = Some(format!("failed to update endpoint cache: {e}"));
+                }
+            }
+        }
+        Err(e) => {
+            warning = Some(format!("failed to initialize DNS environment: {e}"));
+        }
+    }
+
+    Ok(ScanEndpointsResult {
+        endpoints: discovery.endpoints,
+        warning,
+    })
+}
+
+/// Endpoints to write for a Hosts profile. Succeeded kinds contribute exactly their fresh
+/// results (a host a succeeded kind no longer reports is gone); only FAILED kinds keep their
+/// previous records. Attribution comes from the endpoints cache as it was BEFORE this update;
+/// an old /etc/hosts line is re-added only when the cache ties it to a failed kind. When the
+/// cache holds no kind information at all (no entry, or only unknown sources) a line cannot be
+/// attributed and is presumed to belong to a failed kind (D4-a), so partial failures never lose
+/// records that predate the cache.
+pub fn merge_discovered_endpoints(
+    cache_path: &Path,
+    hosts_path: &Path,
+    profile_id: &str,
+    discovered: &[DiscoveredEndpoint],
+    succeeded_kinds: &[String],
+    failed_kinds: &[String],
+) -> Vec<DiscoveredEndpoint> {
+    if failed_kinds.is_empty() {
+        let _ = crate::commands::local_dns::update_endpoint_cache(
+            cache_path,
+            profile_id,
+            discovered,
+            Some(succeeded_kinds),
+        );
+        return discovered.to_vec();
+    }
+
+    let previous = crate::commands::local_dns::cached_endpoints(cache_path, profile_id);
+    let is_known_kind = |src: &str| crate::services::k8s_endpoints::DISCOVERY_KINDS.contains(&src);
+    let have_kind_info = previous.iter().any(|ep| is_known_kind(&ep.source));
+    let kind_of: std::collections::HashMap<&str, &str> = previous
+        .iter()
+        .filter(|ep| is_known_kind(&ep.source))
+        .map(|ep| (ep.host.as_str(), ep.source.as_str()))
+        .collect();
+
+    let mut merged = match crate::commands::local_dns::update_endpoint_cache(
+        cache_path,
+        profile_id,
+        discovered,
+        Some(succeeded_kinds),
+    ) {
+        Ok(eps) => eps,
+        Err(_) => crate::commands::local_dns::merge_endpoints(
+            previous.clone(),
+            discovered,
+            Some(succeeded_kinds),
+        ),
+    };
+
+    if let Ok(hosts_content) = std::fs::read_to_string(hosts_path) {
+        if let Some(lines) =
+            crate::services::hosts_file::get_profile_hosts_block(&hosts_content, profile_id)
+        {
+            let node_suffix = format!(".{profile_id}.clusterdeck.local");
+            for line in lines {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() < 2 {
+                    continue;
+                }
+                let (ip, host) = (parts[0], parts[1]);
+                let keep = match kind_of.get(host) {
+                    Some(kind) => failed_kinds.iter().any(|k| k == kind),
+                    None => !have_kind_info,
+                };
+                if keep
+                    && !host.ends_with(&node_suffix)
+                    && crate::services::validate::is_safe_host_domain(host)
+                    && crate::services::validate::is_safe_ip_address(ip)
+                    && !merged.iter().any(|ep| ep.host == host)
+                {
+                    merged.push(crate::services::k8s_endpoints::DiscoveredEndpoint {
+                        host: host.to_string(),
+                        ip: ip.to_string(),
+                        source: "cached".to_string(),
+                        resource_name: String::new(),
+                    });
+                }
+            }
+        }
+    }
+
+    merged
 }
 
 #[tauri::command]
 pub async fn sync_hosts_file_cmd(profile_id: String) -> Result<SyncHostsResult, String> {
     let paths = ClusterDeckPaths::resolve()?;
-    let profile = store::get_profile(&paths, &profile_id)?;
     let runner = SystemRunner;
-    let kubeconfig_path = paths.kubeconfig_file(&profile_id);
+    sync_hosts_file_with_deps(
+        &runner,
+        &paths,
+        Path::new(crate::services::hosts_file::HOSTS_FILE_PATH),
+        &profile_id,
+    )
+    .await
+}
 
-    let discovery_res: Result<Vec<DiscoveredEndpoint>, String> = if kubeconfig_path.exists() {
-        let default_ip = profile.hosts.first().map(|h| h.address.as_str());
-        crate::services::k8s_endpoints::discover_cluster_endpoints(
-            &runner,
-            &kubeconfig_path,
-            default_ip,
-            profile.gateway_address.as_deref(),
-        )
-        .await
-    } else if profile.kubeconfig.is_none() {
-        Ok(Vec::new())
-    } else {
-        Err("kubeconfig not found for profile; please connect first".to_string())
-    };
+pub async fn sync_hosts_file_with_deps(
+    runner: &dyn CommandRunner,
+    paths: &ClusterDeckPaths,
+    hosts_path: &Path,
+    profile_id: &str,
+) -> Result<SyncHostsResult, String> {
+    let profile = store::get_profile(paths, profile_id)?;
+    let kubeconfig_path = paths.kubeconfig_file(profile_id);
+
+    let discovery_res: Result<crate::services::k8s_endpoints::DiscoveryResult, String> =
+        if kubeconfig_path.exists() {
+            let default_ip = profile.hosts.first().map(|h| h.address.as_str());
+            crate::services::k8s_endpoints::discover_cluster_endpoints_detailed(
+                runner,
+                &kubeconfig_path,
+                default_ip,
+                profile.gateway_address.as_deref(),
+            )
+            .await
+        } else if profile.kubeconfig.is_none() {
+            Ok(crate::services::k8s_endpoints::DiscoveryResult {
+                endpoints: Vec::new(),
+                succeeded_kinds: Vec::new(),
+                failed_kinds: Vec::new(),
+                errors_by_kind: Vec::new(),
+            })
+        } else {
+            Err("kubeconfig not found for profile; please connect first".to_string())
+        };
 
     if profile.host_mapping == crate::services::config::HostMapping::LocalDns {
         let dns = crate::commands::local_dns::SystemDns::resolve()?;
-        return crate::commands::local_dns::sync_local_dns_profile(
-            &paths,
+        return crate::commands::local_dns::sync_local_dns_profile_detailed(
+            paths,
             &dns.env(),
-            crate::commands::local_dns::hosts_path(),
+            hosts_path,
             &profile,
             match &discovery_res {
-                Ok(eps) => Ok(eps.clone()),
+                Ok(res) => Ok(res.clone()),
                 Err(e) => Err(e.as_str()),
             },
         )
         .await;
     }
 
-    let endpoints = discovery_res.unwrap_or_default();
-    crate::services::hosts_file::upsert_hosts_block_with_endpoints(&runner, &profile, &endpoints)
-        .await?;
+    let endpoints = hosts_endpoints_for(
+        &paths.endpoints_cache_file(),
+        hosts_path,
+        profile_id,
+        &discovery_res,
+    );
+    let warning = match &discovery_res {
+        Ok(res) if !res.failed_kinds.is_empty() => {
+            let names: Vec<&str> = res
+                .failed_kinds
+                .iter()
+                .map(|k| crate::services::k8s_endpoints::display_kind_name(k))
+                .collect();
+            Some(format!(
+                "Endpoint discovery partially failed for: {}; keeping last known records.",
+                names.join(", ")
+            ))
+        }
+        Ok(_) => None,
+        Err(_) => Some(
+            "Could not discover endpoints (Connect first); keeping last known records.".to_string(),
+        ),
+    };
+    crate::services::hosts_file::upsert_hosts_block_with_endpoints_at(
+        runner, hosts_path, &profile, &endpoints,
+    )
+    .await?;
 
     let hosts_count = profile.hosts.len() + if profile.bastion.is_some() { 1 } else { 0 };
     let endpoints_count = endpoints.len();
 
     // Warning only: the block is already written, so our entries are in the file now.
-    let written =
-        std::fs::read_to_string(crate::services::hosts_file::HOSTS_FILE_PATH).unwrap_or_default();
-    let conflicts = crate::services::hosts_file::find_hostname_conflicts(&written, &profile_id);
+    let written = std::fs::read_to_string(hosts_path).unwrap_or_default();
+    let conflicts = crate::services::hosts_file::find_hostname_conflicts(&written, profile_id);
 
     Ok(SyncHostsResult {
-        success: true,
+        success: warning.is_none(),
         endpoints_count,
         hosts_count,
         endpoints,
-        message: format!(
-            "Successfully synced {hosts_count} host(s) and {endpoints_count} cluster endpoint(s) to /etc/hosts"
-        ),
-        warning: None,
+        message: if let Some(w) = &warning {
+            w.clone()
+        } else {
+            format!(
+                "Successfully synced {hosts_count} host(s) and {endpoints_count} cluster endpoint(s) to /etc/hosts"
+            )
+        },
+        warning,
         conflicts,
         dns_conflicts: vec![],
         skipped_hosts: vec![],
@@ -1333,5 +1581,178 @@ mod tests {
             assert!(err.contains("API tunnel refused"), "{name}: {err}");
             std::fs::remove_dir_all(&paths.base).ok();
         }
+    }
+
+    struct MockDiscoveryRunner {
+        service_json: String,
+        ingress_json: String,
+        hosts_path: Option<PathBuf>,
+    }
+
+    #[async_trait]
+    impl CommandRunner for MockDiscoveryRunner {
+        async fn run(&self, bin: &str, args: &[String]) -> Result<CommandOutput, String> {
+            if bin == "osascript" {
+                if let Some(script) = args.get(1) {
+                    if let Some(start) = script.find("/bin/cp -P '") {
+                        let rest = &script[start + 12..];
+                        if let Some(end) = rest.find('\'') {
+                            let src = &rest[..end];
+                            if let Ok(content) = std::fs::read_to_string(src) {
+                                if let Some(target) = &self.hosts_path {
+                                    let _ = std::fs::write(target, content);
+                                }
+                            }
+                        }
+                    }
+                }
+                return Ok(CommandOutput {
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    success: true,
+                });
+            }
+            let last = args.last().map(String::as_str).unwrap_or("");
+            if last.ends_with("/api/v1/services") {
+                Ok(CommandOutput {
+                    stdout: self.service_json.clone(),
+                    stderr: String::new(),
+                    success: true,
+                })
+            } else if last.ends_with("/ingresses") {
+                if self.ingress_json.is_empty() {
+                    Ok(CommandOutput {
+                        stdout: String::new(),
+                        stderr: "error".into(),
+                        success: false,
+                    })
+                } else {
+                    Ok(CommandOutput {
+                        stdout: self.ingress_json.clone(),
+                        stderr: String::new(),
+                        success: true,
+                    })
+                }
+            } else {
+                Ok(CommandOutput {
+                    stdout: r#"{"items":[]}"#.into(),
+                    stderr: String::new(),
+                    success: true,
+                })
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn scan_failure_path_returns_warning_when_dns_or_cache_fails() {
+        let paths = temp_paths("scan-fail");
+        let mut p = profile_with_hosts(vec![key_host("cp1")]);
+        p.id = "scan-test".into();
+        store::upsert_profile(&paths, p).unwrap();
+        paths.ensure_dirs().unwrap();
+        std::fs::write(
+            paths.kubeconfig_file("scan-test"),
+            "clusters:\n- cluster:\n    server: https://127.0.0.1:6443\n",
+        )
+        .unwrap();
+
+        let runner = MockDiscoveryRunner {
+            service_json: r#"{"items":[]}"#.into(),
+            ingress_json: r#"{"items":[]}"#.into(),
+            hosts_path: None,
+        };
+
+        // 1. DNS environment resolution failure propagates warning
+        let res1 = discover_cluster_endpoints_internal(
+            &runner,
+            &paths,
+            Err("simulated dns error".to_string()),
+            "scan-test",
+        )
+        .await
+        .unwrap();
+        assert!(res1.warning.is_some());
+        assert!(res1.warning.unwrap().contains("simulated dns error"));
+
+        // 2. Cache path write failure propagates warning
+        let unwriteable_cache = std::path::PathBuf::from("/dev/null/impossible/endpoints.json");
+        let res2 = discover_cluster_endpoints_internal(
+            &runner,
+            &paths,
+            Ok(unwriteable_cache),
+            "scan-test",
+        )
+        .await
+        .unwrap();
+        assert!(res2.warning.is_some());
+        assert!(res2
+            .warning
+            .unwrap()
+            .contains("failed to update endpoint cache"));
+
+        // 3. Scan command failure for nonexistent profile
+        let res3 = discover_cluster_endpoints_cmd("nonexistent-profile-xyz".into()).await;
+        assert!(res3.is_err());
+
+        std::fs::remove_dir_all(&paths.base).ok();
+    }
+
+    #[tokio::test]
+    async fn hosts_sync_partial_discovery_preserves_last_known_records() {
+        let paths = temp_paths("hosts-partial");
+        let mut p = profile_with_hosts(vec![key_host("cp1")]);
+        p.id = "hosts-test".into();
+        p.host_mapping = crate::services::config::HostMapping::Hosts;
+        store::upsert_profile(&paths, p.clone()).unwrap();
+        paths.ensure_dirs().unwrap();
+        std::fs::write(
+            paths.kubeconfig_file("hosts-test"),
+            "clusters:\n- cluster:\n    server: https://127.0.0.1:6443\n",
+        )
+        .unwrap();
+
+        let hosts_file = paths.base.join("hosts_test_file");
+        // Initial hosts block has an existing ingress endpoint: api.lab.example.internal
+        let initial_block =
+            "# >>> ClusterDeck BEGIN (profile: hosts-test) >>>\n192.0.2.10 cp1.hosts-test.clusterdeck.local\n# Discovered cluster endpoints (Ingress, APISIX, etc.)\n192.0.2.60 api.lab.example.internal\n# <<< ClusterDeck END (profile: hosts-test) <<<\n";
+        std::fs::write(&hosts_file, initial_block).unwrap();
+
+        // Runner where services query succeeds with a new svc endpoint, but ingress query fails
+        let runner = MockDiscoveryRunner {
+            service_json: r#"{
+                "items": [{
+                    "metadata": {"name": "my-svc", "namespace": "default", "annotations": {"external-dns.alpha.kubernetes.io/hostname": "svc.lab.example.internal"}},
+                    "spec": {"type": "LoadBalancer"},
+                    "status": {"loadBalancer": {"ingress": [{"ip": "192.0.2.50"}]}}
+                }]
+            }"#.into(),
+            ingress_json: String::new(), // causes ingress failure
+            hosts_path: Some(hosts_file.clone()),
+        };
+
+        let res = sync_hosts_file_with_deps(&runner, &paths, &hosts_file, "hosts-test")
+            .await
+            .unwrap();
+
+        assert!(!res.success);
+        assert!(res
+            .warning
+            .as_ref()
+            .unwrap()
+            .contains("keeping last known records"));
+        let hosts_content = std::fs::read_to_string(&hosts_file).unwrap();
+
+        // Must keep the old ingress endpoint from previous hosts block AND include the new service endpoint
+        assert!(
+            hosts_content.contains("192.0.2.60 api.lab.example.internal"),
+            "hosts content missing preserved ingress endpoint: {hosts_content}"
+        );
+        assert!(
+            hosts_content.contains("192.0.2.50 svc.lab.example.internal"),
+            "hosts content missing new service endpoint: {hosts_content}"
+        );
+        assert_eq!(res.endpoints_count, 2);
+
+        std::fs::remove_dir_all(&paths.base).ok();
     }
 }
