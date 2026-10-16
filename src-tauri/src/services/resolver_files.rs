@@ -17,8 +17,13 @@ const MARKER_SUFFIX: &str = ")";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConflictKind {
     Unowned,
-    OwnedByOtherProfile { owner: String },
+    OwnedByOtherProfile {
+        owner: String,
+    },
     InvalidZone,
+    /// The `/etc/resolver` entry for this zone is a symlink, not a regular file, or unreadable:
+    /// ownership cannot be established, so it is never written or served.
+    Unreadable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -225,7 +230,7 @@ fn validate_dir_path(path: &str, label: &str) -> Result<(), String> {
 }
 
 /// POSIX single-quote escaping for `/bin/sh`: wraps in `'...'` and replaces each `'` with `'\''`.
-fn sh_single_quote(s: &str) -> String {
+pub(crate) fn sh_single_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
@@ -247,6 +252,50 @@ pub fn build_privileged_script(
     plan: &ResolverPlan,
     port: u16,
 ) -> Result<String, String> {
+    build_privileged_script_with(resolver_dir, plan, port, &ScriptOptions::default())
+}
+
+/// Optional extra steps for `build_privileged_script_with`. Extra exit code: 7 = listener
+/// ownership check failed (the hosts copy propagates `cp`'s own status).
+#[derive(Debug, Clone, Default)]
+pub struct ScriptOptions<'a> {
+    /// When set, the script first requires the UDP listener and the TCP LISTEN socket on `port`
+    /// to both belong to exactly this pid (R8: re-checked as root right before writing, closing
+    /// the gap between the unprivileged ownership gate and the prompt being approved).
+    pub expected_pid: Option<u32>,
+    /// A user-staged hosts file copied to /etc/hosts FIRST (R11: one prompt for a hosts<->DNS
+    /// mode switch). Same `hosts_file::hosts_copy_command` as `write_hosts_file`.
+    ///
+    /// D-HOSTS-COPY: the user-owned staged file is never copied straight onto /etc/hosts; root
+    /// copies it to its own temp file, verifies the content hash and type, and renames it, so a
+    /// same-UID swap after staging cannot inject different content.
+    pub hosts_tmp: Option<&'a std::path::Path>,
+    /// SHA-256 (hex) of the /etc/hosts snapshot `hosts_tmp` was computed from; exit 8 when the
+    /// live file no longer matches. The hosts step runs after every resolver step.
+    pub hosts_sha256: Option<&'a str>,
+    /// D-MBB: the hosts change keeps every existing line (adds only). Placed before resolver
+    /// removals when true, after them otherwise. Default false (= the safer "last").
+    pub hosts_additive: bool,
+    /// SHA-256 (hex) of the intended NEW hosts content; required with `hosts_tmp`. The script
+    /// verifies its private copy against it (D-HOSTS-COPY, exit 9).
+    pub hosts_content_sha256: Option<String>,
+}
+
+/// SHA-256 hex of a hosts snapshot, as compared by the script's `shasum` check.
+pub fn sha256_hex(content: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(content.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+pub fn build_privileged_script_with(
+    resolver_dir: &str,
+    plan: &ResolverPlan,
+    port: u16,
+    opts: &ScriptOptions<'_>,
+) -> Result<String, String> {
     if port == 0 {
         return Err("invalid port: 0".to_string());
     }
@@ -264,6 +313,54 @@ pub fn build_privileged_script(
     let resolver_base = resolver_dir.trim_end_matches('/');
 
     let mut cmds: Vec<String> = vec!["set -e".to_string()];
+
+    if let Some(pid) = opts.expected_pid {
+        cmds.push(format!(
+            "[ \"$(/usr/sbin/lsof -nP -iUDP:{port} -t)\" = \"{pid}\" ] || exit 7"
+        ));
+        cmds.push(format!(
+            "[ \"$(/usr/sbin/lsof -nP -iTCP:{port} -sTCP:LISTEN -t)\" = \"{pid}\" ] || exit 7"
+        ));
+    }
+
+    // D-MBB (make-before-break): steps are ordered by EFFECT so a failure at any point leaves at
+    // least one working name mapping:
+    //   (1) resolver writes, (2) hosts step if purely additive, (3) resolver removals,
+    //   (4) hosts step if it removes anything.
+    // LocalDns->Hosts therefore adds the hosts block before removing resolver files, and
+    // Hosts->LocalDns writes resolver files before removing the hosts block. Any failure
+    // (including exit 8) aborts the remaining steps; the caller reconciles from disk.
+    let hosts_additive = opts.hosts_additive;
+    let mut hosts_cmds: Vec<String> = Vec::new();
+    if let Some(tmp) = opts.hosts_tmp {
+        let tmp = tmp
+            .to_str()
+            .ok_or_else(|| "hosts staging path is not valid UTF-8".to_string())?;
+        if let Some(hash) = opts.hosts_sha256 {
+            if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err("hosts_sha256 must be 64 hex characters".to_string());
+            }
+            // ADR-0004 snapshot discipline, enforced as root: the staged content was computed
+            // from a snapshot with this hash; if /etc/hosts changed since, exit 8 and skip
+            // every remaining step rather than clobber the concurrent edit.
+            hosts_cmds.push(format!(
+                "[ \"$(/usr/bin/shasum -a 256 < {} | /usr/bin/cut -d' ' -f1)\" = \"{hash}\" ] || exit 8",
+                crate::services::hosts_file::HOSTS_FILE_PATH
+            ));
+        }
+        let content_hash = opts
+            .hosts_content_sha256
+            .as_deref()
+            .ok_or_else(|| "hosts_content_sha256 is required with hosts_tmp".to_string())?;
+        if content_hash.len() != 64 || !content_hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err("hosts_content_sha256 must be 64 hex characters".to_string());
+        }
+        // Path and hash validation plus shell quoting happen inside `hosts_copy_command`.
+        hosts_cmds.push(crate::services::hosts_file::hosts_copy_command(
+            tmp,
+            content_hash,
+        )?);
+    }
 
     if !plan.write.is_empty() {
         let q_resolver_dir = sh_single_quote(resolver_base);
@@ -316,6 +413,10 @@ pub fn build_privileged_script(
         cmds.push(format!("/bin/mv -f \"$tmp\" {q_target} || {cleanup}"));
     }
 
+    if hosts_additive {
+        cmds.extend(hosts_cmds.iter().cloned());
+    }
+
     for (zone, expected_owner) in &plan.remove {
         if !is_allowed_private_zone(zone) {
             return Err(format!("invalid zone in remove plan: {zone}"));
@@ -336,6 +437,10 @@ pub fn build_privileged_script(
             "{{ [ -f {q_target} ] && [ ! -L {q_target} ] && IFS= read -r line < {q_target} && [ \"$line\" = {q_marker} ]; }} || exit 4"
         ));
         cmds.push(format!("/bin/rm -f {q_target} || exit 6"));
+    }
+
+    if !hosts_additive {
+        cmds.extend(hosts_cmds);
     }
 
     cmds.push(FLUSH_DNS_CACHE.to_string());
@@ -1034,5 +1139,482 @@ mod tests {
             "flush failure must not fail the script: {status:?}"
         );
         assert!(resolver_dir.join("lab.example.internal").exists());
+    }
+
+    /// Runs the extracted script with `lsof` and `/etc/hosts` redirected to scratch paths.
+    /// The stub prints `listener_pid` for every query, standing in for the real listener.
+    fn run_ext(
+        dir: &TestDir,
+        plan: &ResolverPlan,
+        opts: &ScriptOptions<'_>,
+        listener_pid: &str,
+        hosts_target: &Path,
+    ) -> Option<i32> {
+        let stub = dir.path().join("lsof-stub");
+        std::fs::write(&stub, format!("#!/bin/sh\necho {listener_pid}\n")).unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let resolver = dir.path().join("resolver");
+        let applescript =
+            build_privileged_script_with(resolver.to_str().unwrap(), plan, DEFAULT_DNS_PORT, opts)
+                .unwrap();
+        let sh = unescape_applescript_do_shell_script(&applescript)
+            .replace(FLUSH_DNS_CACHE, "true")
+            .replace("/usr/sbin/lsof", stub.to_str().unwrap())
+            // D-HOSTS-COPY paths: /private/etc -> the scratch dir, chown (needs root) stubbed.
+            .replace(
+                "/private/etc/hosts",
+                &format!("'{}'", hosts_target.display()),
+            )
+            .replace(
+                "/private/etc/",
+                &format!("{}/", hosts_target.parent().unwrap().display()),
+            )
+            .replace("/usr/sbin/chown root:wheel", "/usr/bin/true")
+            .replace(" /etc/hosts", &format!(" '{}'", hosts_target.display()));
+        std::process::Command::new("/bin/sh")
+            .args(["-c", &sh])
+            .status()
+            .unwrap()
+            .code()
+    }
+
+    fn one_write_plan() -> ResolverPlan {
+        ResolverPlan {
+            write: vec![("lab.example.internal".to_string(), "prof-a".to_string())],
+            ..ResolverPlan::default()
+        }
+    }
+
+    #[test]
+    fn real_sh_expected_pid_mismatch_exits_7_before_any_write() {
+        let dir = TestDir::new();
+        let hosts_src = dir.path().join("hosts.staged");
+        let hosts_dst = dir.path().join("hosts.live");
+        std::fs::write(&hosts_src, "192.0.2.1 a.example.internal\n").unwrap();
+        std::fs::write(&hosts_dst, "original\n").unwrap();
+        let opts = ScriptOptions {
+            expected_pid: Some(4242),
+            hosts_tmp: Some(&hosts_src),
+            hosts_sha256: None,
+            hosts_additive: false,
+            hosts_content_sha256: Some(file_sha(&hosts_src)),
+        };
+
+        let code = run_ext(&dir, &one_write_plan(), &opts, "9999", &hosts_dst);
+        assert_eq!(code, Some(7));
+        assert!(!dir.path().join("resolver/lab.example.internal").exists());
+        assert_eq!(std::fs::read_to_string(&hosts_dst).unwrap(), "original\n");
+    }
+
+    #[test]
+    fn real_sh_expected_pid_match_applies_resolver_files_then_hosts() {
+        let dir = TestDir::new();
+        let hosts_src = dir.path().join("hosts.staged");
+        let hosts_dst = dir.path().join("hosts.live");
+        std::fs::write(&hosts_src, "192.0.2.1 a.example.internal\n").unwrap();
+        std::fs::write(&hosts_dst, "original\n").unwrap();
+        let opts = ScriptOptions {
+            expected_pid: Some(4242),
+            hosts_tmp: Some(&hosts_src),
+            hosts_sha256: None,
+            hosts_additive: false,
+            hosts_content_sha256: Some(file_sha(&hosts_src)),
+        };
+
+        let code = run_ext(&dir, &one_write_plan(), &opts, "4242", &hosts_dst);
+        assert_eq!(code, Some(0));
+        assert!(dir.path().join("resolver/lab.example.internal").exists());
+        assert_eq!(
+            std::fs::read_to_string(&hosts_dst).unwrap(),
+            "192.0.2.1 a.example.internal\n"
+        );
+
+        let script = build_privileged_script_with(
+            "/etc/resolver",
+            &one_write_plan(),
+            DEFAULT_DNS_PORT,
+            &opts,
+        )
+        .unwrap();
+        let udp = script.find("-iUDP:15353").expect("udp check");
+        let tcp = script.find("-sTCP:LISTEN").expect("tcp check");
+        let cp = script.find("/bin/cp -P '").expect("hosts copy");
+        let mkdir = script.find("/bin/mkdir").expect("mkdir");
+        assert!(udp < tcp && tcp < mkdir && mkdir < cp, "{script}");
+    }
+
+    #[test]
+    fn real_sh_hosts_snapshot_mismatch_exits_8_and_match_copies() {
+        let dir = TestDir::new();
+        let hosts_src = dir.path().join("hosts.staged");
+        let hosts_dst = dir.path().join("hosts.live");
+        std::fs::write(&hosts_src, "192.0.2.1 a.example.internal\n").unwrap();
+        std::fs::write(&hosts_dst, "edited concurrently\n").unwrap();
+        let stale = sha256_hex("original\n");
+        let opts = ScriptOptions {
+            expected_pid: None,
+            hosts_tmp: Some(&hosts_src),
+            hosts_sha256: Some(&stale),
+            hosts_additive: false,
+            hosts_content_sha256: Some(file_sha(&hosts_src)),
+        };
+        let code = run_ext(&dir, &ResolverPlan::default(), &opts, "1", &hosts_dst);
+        assert_eq!(code, Some(8));
+        assert_eq!(
+            std::fs::read_to_string(&hosts_dst).unwrap(),
+            "edited concurrently\n"
+        );
+
+        let fresh = sha256_hex("edited concurrently\n");
+        let opts = ScriptOptions {
+            hosts_sha256: Some(&fresh),
+            ..opts
+        };
+        let code = run_ext(&dir, &ResolverPlan::default(), &opts, "1", &hosts_dst);
+        assert_eq!(code, Some(0));
+        assert_eq!(
+            std::fs::read_to_string(&hosts_dst).unwrap(),
+            "192.0.2.1 a.example.internal\n"
+        );
+    }
+
+    #[test]
+    fn real_sh_resolver_failure_leaves_hosts_untouched() {
+        let dir = TestDir::new();
+        let hosts_src = dir.path().join("hosts.staged");
+        let hosts_dst = dir.path().join("hosts.live");
+        std::fs::write(&hosts_src, "192.0.2.1 a.example.internal\n").unwrap();
+        std::fs::write(&hosts_dst, "original\n").unwrap();
+        // Unowned file already at the target: the write guard exits 3.
+        let resolver = dir.path().join("resolver");
+        std::fs::create_dir_all(&resolver).unwrap();
+        std::fs::write(
+            resolver.join("lab.example.internal"),
+            "nameserver 192.0.2.53\n",
+        )
+        .unwrap();
+        let hash = sha256_hex("original\n");
+        let opts = ScriptOptions {
+            expected_pid: None,
+            hosts_tmp: Some(&hosts_src),
+            hosts_sha256: Some(&hash),
+            hosts_additive: false,
+            hosts_content_sha256: Some(file_sha(&hosts_src)),
+        };
+        let code = run_ext(&dir, &one_write_plan(), &opts, "1", &hosts_dst);
+        assert_eq!(code, Some(3));
+        assert_eq!(std::fs::read_to_string(&hosts_dst).unwrap(), "original\n");
+    }
+
+    #[test]
+    fn script_options_default_adds_no_lsof_or_hosts_step() {
+        let plain =
+            build_privileged_script("/etc/resolver", &one_write_plan(), DEFAULT_DNS_PORT).unwrap();
+        assert!(!plain.contains("lsof"));
+        assert!(!plain.contains("/etc/hosts"));
+    }
+
+    #[test]
+    fn hosts_tmp_that_is_relative_or_has_control_chars_is_rejected() {
+        for bad in ["relative/path", "/tmp/a\nb", "/tmp/a\0b"] {
+            let opts = ScriptOptions {
+                expected_pid: None,
+                hosts_tmp: Some(Path::new(bad)),
+                hosts_sha256: None,
+                hosts_additive: false,
+                hosts_content_sha256: Some(file_sha(Path::new(bad))),
+            };
+            assert!(
+                build_privileged_script_with(
+                    "/etc/resolver",
+                    &one_write_plan(),
+                    DEFAULT_DNS_PORT,
+                    &opts
+                )
+                .is_err(),
+                "{bad:?}"
+            );
+        }
+    }
+
+    /// Parent must exist and not be a symlink (`/tmp` is one on macOS), so use the temp dir.
+    const HOSTS_STAGED_DUMMY: &str = "/private/tmp/h.tmp";
+
+    fn file_sha(p: &Path) -> String {
+        std::fs::read_to_string(p)
+            .map(|c| sha256_hex(&c))
+            .unwrap_or_else(|_| "0".repeat(64))
+    }
+
+    // D-MBB: both switch directions, failure injected at each step; a mapping must remain.
+    const HOST_LINE: &str = "192.0.2.1 h.example.internal\n";
+
+    struct Switch {
+        dir: TestDir,
+        hosts_src: PathBuf,
+        hosts_dst: PathBuf,
+    }
+
+    impl Switch {
+        fn new(hosts_live: &str, hosts_staged: &str) -> Self {
+            let dir = TestDir::new();
+            std::fs::create_dir_all(dir.path().join("resolver")).unwrap();
+            let hosts_src = dir.path().join("hosts.staged");
+            let hosts_dst = dir.path().join("hosts.live");
+            std::fs::write(&hosts_src, hosts_staged).unwrap();
+            std::fs::write(&hosts_dst, hosts_live).unwrap();
+            Switch {
+                dir,
+                hosts_src,
+                hosts_dst,
+            }
+        }
+
+        fn zone_file(&self) -> PathBuf {
+            self.dir.path().join("resolver/lab.example.internal")
+        }
+
+        fn has_mapping(&self) -> bool {
+            self.zone_file().exists()
+                || std::fs::read_to_string(&self.hosts_dst)
+                    .unwrap()
+                    .contains("h.example.internal")
+        }
+
+        fn run(&self, plan: &ResolverPlan, snapshot: &str, additive: bool) -> Option<i32> {
+            let hash = sha256_hex(snapshot);
+            let opts = ScriptOptions {
+                expected_pid: None,
+                hosts_tmp: Some(&self.hosts_src),
+                hosts_sha256: Some(&hash),
+                hosts_additive: additive,
+                hosts_content_sha256: Some(file_sha(&self.hosts_src)),
+            };
+            run_ext(&self.dir, plan, &opts, "1", &self.hosts_dst)
+        }
+    }
+
+    fn remove_plan(owner: &str) -> ResolverPlan {
+        ResolverPlan {
+            remove: vec![("lab.example.internal".to_string(), owner.to_string())],
+            ..ResolverPlan::default()
+        }
+    }
+
+    #[test]
+    fn mbb_local_dns_to_hosts_adds_hosts_before_removing_resolver_file() {
+        let live = "orig\n";
+        let staged = format!("orig\n{HOST_LINE}");
+
+        // Success.
+        let sw = Switch::new(live, &staged);
+        std::fs::write(
+            sw.zone_file(),
+            render_resolver_file("prof-a", DEFAULT_DNS_PORT).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(sw.run(&remove_plan("prof-a"), live, true), Some(0));
+        assert!(!sw.zone_file().exists());
+        assert!(sw.has_mapping());
+
+        // Hosts snapshot mismatch (exit 8) aborts before the removal: resolver file stays.
+        let sw = Switch::new("edited\n", &staged);
+        std::fs::write(
+            sw.zone_file(),
+            render_resolver_file("prof-a", DEFAULT_DNS_PORT).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(sw.run(&remove_plan("prof-a"), live, true), Some(8));
+        assert!(sw.zone_file().exists() && sw.has_mapping());
+
+        // Removal guard fails (exit 4) AFTER the hosts block was added: hosts maps the name.
+        let sw = Switch::new(live, &staged);
+        std::fs::write(
+            sw.zone_file(),
+            render_resolver_file("someone-else", DEFAULT_DNS_PORT).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(sw.run(&remove_plan("prof-a"), live, true), Some(4));
+        assert!(sw.has_mapping());
+        assert!(std::fs::read_to_string(&sw.hosts_dst)
+            .unwrap()
+            .contains("h.example.internal"));
+
+        let script = build_privileged_script_with(
+            "/etc/resolver",
+            &remove_plan("prof-a"),
+            DEFAULT_DNS_PORT,
+            &ScriptOptions {
+                expected_pid: None,
+                hosts_tmp: Some(Path::new(HOSTS_STAGED_DUMMY)),
+                hosts_sha256: None,
+                hosts_additive: true,
+                hosts_content_sha256: Some(file_sha(Path::new(HOSTS_STAGED_DUMMY))),
+            },
+        )
+        .unwrap();
+        assert!(script.find("/bin/cp -P '").unwrap() < script.find("/bin/rm -f '").unwrap());
+    }
+
+    #[test]
+    fn mbb_hosts_to_local_dns_writes_resolver_file_before_removing_hosts_block() {
+        let live = format!("orig\n{HOST_LINE}");
+        let staged = "orig\n";
+
+        // Success.
+        let sw = Switch::new(&live, staged);
+        assert_eq!(sw.run(&one_write_plan(), &live, false), Some(0));
+        assert!(sw.zone_file().exists());
+        assert!(sw.has_mapping());
+        assert!(!std::fs::read_to_string(&sw.hosts_dst)
+            .unwrap()
+            .contains("h.example"));
+
+        // Resolver write refused (unowned file at the target, exit 3): hosts untouched.
+        let sw = Switch::new(&live, staged);
+        std::fs::write(sw.zone_file(), "nameserver 192.0.2.53\n").unwrap();
+        assert_eq!(sw.run(&one_write_plan(), &live, false), Some(3));
+        assert_eq!(std::fs::read_to_string(&sw.hosts_dst).unwrap(), live);
+
+        // Hosts snapshot mismatch (exit 8) after the write: resolver file is the mapping.
+        let sw = Switch::new(&format!("{live}extra\n"), staged);
+        assert_eq!(sw.run(&one_write_plan(), &live, false), Some(8));
+        assert!(sw.zone_file().exists() && sw.has_mapping());
+
+        let script = build_privileged_script_with(
+            "/etc/resolver",
+            &one_write_plan(),
+            DEFAULT_DNS_PORT,
+            &ScriptOptions {
+                expected_pid: None,
+                hosts_tmp: Some(Path::new(HOSTS_STAGED_DUMMY)),
+                hosts_sha256: None,
+                hosts_additive: false,
+                hosts_content_sha256: Some(file_sha(Path::new(HOSTS_STAGED_DUMMY))),
+            },
+        )
+        .unwrap();
+        assert!(script.find("/bin/mv -f").unwrap() < script.find("/bin/cp -P '").unwrap());
+    }
+
+    fn hosts_copy_opts<'a>(src: &'a Path, snapshot: &'a str, content: &str) -> ScriptOptions<'a> {
+        ScriptOptions {
+            expected_pid: None,
+            hosts_tmp: Some(src),
+            hosts_sha256: Some(snapshot),
+            hosts_additive: false,
+            hosts_content_sha256: Some(sha256_hex(content)),
+        }
+    }
+
+    fn hosts_leftovers(dir: &Path) -> usize {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(".clusterdeck-hosts.")
+            })
+            .count()
+    }
+
+    #[test]
+    fn hosts_copy_happy_path_replaces_via_private_temp_without_leftovers() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TestDir::new();
+        let src = dir.path().join("hosts.staged");
+        let dst = dir.path().join("hosts.live");
+        std::fs::write(&src, "192.0.2.1 a.example.internal\n").unwrap();
+        std::fs::write(&dst, "original\n").unwrap();
+        let snap = sha256_hex("original\n");
+        let opts = hosts_copy_opts(&src, &snap, "192.0.2.1 a.example.internal\n");
+
+        let code = run_ext(&dir, &ResolverPlan::default(), &opts, "1", &dst);
+        assert_eq!(code, Some(0));
+        assert_eq!(
+            std::fs::read_to_string(&dst).unwrap(),
+            "192.0.2.1 a.example.internal\n"
+        );
+        assert_eq!(
+            std::fs::metadata(&dst).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        assert_eq!(hosts_leftovers(dir.path()), 0);
+    }
+
+    #[test]
+    fn hosts_copy_rejects_a_staged_symlink_with_exit_9_and_leaves_target_untouched() {
+        let dir = TestDir::new();
+        let real = dir.path().join("real-content");
+        let src = dir.path().join("hosts.staged");
+        let dst = dir.path().join("hosts.live");
+        std::fs::write(&real, "192.0.2.1 a.example.internal\n").unwrap();
+        // Hash matches the symlink's TARGET: only the symlink check can stop it.
+        std::os::unix::fs::symlink(&real, &src).unwrap();
+        std::fs::write(&dst, "original\n").unwrap();
+        let snap = sha256_hex("original\n");
+        let opts = hosts_copy_opts(&src, &snap, "192.0.2.1 a.example.internal\n");
+
+        let code = run_ext(&dir, &ResolverPlan::default(), &opts, "1", &dst);
+        assert_eq!(code, Some(9));
+        assert_eq!(std::fs::read_to_string(&dst).unwrap(), "original\n");
+        assert_eq!(hosts_leftovers(dir.path()), 0);
+    }
+
+    #[test]
+    fn hosts_copy_rejects_content_that_does_not_match_the_hash() {
+        let dir = TestDir::new();
+        let src = dir.path().join("hosts.staged");
+        let dst = dir.path().join("hosts.live");
+        // The staged file was swapped after the hash of the intended content was computed.
+        std::fs::write(&src, "6.6.6.6 evil.example.internal\n").unwrap();
+        std::fs::write(&dst, "original\n").unwrap();
+        let snap = sha256_hex("original\n");
+        let opts = hosts_copy_opts(&src, &snap, "192.0.2.1 a.example.internal\n");
+
+        let code = run_ext(&dir, &ResolverPlan::default(), &opts, "1", &dst);
+        assert_eq!(code, Some(9));
+        assert_eq!(std::fs::read_to_string(&dst).unwrap(), "original\n");
+        assert_eq!(hosts_leftovers(dir.path()), 0);
+    }
+
+    #[test]
+    fn hosts_tmp_without_a_content_hash_is_rejected() {
+        let opts = ScriptOptions {
+            hosts_tmp: Some(Path::new(HOSTS_STAGED_DUMMY)),
+            ..ScriptOptions::default()
+        };
+        assert!(build_privileged_script_with(
+            "/etc/resolver",
+            &ResolverPlan::default(),
+            DEFAULT_DNS_PORT,
+            &opts
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn hosts_copy_survives_a_staging_dir_name_with_quote_and_command_substitution() {
+        let dir = TestDir::new();
+        let evil_dir = dir.path().join("it's$(touch pwned)'\"x");
+        std::fs::create_dir_all(&evil_dir).unwrap();
+        let src = evil_dir.join("hosts.staged");
+        let dst = dir.path().join("hosts.live");
+        std::fs::write(&src, "192.0.2.1 a.example.internal\n").unwrap();
+        std::fs::write(&dst, "original\n").unwrap();
+        let snap = sha256_hex("original\n");
+        let opts = hosts_copy_opts(&src, &snap, "192.0.2.1 a.example.internal\n");
+        let _ = std::fs::remove_file("pwned");
+
+        let code = run_ext(&dir, &ResolverPlan::default(), &opts, "1", &dst);
+        assert_eq!(code, Some(0), "quoted path must copy safely");
+        assert_eq!(
+            std::fs::read_to_string(&dst).unwrap(),
+            "192.0.2.1 a.example.internal\n"
+        );
+        assert!(!Path::new("pwned").exists(), "command substitution ran");
+        assert!(!evil_dir.join("pwned").exists());
+        assert!(!dir.path().join("pwned").exists());
     }
 }
