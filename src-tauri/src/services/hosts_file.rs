@@ -335,6 +335,56 @@ mod tests {
     }
 }
 
+/// The privileged hosts replacement shared by `write_hosts_file` and the local-DNS combined
+/// script (`resolver_files::build_privileged_script_with`), so both keep identical semantics.
+///
+/// D-HOSTS-COPY: root must never copy the user-owned staged file straight onto /etc/hosts (the
+/// same-UID confused deputy: the file can be swapped between staging and approval). Instead it
+/// copies into a root-created temp file beside the target (`cp -P`: a symlinked source stays a
+/// symlink and is rejected), requires a regular non-symlink file whose SHA-256 equals
+/// `new_content_sha256` (the hash of the intended content, computed in Rust), fixes owner and
+/// mode, and renames it over /etc/hosts. `/private/etc` is the real location of `/etc` on
+/// macOS, so the rename stays on one filesystem. Exit 9 = any step of this sequence failed.
+/// The result is a brace-free statement list; callers group it when composing with `&&`.
+///
+/// Every interpolated value is validated and quoted here, for all callers: the staged path
+/// (derived from TMPDIR) must be absolute, free of control characters/NUL, with a parent that
+/// exists and is not a symlink, and is then POSIX single-quote escaped; the hash must be 64 hex
+/// characters. The AppleScript escaping layer is applied by the caller afterwards.
+pub fn hosts_copy_command(tmp_path: &str, new_content_sha256: &str) -> Result<String, String> {
+    let path = std::path::Path::new(tmp_path);
+    if !path.is_absolute() {
+        return Err(format!("staged hosts path must be absolute: {tmp_path}"));
+    }
+    if tmp_path.chars().any(char::is_control) {
+        return Err("staged hosts path contains control characters".to_string());
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| "staged hosts path has no parent directory".to_string())?;
+    let parent_meta = std::fs::symlink_metadata(parent)
+        .map_err(|e| format!("cannot inspect staging directory {}: {e}", parent.display()))?;
+    if parent_meta.file_type().is_symlink() || !parent_meta.is_dir() {
+        return Err(format!(
+            "staging directory must be a real directory: {}",
+            parent.display()
+        ));
+    }
+    if new_content_sha256.len() != 64 || !new_content_sha256.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return Err("hosts content hash must be 64 hex characters".to_string());
+    }
+    let q_tmp = crate::services::resolver_files::sh_single_quote(tmp_path);
+    let rm = "{ /bin/rm -f \"$rt\"; exit 9; }";
+    Ok(format!(
+        "rt=$(/usr/bin/mktemp /private/etc/.clusterdeck-hosts.XXXXXX) || exit 9; \
+/bin/cp -P {q_tmp} \"$rt\" || {rm}; \
+[ -f \"$rt\" ] && [ ! -L \"$rt\" ] && [ \"$(/usr/bin/shasum -a 256 < \"$rt\" | /usr/bin/cut -d' ' -f1)\" = \"{new_content_sha256}\" ] || {rm}; \
+/bin/chmod 0644 \"$rt\" && /usr/sbin/chown root:wheel \"$rt\" || {rm}; \
+/bin/mv -f \"$rt\" /private/etc/hosts || {rm}"
+    ))
+}
+
 pub async fn write_hosts_file(
     runner: &dyn crate::services::process::CommandRunner,
     new_content: &str,
@@ -351,8 +401,20 @@ pub async fn write_hosts_file(
     // would still reach the previous address (Issue #84). Flush in the same privileged call
     // (no extra admin prompt); `|| true` keeps a failed flush from failing a successful copy,
     // while `&&` still reports a failed copy.
+    let copy = match hosts_copy_command(
+        &tmp_path_str,
+        &crate::services::resolver_files::sha256_hex(new_content),
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(e);
+        }
+    };
+    // The command contains double quotes: escape for the AppleScript string literal.
+    let copy = copy.replace('\\', "\\\\").replace('"', "\\\"");
     let script = format!(
-        "do shell script \"cp '{tmp_path_str}' {HOSTS_FILE_PATH} && {{ {FLUSH_DNS_CACHE} || true; }}\" with administrator privileges"
+        "do shell script \"{{ {copy}; }} && {{ {FLUSH_DNS_CACHE} || true; }}\" with administrator privileges"
     );
 
     let res = runner.run("osascript", &["-e".to_string(), script]).await;
@@ -521,14 +583,20 @@ mod write_tests {
             .await
             .unwrap();
         let script = runner.script.lock().unwrap().clone();
-        let cp = script.find("cp '").expect("copy step");
+        let cp = script.find("/bin/cp -P '").expect("copy step");
         let flush = script.find("dscacheutil -flushcache").expect("flush step");
         assert!(cp < flush, "{script}");
         assert!(
             script.contains("killall -HUP mDNSResponder || true; }"),
             "{script}"
         );
-        assert!(script.contains("/etc/hosts && {"), "{script}");
+        assert!(script.contains("exit 9; }; } && { /usr"), "{script}");
+        assert!(
+            script.contains(&crate::services::resolver_files::sha256_hex(
+                "127.0.0.1 localhost\n"
+            )),
+            "{script}"
+        );
         assert_eq!(script.matches("with administrator privileges").count(), 1);
     }
 
@@ -887,5 +955,38 @@ mod conflict_tests {
             blk("cloud", "192.0.2.5 a.example.internal")
         );
         assert_eq!(find_hostname_conflicts(&mixed, "cloud").len(), 1);
+    }
+
+    #[test]
+    fn hosts_copy_command_validates_every_interpolated_value() {
+        let hash = "a".repeat(64);
+        let good = std::env::temp_dir().join("clusterdeck-hosts-x.tmp");
+        let good = good.to_string_lossy().into_owned();
+        let cmd = hosts_copy_command(&good, &hash).unwrap();
+        assert!(cmd.contains("/bin/cp -P '"));
+
+        assert!(hosts_copy_command("relative.tmp", &hash).is_err());
+        assert!(hosts_copy_command("/var/tmp/a\nb", &hash).is_err());
+        assert!(hosts_copy_command("/var/tmp/a\0b", &hash).is_err());
+        assert!(hosts_copy_command(&good, "not-a-hash").is_err());
+        assert!(hosts_copy_command(&good, &format!("{}'; id #", "a".repeat(60))).is_err());
+
+        // A symlinked parent directory is refused.
+        let base =
+            std::env::temp_dir().join(format!("clusterdeck-hosts-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("real")).unwrap();
+        std::os::unix::fs::symlink(base.join("real"), base.join("link")).unwrap();
+        let via_link = base.join("link").join("h.tmp");
+        assert!(hosts_copy_command(&via_link.to_string_lossy(), &hash).is_err());
+        let _ = std::fs::remove_dir_all(&base);
+
+        // Quotes and command substitution in an otherwise valid path are escaped, not spliced.
+        let evil_dir = std::env::temp_dir().join(format!("it's$(id)-{}", std::process::id()));
+        std::fs::create_dir_all(&evil_dir).unwrap();
+        let evil = evil_dir.join("h.tmp");
+        let cmd = hosts_copy_command(&evil.to_string_lossy(), &hash).unwrap();
+        assert!(cmd.contains("it'\\''s$(id)"), "{cmd}");
+        let _ = std::fs::remove_dir_all(&evil_dir);
     }
 }

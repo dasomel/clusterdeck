@@ -43,6 +43,34 @@ pub struct StatusFile {
     pub generation: u64,
     pub loaded_at: String,
     pub error: Option<String>,
+    /// Writer's process id; the manager's ownership gate compares it with the launchctl and
+    /// lsof pids. `serde(default)` (0 = unknown, never matches a real pid) keeps a status file
+    /// from an older build parseable.
+    #[serde(default)]
+    pub pid: u32,
+    /// Random nonce per process start, so a status left by a previous incarnation is
+    /// distinguishable even if the OS reuses the pid.
+    #[serde(default)]
+    pub instance: String,
+}
+
+/// `(pid, instance)` of this process; `instance` is stable for the process lifetime.
+/// std-only nonce: SipHash of start time, pid and a stack address (ASLR) -- unpredictability is
+/// not a security property here, only uniqueness across restarts.
+pub fn process_identity() -> (u32, String) {
+    static INSTANCE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let instance = INSTANCE.get_or_init(|| {
+        use std::hash::{BuildHasher, Hash, Hasher};
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+            .hash(&mut h);
+        std::process::id().hash(&mut h);
+        format!("{:016x}", h.finish())
+    });
+    (std::process::id(), instance.clone())
 }
 
 /// Validated, immutable snapshot of authoritative zones and A records served by the responder.
@@ -420,6 +448,8 @@ mod tests {
             generation: 3,
             loaded_at: "2026-10-16T00:00:00Z".into(),
             error: None,
+            pid: 4242,
+            instance: "abc".into(),
         };
         write_status(&status_path, status.clone()).unwrap();
 
@@ -439,5 +469,17 @@ mod tests {
         assert!(leftovers.is_empty(), "leftover tmp files: {leftovers:?}");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn process_identity_is_stable_and_status_without_identity_still_parses() {
+        let (pid, inst) = process_identity();
+        assert_eq!(pid, std::process::id());
+        assert_eq!(inst.len(), 16);
+        assert_eq!(process_identity().1, inst);
+
+        let old: StatusFile =
+            serde_json::from_str(r#"{"generation":1,"loaded_at":"x","error":null}"#).unwrap();
+        assert_eq!((old.pid, old.instance.as_str()), (0, ""));
     }
 }

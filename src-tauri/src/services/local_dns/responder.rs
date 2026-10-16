@@ -12,7 +12,8 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::services::local_dns::zone_file::{
-    load_and_validate, write_status, StatusFile, ZoneTable, DEFAULT_LOCAL_DNS_PORT,
+    load_and_validate, process_identity, write_status, StatusFile, ZoneTable,
+    DEFAULT_LOCAL_DNS_PORT,
 };
 
 pub const ANSWER_TTL_SECS: u32 = 30;
@@ -605,6 +606,7 @@ fn apply_load_attempt(
     active_loaded_at: &mut String,
     gate: &mut StatusLogGate,
 ) -> Option<StatusFile> {
+    let (pid, instance) = process_identity();
     match load_and_validate(zones_path) {
         Ok(new_table) => {
             let gen = new_table.generation;
@@ -621,6 +623,8 @@ fn apply_load_attempt(
                     generation: gen,
                     loaded_at: now,
                     error: None,
+                    pid,
+                    instance,
                 },
                 gate,
             )
@@ -637,6 +641,8 @@ fn apply_load_attempt(
                     generation: *active_generation,
                     loaded_at: active_loaded_at.clone(),
                     error: Some(err),
+                    pid,
+                    instance,
                 },
                 gate,
             )
@@ -1016,6 +1022,9 @@ mod tests {
         let status1 = load_status(&status_path).unwrap();
         assert_eq!(status1.generation, 1);
         assert!(status1.error.is_none());
+        let (self_pid, self_instance) = process_identity();
+        assert_eq!(status1.pid, self_pid);
+        assert_eq!(status1.instance, self_instance);
 
         let query_ip = |id: u16| -> Ipv4Addr {
             let client = UdpSocket::bind("127.0.0.1:0").unwrap();
