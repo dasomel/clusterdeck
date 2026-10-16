@@ -114,6 +114,26 @@ export type HostnameConflict = {
   we_win: boolean;
 };
 
+/** ADR-0011: a zone local DNS could not publish. `profile_ids` are the claimants (on-disk owner last). */
+export type DnsConflict = {
+  zone: string;
+  kind:
+    | 'unowned'
+    | 'owned_by_other_profile'
+    | 'invalid_zone'
+    | 'unreadable'
+    | 'claimed_by_multiple';
+  profile_ids: string[];
+};
+
+/** A discovered host local DNS did not publish; `suggested_zones` are approvable parents. */
+export type DnsSkippedHost = {
+  profile_id: string;
+  host: string;
+  reason: string;
+  suggested_zones: string[];
+};
+
 export type SyncHostsResult = {
   success: boolean;
   endpoints_count: number;
@@ -121,6 +141,17 @@ export type SyncHostsResult = {
   endpoints: DiscoveredEndpoint[];
   message: string;
   conflicts: HostnameConflict[];
+  /** Absent from older backends; only set for local-DNS profiles. */
+  dns_conflicts?: DnsConflict[];
+  skipped_hosts?: DnsSkippedHost[];
+  dns_prompted?: boolean;
+};
+
+export type DnsApplyView = {
+  conflicts: DnsConflict[];
+  skipped_hosts: DnsSkippedHost[];
+  prompted: boolean;
+  cancelled: boolean;
 };
 
 export type DiscoveredHost = { address: string; ssh_open: boolean };
@@ -270,4 +301,16 @@ export type EnvironmentProfileResult = {
   profile_id: string;
   created: boolean;
   updated_hosts: string[];
+};
+
+export type LocalDnsZoneView = { zone: string; owner: string; records: number };
+
+export type LocalDnsStatus = {
+  agent_loaded: boolean;
+  pid: number | null;
+  generation: number;
+  loaded_generation: number | null;
+  last_error: string | null;
+  port: number;
+  zones: LocalDnsZoneView[];
 };

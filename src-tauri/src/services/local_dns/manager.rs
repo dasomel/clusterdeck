@@ -701,6 +701,21 @@ pub async fn teardown(env: &ManagerEnv<'_>) -> Result<TeardownResult, String> {
     Ok(result)
 }
 
+/// App-start refresh of the stable binary copy (R10): copies `current_exe` over it when the
+/// SHA-256 differs and reloads the agent only if it is currently loaded (never starts one).
+/// Returns whether the copy changed.
+pub async fn refresh_binary(env: &ManagerEnv<'_>) -> Result<bool, String> {
+    let _guard = MANAGER_MUTEX.lock().await;
+    let changed = agent::ensure_binary(env.current_exe, &env.paths.binary)?;
+    if changed {
+        let uid = agent::current_uid(env.runner).await?;
+        if agent::is_loaded(env.runner, uid).await? {
+            agent::reload(env.runner, env.paths, uid).await?;
+        }
+    }
+    Ok(changed)
+}
+
 /// App-start cleanup: removes only OUR marker files when no profile uses local DNS or when the
 /// agent does not own the port. Never starts the agent; unowned files are never touched.
 pub async fn startup_sweep(

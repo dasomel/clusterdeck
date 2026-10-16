@@ -3,11 +3,15 @@ import {
   api,
   type ConnectionResult,
   type DiscoveredCaView,
+  type DnsConflict,
+  type DnsSkippedHost,
   type HostsFileStatus,
+  type LocalDnsStatus,
   type Profile,
 } from '../api/tauri';
 import { EMPTY_VERIFICATION } from './useClusterSession';
 import { useStatus } from '../state/StatusContext';
+import { useProfiles } from '../state/ProfilesContext';
 import {
   groupBlockingConflicts,
   hasBlockingConflicts,
@@ -22,6 +26,7 @@ export function useEndpoints(
   trustVersion?: number,
 ) {
   const { pushStatus } = useStatus();
+  const { reload: reloadProfiles } = useProfiles();
   const [conflictGroups, setConflictGroups] = useState<ConflictGroups | null>(null);
   const [resolvingConflicts, setResolvingConflicts] = useState(false);
   const [resolveError, setResolveError] = useState<string | null>(null);
@@ -34,6 +39,11 @@ export function useEndpoints(
   const [discoveringEndpoints, setDiscoveringEndpoints] = useState(false);
   const [syncingHosts, setSyncingHosts] = useState(false);
   const [clearingHosts, setClearingHosts] = useState(false);
+  // Local-DNS (ADR-0011) outcome of the last sync; empty for Hosts profiles.
+  const [dnsConflicts, setDnsConflicts] = useState<DnsConflict[]>([]);
+  const [dnsSkipped, setDnsSkipped] = useState<DnsSkippedHost[]>([]);
+  const [dnsStatus, setDnsStatus] = useState<LocalDnsStatus | null>(null);
+  const [approvingZone, setApprovingZone] = useState<string | null>(null);
 
   const loadHostsStatus = useCallback(async (profileId?: string) => {
     const id = profileId ?? profile?.id;
@@ -49,6 +59,22 @@ export function useEndpoints(
     }
   }, [profile?.id]);
 
+  const loadDnsStatus = useCallback(async () => {
+    try {
+      setDnsStatus(await api.localDnsStatus());
+    } catch {
+      setDnsStatus(null);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (profile?.host_mapping === 'local_dns') {
+      void loadDnsStatus();
+    } else {
+      setDnsStatus(null);
+    }
+  }, [profile?.id, profile?.host_mapping, loadDnsStatus]);
+
   useEffect(() => {
     if (profile?.id) {
       loadHostsStatus(profile.id);
@@ -58,6 +84,8 @@ export function useEndpoints(
     setCaViews([]);
     setCaActionTarget(null);
     setCaRemoveTarget(null);
+    setDnsConflicts([]);
+    setDnsSkipped([]);
   }, [profile?.id, loadHostsStatus]);
 
   // Refetch CA views when trustVersion increments (e.g. from KubeconfigManager)
@@ -161,7 +189,14 @@ export function useEndpoints(
       const res = await api.syncHostsFile(profile.id);
       setLastResult((prev) => (prev ? { ...prev, endpoints: res.endpoints } : null));
       await loadHostsStatus(profile.id);
-      pushStatus('success', 'Hosts File Synced', [res.message]);
+      setDnsConflicts(res.dns_conflicts ?? []);
+      setDnsSkipped(res.skipped_hosts ?? []);
+      void loadDnsStatus();
+      if (profile.host_mapping === 'local_dns') {
+        pushStatus(res.success ? 'success' : 'warning', 'Local DNS Synced', [res.message]);
+      } else {
+        pushStatus('success', 'Hosts File Synced', [res.message]);
+      }
       const groups = groupBlockingConflicts(res.conflicts ?? [], profile.id);
       if (hasBlockingConflicts(groups)) setConflictGroups(groups);
     } catch (err) {
@@ -169,7 +204,36 @@ export function useEndpoints(
     } finally {
       setSyncingHosts(false);
     }
-  }, [profile, setLastResult, loadHostsStatus, pushStatus]);
+  }, [profile, setLastResult, loadHostsStatus, loadDnsStatus, pushStatus]);
+
+  const approveZone = useCallback(async (zone: string) => {
+    if (!profile) return;
+    setApprovingZone(zone);
+    try {
+      const view = await api.approveDnsZone(profile.id, zone);
+      setDnsConflicts(view.conflicts);
+      setDnsSkipped(view.skipped_hosts);
+      void loadDnsStatus();
+      await reloadProfiles();
+      if (view.cancelled) {
+        pushStatus('warning', 'Zone Approval Incomplete', [
+          `Admin approval was cancelled. ${zone} was added to approved zones, but local DNS was not updated.`,
+        ]);
+      } else if (view.conflicts.length > 0) {
+        pushStatus('warning', 'DNS Zone Approved with Conflicts', [
+          `${zone} was approved, but DNS conflicts need resolution: ${view.conflicts.map((c) => c.zone).join(', ')}.`,
+        ]);
+      } else {
+        pushStatus('success', 'DNS Zone Approved', [
+          `${zone} is now served by local DNS for ${profile.name}.`,
+        ]);
+      }
+    } catch (err) {
+      pushStatus('error', 'Approve zone failed', [String(err)]);
+    } finally {
+      setApprovingZone(null);
+    }
+  }, [profile, reloadProfiles, loadDnsStatus, pushStatus]);
 
   const clearHosts = useCallback(async () => {
     if (!profile) return;
@@ -177,13 +241,20 @@ export function useEndpoints(
     try {
       const res = await api.removeHostsFile(profile.id);
       await loadHostsStatus(profile.id);
-      pushStatus('success', 'Cleared from /etc/hosts', [res.message]);
+      if (profile.host_mapping === 'local_dns') {
+        setDnsConflicts([]);
+        setDnsSkipped([]);
+        void loadDnsStatus();
+        pushStatus('success', 'Removed from local DNS', [res.message]);
+      } else {
+        pushStatus('success', 'Cleared from /etc/hosts', [res.message]);
+      }
     } catch (err) {
-      pushStatus('error', 'Clear /etc/hosts failed', [String(err)]);
+      pushStatus('error', profile.host_mapping === 'local_dns' ? 'Remove from local DNS failed' : 'Clear /etc/hosts failed', [String(err)]);
     } finally {
       setClearingHosts(false);
     }
-  }, [profile, loadHostsStatus, pushStatus]);
+  }, [profile, loadHostsStatus, loadDnsStatus, pushStatus]);
 
   const openConflictResolver = useCallback(() => {
     if (!profile) return;
@@ -266,6 +337,11 @@ export function useEndpoints(
     executeCaRemoveAction,
     syncHosts,
     clearHosts,
+    dnsConflicts,
+    dnsSkipped,
+    dnsStatus,
+    approvingZone,
+    approveZone,
     conflictGroups,
     resolvingConflicts,
     resolveError,

@@ -1,5 +1,6 @@
 import { createContext, useContext, useState, useEffect, useCallback, useMemo, type ReactNode } from 'react';
 import { api, type Profile } from '../api/tauri';
+import type { DnsApplyView } from '../api/types';
 
 export type ProfilesContextType = {
   profiles: Profile[];
@@ -10,7 +11,7 @@ export type ProfilesContextType = {
   trustVersion: Record<string, number>;
   reload: () => Promise<void>;
   select: (id: string | null) => void;
-  remove: (profile: Profile) => Promise<void>;
+  remove: (profile: Profile) => Promise<DnsApplyView | null>;
   bumpTrust: (profileId: string) => void;
 };
 
@@ -50,8 +51,7 @@ export function ProfilesProvider({ children }: { children: ReactNode }) {
     setSelectedId(id);
   }, []);
 
-  const remove = useCallback(async (profile: Profile) => {
-    await api.deleteProfile(profile.id);
+  const remove = useCallback(async (profile: Profile): Promise<DnsApplyView | null> => {
     setProfiles((prev) => {
       const remaining = prev.filter((p) => p.id !== profile.id);
       setSelectedId((curr) => {
@@ -62,6 +62,7 @@ export function ProfilesProvider({ children }: { children: ReactNode }) {
       });
       return remaining;
     });
+    return await api.deleteProfile(profile.id);
   }, []);
 
   const bumpTrust = useCallback((profileId: string) => {

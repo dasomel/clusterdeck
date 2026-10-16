@@ -155,6 +155,11 @@ export default function ClusterDetail({
           onScan={endpoints.discoverEndpoints}
           onSync={endpoints.syncHosts}
           onClear={endpoints.clearHosts}
+          dnsConflicts={endpoints.dnsConflicts}
+          dnsSkipped={endpoints.dnsSkipped}
+          dnsStatus={endpoints.dnsStatus}
+          approvingZone={endpoints.approvingZone}
+          onApproveZone={endpoints.approveZone}
           onResolveConflicts={endpoints.openConflictResolver}
           onOpenUrl={endpoints.openUrl}
         />

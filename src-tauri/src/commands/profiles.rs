@@ -28,44 +28,108 @@ fn save_profile_with_paths(paths: &ClusterDeckPaths, mut profile: Profile) -> Re
     store::upsert_profile(paths, profile)
 }
 
+use crate::commands::local_dns::DnsApplyView;
+
 #[tauri::command]
 pub async fn save_profile(
     guard: tauri::State<'_, crate::services::store::ProfileWriteGuard>,
     profile: Profile,
-) -> Result<(), String> {
-    let _lock = guard.lock().await;
+) -> Result<Option<DnsApplyView>, String> {
     let paths = ClusterDeckPaths::resolve()?;
-    save_profile_with_paths(&paths, profile)
+    save_profile_internal(
+        &paths,
+        &guard,
+        profile,
+        crate::commands::local_dns::SystemDns::resolve,
+        crate::commands::local_dns::hosts_path(),
+    )
+    .await
+}
+
+pub(crate) async fn save_profile_internal<R>(
+    paths: &ClusterDeckPaths,
+    guard: &crate::services::store::ProfileWriteGuard,
+    profile: Profile,
+    resolve_dns: R,
+    hosts_path: &std::path::Path,
+) -> Result<Option<DnsApplyView>, String>
+where
+    R: FnOnce() -> Result<crate::commands::local_dns::SystemDns, String>,
+{
+    let old = {
+        let _lock = guard.lock().await;
+        let old = store::get_profile(paths, &profile.id).ok();
+        save_profile_with_paths(paths, profile.clone())?;
+        old
+    };
+    if !crate::commands::local_dns::needs_reapply_after_save(old.as_ref(), &profile) {
+        return Ok(None);
+    }
+    // Outside the write lock: this may wait on an admin prompt.
+    let dns = resolve_dns()?;
+    crate::commands::local_dns::reapply_after_save(
+        paths,
+        &dns.env(),
+        hosts_path,
+        old.as_ref(),
+        &profile,
+    )
+    .await
+    .map_err(|e| format!("profile saved, but updating local DNS failed: {e}"))
 }
 
 #[tauri::command]
 pub async fn delete_profile_cmd(
     guard: tauri::State<'_, crate::services::store::ProfileWriteGuard>,
     profile_id: String,
-) -> Result<(), String> {
-    let _lock = guard.lock().await;
+) -> Result<Option<DnsApplyView>, String> {
     if !crate::services::validate::is_safe_profile_id(&profile_id) {
         return Err("invalid profile id".to_string());
     }
     let paths = ClusterDeckPaths::resolve()?;
-    let runner = crate::services::process::SystemRunner;
+    let was_local_dns = {
+        let _lock = guard.lock().await;
+        let runner = crate::services::process::SystemRunner;
 
-    let _ = crate::services::hosts_file::remove_hosts_block(&runner, &profile_id).await;
+        let _ = crate::services::hosts_file::remove_hosts_block(&runner, &profile_id).await;
 
-    let ssh_conf = paths.ssh_conf(&profile_id);
-    if ssh_conf.exists() {
-        let _ = std::fs::remove_file(ssh_conf);
+        let ssh_conf = paths.ssh_conf(&profile_id);
+        if ssh_conf.exists() {
+            let _ = std::fs::remove_file(ssh_conf);
+        }
+        let kc_file = paths.kubeconfig_file(&profile_id);
+        if kc_file.exists() {
+            let _ = std::fs::remove_file(kc_file);
+        }
+        crate::services::tunnel::global()
+            .stop_tunnel(&profile_id)
+            .await;
+        let _ = crate::services::state::delete_status(&paths, &profile_id);
+
+        delete_stored_profile(&paths, &profile_id)?
+    };
+    if !was_local_dns {
+        return Ok(None);
     }
-    let kc_file = paths.kubeconfig_file(&profile_id);
-    if kc_file.exists() {
-        let _ = std::fs::remove_file(kc_file);
-    }
-    crate::services::tunnel::global()
-        .stop_tunnel(&profile_id)
-        .await;
-    let _ = crate::services::state::delete_status(&paths, &profile_id);
+    // Outside the write lock: this may wait on an admin prompt.
+    let dns = crate::commands::local_dns::SystemDns::resolve()?;
+    let view = crate::commands::local_dns::reapply_after_delete(&paths, &dns.env(), &profile_id)
+        .await
+        .map_err(|e| format!("profile deleted, but updating local DNS failed: {e}"))?;
+    Ok(Some(view))
+}
 
-    store::delete_profile(&paths, &profile_id)
+/// Deletes the stored profile and reports whether it used local DNS (its zones must then leave
+/// the resolver; see `local_dns::reapply_after_delete`).
+pub(crate) fn delete_stored_profile(
+    paths: &ClusterDeckPaths,
+    profile_id: &str,
+) -> Result<bool, String> {
+    let was_local_dns = store::get_profile(paths, profile_id)
+        .map(|p| p.host_mapping == crate::services::config::HostMapping::LocalDns)
+        .unwrap_or(false);
+    store::delete_profile(paths, profile_id)?;
+    Ok(was_local_dns)
 }
 
 #[cfg(test)]
