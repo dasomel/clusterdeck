@@ -200,6 +200,7 @@ export function useEndpoints(
   // failure must stop the rest so the user is not asked to authorize more work.
   const resolveConflicts = useCallback(async () => {
     if (!profile || !conflictGroups) return;
+    setResolveError(null);
     setResolvingConflicts(true);
     const removed: string[] = [];
     try {
