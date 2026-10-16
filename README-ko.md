@@ -20,6 +20,7 @@ ClusterDeck은 자체 데이터 디렉터리(`~/.clusterdeck/`) 밖의 무언가
 
 - **로그인 키체인(CA 인증서)** — 클러스터의 내부 CA를 신뢰하기로 선택하면(발견된 엔드포인트별 opt-in 동작, 또는 설정 → Trusted CAs에서), ClusterDeck은 그 인증서를 **로그인 키체인**(System 키체인이 아님)에 추가하며, SSL/TLS 신뢰 정책으로만 범위를 제한한다. 매번 macOS 자체 인증 프롬프트(암호 또는 Touch ID)가 뜬다. 신뢰된 항목은 언제든 Keychain Access.app에서 확인할 수 있고, ClusterDeck 자체(설정 → Trusted CAs, 또는 신뢰된 엔드포인트의 "제거" 동작)에서도 제거할 수 있다 — 둘 다 로컬에서 그냥 잊어버리는 게 아니라 인증서를 실제로 신뢰 해제한다.
 - **`/etc/hosts`** — 기본값은 비활성화이며 Profile별 opt-in이다. 활성화하면 ClusterDeck은 클러스터 내부 도메인 항목을 하나의 표시된 블록(`# >>> ClusterDeck BEGIN (profile: <id>) >>>` … `# <<< ClusterDeck END (profile: <id>) <<<`) 안에만 macOS 관리자 권한 프롬프트를 통해 작성한다. 해당 프로필의 자기 블록만 편집한다.
+  - 선택 사항인 **Gateway public address**(IP): 게이트웨이가 외부 로드밸런서 뒤에 있는 클러스터(프라이빗 노드)에서, 검색된 엔드포인트를 클러스터 사설 주소 대신 이 IP로 매핑한다.
 - **`~/.ssh/config`** — ClusterDeck은 `Include ~/.clusterdeck/ssh/*.conf` 한 줄만 추가하고, 프로필별 SSH 옵션은 그 include된 디렉터리 안에 보관한다. 사용자의 config 파일에 직접 쓰지 않는다.
 
 ClusterDeck이 추가한 모든 것을 제거하고 싶다면: Keychain Access.app(또는 ClusterDeck 자체 설정)에서 CA 신뢰를 해제하고, opt-in했다면 `/etc/hosts`의 표시된 블록을 삭제하고, `~/.ssh/config`에서 `Include` 줄을 제거하고, `~/.clusterdeck/`를 삭제하면 된다.

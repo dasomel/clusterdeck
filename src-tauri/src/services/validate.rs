@@ -207,6 +207,13 @@ pub fn validate_profile(profile: &crate::services::config::Profile) -> Result<()
             }
         }
     }
+    if let Some(gateway) = &profile.gateway_address {
+        // Becomes the IP column of /etc/hosts lines, so it must be a bare IP (no whitespace,
+        // comments or newlines that could inject extra hosts entries).
+        if !is_safe_ip_address(gateway) {
+            return Err(format!("invalid gateway_address: {gateway}"));
+        }
+    }
     if let Some(local_runtime) = &profile.local_runtime {
         // Same validator lifecycle actions use before embedding an instance name in
         // `colima`/`limactl` argv or an osascript string (services/local_runtime_lifecycle.rs) --
@@ -262,6 +269,7 @@ mod tests {
             bootstrap: BootstrapPolicy::default(),
             kubeconfig: None,
             manage_hosts_file: false,
+            gateway_address: None,
             trusted_cas: Vec::new(),
             local_runtime: None,
         };
@@ -295,6 +303,7 @@ mod tests {
             bootstrap: BootstrapPolicy::default(),
             kubeconfig: None,
             manage_hosts_file: false,
+            gateway_address: None,
             trusted_cas: Vec::new(),
             local_runtime: None,
         };
@@ -387,6 +396,7 @@ mod tests {
                 context: "cka-lab".into(),
             }),
             manage_hosts_file: false,
+            gateway_address: None,
             trusted_cas: Vec::new(),
             local_runtime: None,
         };
@@ -491,6 +501,7 @@ mod tests {
             bootstrap: BootstrapPolicy::default(),
             kubeconfig: None,
             manage_hosts_file: false,
+            gateway_address: None,
             trusted_cas: Vec::new(),
             local_runtime: Some(crate::services::config::LocalRuntimeSource {
                 provider: crate::services::local_runtime_lifecycle::LocalRuntimeProvider::Colima,

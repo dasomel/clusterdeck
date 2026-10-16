@@ -542,6 +542,7 @@ pub async fn connect_profile(
             &runner,
             &kubeconfig_path,
             default_ip,
+            profile.gateway_address.as_deref(),
         )
         .await
         {
@@ -601,6 +602,7 @@ pub async fn discover_cluster_endpoints_cmd(
         &runner,
         &kubeconfig_path,
         default_ip,
+        profile.gateway_address.as_deref(),
     )
     .await
 }
@@ -619,6 +621,7 @@ pub async fn sync_hosts_file_cmd(profile_id: String) -> Result<SyncHostsResult, 
             &runner,
             &kubeconfig_path,
             default_ip,
+            profile.gateway_address.as_deref(),
         )
         .await
         {
@@ -868,6 +871,7 @@ mod tests {
             bootstrap: BootstrapPolicy::default(),
             kubeconfig: None,
             manage_hosts_file: false,
+            gateway_address: None,
             trusted_cas: Vec::new(),
             local_runtime: None,
         }

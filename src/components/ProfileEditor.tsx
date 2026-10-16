@@ -76,6 +76,9 @@ export default function ProfileEditor({ initial, onClose, onSaved, onDeleteReque
   const [manageHostsFile, setManageHostsFile] = useState(
     initial?.manage_hosts_file ?? false
   );
+  const [gatewayAddress, setGatewayAddress] = useState(
+    initial?.gateway_address ?? ''
+  );
   const [localRuntime, setLocalRuntime] = useState<LocalRuntimeSource | null>(
     initial?.local_runtime ?? null
   );
@@ -358,6 +361,7 @@ export default function ProfileEditor({ initial, onClose, onSaved, onDeleteReque
           }
         : null,
       manage_hosts_file: manageHostsFile,
+      gateway_address: gatewayAddress.trim() || null,
       trusted_cas: initial?.trusted_cas ?? [],
       local_runtime: localRuntime,
     };
@@ -819,6 +823,19 @@ export default function ProfileEditor({ initial, onClose, onSaved, onDeleteReque
             <p className="form-helper" style={{ marginLeft: '24px', marginTop: '2px' }}>
               Automatically maps profile host aliases in /etc/hosts bracketed by # BEGIN CLUSTERDECK MANAGED and # END CLUSTERDECK MANAGED markers.
             </p>
+            <div className="form-group" style={{ marginLeft: '24px', marginTop: '8px' }}>
+              <label className="form-label">Gateway public address (optional)</label>
+              <input
+                className="form-input mono"
+                value={gatewayAddress}
+                onChange={(e) => setGatewayAddress(e.target.value)}
+                placeholder="203.0.113.10"
+                spellCheck={false}
+              />
+              <p className="form-helper">
+                IP that discovered ingress/gateway endpoints map to, for example a cloud load balancer in front of private nodes. Leave empty to use the cluster's own load balancer or control-plane address.
+              </p>
+            </div>
           </div>
         </div>
 

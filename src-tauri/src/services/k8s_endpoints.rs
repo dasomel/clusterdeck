@@ -675,6 +675,7 @@ pub async fn discover_cluster_endpoints(
     runner: &dyn CommandRunner,
     kubeconfig_path: &Path,
     default_ip: Option<&str>,
+    gateway_address: Option<&str>,
 ) -> Result<Vec<DiscoveredEndpoint>, String> {
     let mut all_endpoints = Vec::new();
 
@@ -790,7 +791,19 @@ pub async fn discover_cluster_endpoints(
         }
     }
 
-    Ok(dedup_map.into_values().collect())
+    let mut endpoints: Vec<DiscoveredEndpoint> = dedup_map.into_values().collect();
+
+    // An operator-supplied gateway address wins over LB IPs and the control-plane fallback:
+    // Kubernetes cannot know an external cloud LB's address (the gateway Service is typically
+    // NodePort behind it), so anything it reports is a private address the user cannot reach.
+    // Re-validated here because this is the single place the override reaches endpoint data.
+    if let Some(gw) = gateway_address.filter(|g| is_safe_ip_address(g)) {
+        for ep in &mut endpoints {
+            ep.ip = gw.to_string();
+        }
+    }
+
+    Ok(endpoints)
 }
 
 #[cfg(test)]
@@ -1271,6 +1284,7 @@ mod tests {
     struct FakeK8sRunner {
         service_json: String,
         apisix_json: String,
+        ingress_json: String,
     }
 
     #[async_trait::async_trait]
@@ -1286,6 +1300,13 @@ mod tests {
                     if raw_path == "/api/v1/services" {
                         return Ok(crate::services::process::CommandOutput {
                             stdout: self.service_json.clone(),
+                            stderr: String::new(),
+                            success: true,
+                        });
+                    }
+                    if raw_path == "/apis/networking.k8s.io/v1/ingresses" {
+                        return Ok(crate::services::process::CommandOutput {
+                            stdout: self.ingress_json.clone(),
                             stderr: String::new(),
                             success: true,
                         });
@@ -1325,12 +1346,13 @@ mod tests {
                 }]
             }"#
             .into(),
+            ingress_json: "{}".into(),
         };
 
         let temp_kc = std::env::temp_dir().join("test-dummy-kc.yaml");
         let _ = std::fs::write(&temp_kc, "dummy");
 
-        let endpoints = discover_cluster_endpoints(&runner, &temp_kc, None)
+        let endpoints = discover_cluster_endpoints(&runner, &temp_kc, None, None)
             .await
             .unwrap();
         let _ = std::fs::remove_file(&temp_kc);
@@ -1339,5 +1361,73 @@ mod tests {
         assert_eq!(endpoints[0].host, "trino.local.beluga.internal");
         assert_eq!(endpoints[0].ip, "192.168.77.200");
         assert_eq!(endpoints[0].source, "apisix");
+    }
+
+    // RFC 5737 documentation addresses only.
+    async fn discover_with_gateway(gateway: Option<&str>) -> Vec<DiscoveredEndpoint> {
+        let runner = FakeK8sRunner {
+            service_json: r#"{
+                "items": [{
+                    "metadata": {
+                        "name": "lb", "namespace": "edge",
+                        "annotations": { "external-dns.alpha.kubernetes.io/hostname": "svc.example.test" }
+                    },
+                    "spec": { "type": "LoadBalancer" },
+                    "status": { "loadBalancer": { "ingress": [{ "ip": "192.0.2.200" }] } }
+                }]
+            }"#
+            .into(),
+            apisix_json: r#"{
+                "items": [{
+                    "metadata": { "name": "r", "namespace": "app" },
+                    "spec": { "http": [{ "match": { "hosts": ["apisix.example.test"] } }] }
+                }]
+            }"#
+            .into(),
+            ingress_json: r#"{
+                "items": [{
+                    "metadata": { "name": "i", "namespace": "app" },
+                    "spec": { "rules": [{ "host": "ing.example.test" }] },
+                    "status": { "loadBalancer": { "ingress": [{ "ip": "192.0.2.201" }] } }
+                }]
+            }"#
+            .into(),
+        };
+        let kc =
+            std::env::temp_dir().join(format!("test-gw-kc-{}.yaml", gateway.unwrap_or("none")));
+        let _ = std::fs::write(&kc, "dummy");
+        let eps = discover_cluster_endpoints(&runner, &kc, Some("172.16.0.10"), gateway)
+            .await
+            .unwrap();
+        let _ = std::fs::remove_file(&kc);
+        eps
+    }
+
+    #[tokio::test]
+    async fn gateway_address_overrides_ip_of_all_endpoint_sources() {
+        let eps = discover_with_gateway(Some("203.0.113.10")).await;
+        let sources: Vec<&str> = eps.iter().map(|e| e.source.as_str()).collect();
+        assert!(
+            sources.contains(&"apisix")
+                && sources.contains(&"ingress")
+                && sources.contains(&"service")
+        );
+        assert!(eps.iter().all(|e| e.ip == "203.0.113.10"), "{eps:?}");
+    }
+
+    #[tokio::test]
+    async fn no_gateway_address_keeps_lb_and_fallback_behavior() {
+        let eps = discover_with_gateway(None).await;
+        let ip_of = |h: &str| eps.iter().find(|e| e.host == h).unwrap().ip.clone();
+        assert_eq!(ip_of("svc.example.test"), "192.0.2.200");
+        assert_eq!(ip_of("ing.example.test"), "192.0.2.201");
+        assert_eq!(ip_of("apisix.example.test"), "192.0.2.200");
+    }
+
+    #[tokio::test]
+    async fn invalid_gateway_address_is_ignored_defensively() {
+        let eps = discover_with_gateway(Some("203.0.113.10\nevil")).await;
+        assert!(eps.iter().all(|e| e.ip != "203.0.113.10\nevil"));
+        assert!(eps.iter().any(|e| e.ip == "192.0.2.200"));
     }
 }
