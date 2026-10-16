@@ -14,6 +14,14 @@ pub struct Profile {
     pub manage_hosts_file: bool,
     #[serde(default)]
     pub trusted_cas: Vec<crate::services::ca_trust::TrustedCa>,
+    /// Externally reachable address of the cluster's ingress/gateway (for example a cloud
+    /// load balancer's public IP in front of NodePorts). When set, it is the target IP of every
+    /// discovered endpoint instead of an LB IP or the control-plane address: Kubernetes cannot
+    /// know an external cloud LB address (the gateway Service is NodePort, so there is no
+    /// `status.loadBalancer`). `#[serde(default, skip_serializing_if = ...)]` so existing
+    /// profile YAML round-trips unchanged. Must satisfy `validate::is_safe_ip_address`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway_address: Option<String>,
     /// Which local VM runtime this profile's host(s) came from, if created from a detected
     /// Colima/Lima instance. `#[serde(default, skip_serializing_if = "Option::is_none")]` so
     /// profile YAML persisted before this field existed still deserializes unchanged, and a

@@ -92,6 +92,7 @@ mod tests {
             bootstrap: BootstrapPolicy::default(),
             kubeconfig: None,
             manage_hosts_file: false,
+            gateway_address: None,
             trusted_cas,
             local_runtime: None,
         }

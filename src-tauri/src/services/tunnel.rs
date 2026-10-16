@@ -610,6 +610,7 @@ mod tests {
                 context: "lab".to_string(),
             }),
             manage_hosts_file: false,
+            gateway_address: None,
             trusted_cas: Vec::new(),
             local_runtime: None,
         }

@@ -90,6 +90,7 @@ pub fn apply(
                 context: t.context.clone(),
             }),
             manage_hosts_file: false,
+            gateway_address: None,
             trusted_cas: vec![],
             local_runtime: t.local_runtime.clone(),
         };
@@ -165,6 +166,7 @@ mod tests {
             bootstrap: BootstrapPolicy::default(),
             kubeconfig: None,
             manage_hosts_file: false,
+            gateway_address: None,
             trusted_cas: vec![],
             local_runtime: None,
         }];
@@ -214,6 +216,7 @@ mod tests {
             bootstrap: BootstrapPolicy::default(),
             kubeconfig: None,
             manage_hosts_file: false,
+            gateway_address: None,
             trusted_cas: vec![],
             local_runtime: None,
         }

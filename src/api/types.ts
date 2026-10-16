@@ -43,6 +43,7 @@ export type Profile = {
   bootstrap: BootstrapPolicy;
   kubeconfig: KubeconfigSource | null;
   manage_hosts_file: boolean;
+  gateway_address?: string | null;
   trusted_cas: TrustedCa[];
   local_runtime?: LocalRuntimeSource | null;
 };

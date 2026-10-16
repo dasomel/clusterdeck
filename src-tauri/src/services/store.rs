@@ -30,6 +30,8 @@ struct ProfileBody {
     #[serde(default)]
     trusted_cas: Vec<crate::services::ca_trust::TrustedCa>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    gateway_address: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     local_runtime: Option<LocalRuntimeSource>,
 }
 
@@ -53,6 +55,7 @@ pub fn load_profiles(paths: &ClusterDeckPaths) -> Result<Vec<Profile>, String> {
                 kubeconfig: body.kubeconfig,
                 manage_hosts_file: body.manage_hosts_file,
                 trusted_cas: body.trusted_cas,
+                gateway_address: body.gateway_address,
                 local_runtime: body.local_runtime,
             };
             match crate::services::validate::validate_profile(&profile) {
@@ -108,6 +111,7 @@ pub fn save_profiles(paths: &ClusterDeckPaths, profiles: &[Profile]) -> Result<(
                 kubeconfig: p.kubeconfig.clone(),
                 manage_hosts_file: p.manage_hosts_file,
                 trusted_cas: p.trusted_cas.clone(),
+                gateway_address: p.gateway_address.clone(),
                 local_runtime: p.local_runtime.clone(),
             },
         );
@@ -216,6 +220,7 @@ mod tests {
             bootstrap: BootstrapPolicy::default(),
             kubeconfig: None,
             manage_hosts_file: true,
+            gateway_address: None,
             trusted_cas: Vec::new(),
             local_runtime: None,
         };
@@ -237,6 +242,7 @@ mod tests {
             bootstrap: BootstrapPolicy::default(),
             kubeconfig: None,
             manage_hosts_file: false,
+            gateway_address: None,
             trusted_cas: Vec::new(),
             local_runtime: None,
         };
@@ -274,6 +280,68 @@ profiles:
     }
 
     #[test]
+    fn gateway_address_roundtrips_and_is_omitted_when_none() {
+        let paths = temp_paths("gateway-address");
+        let mut profile = Profile {
+            id: "gw".into(),
+            name: "GW".into(),
+            hosts: vec![],
+            bastion: None,
+            bootstrap: BootstrapPolicy::default(),
+            kubeconfig: None,
+            manage_hosts_file: false,
+            gateway_address: None,
+            trusted_cas: Vec::new(),
+            local_runtime: None,
+        };
+        upsert_profile(&paths, profile.clone()).unwrap();
+        let yaml = std::fs::read_to_string(paths.profiles_file()).unwrap();
+        assert!(!yaml.contains("gateway_address"), "{yaml}");
+
+        profile.gateway_address = Some("203.0.113.10".into());
+        upsert_profile(&paths, profile).unwrap();
+        let loaded = get_profile(&paths, "gw").unwrap();
+        assert_eq!(loaded.gateway_address.as_deref(), Some("203.0.113.10"));
+    }
+
+    #[test]
+    fn legacy_yaml_without_gateway_address_deserializes_to_none() {
+        let paths = temp_paths("gateway-legacy");
+        std::fs::create_dir_all(paths.profiles_file().parent().unwrap()).unwrap();
+        std::fs::write(
+            paths.profiles_file(),
+            "profiles:\n  old:\n    name: Old\n    hosts: []\n    manage_hosts_file: false\n",
+        )
+        .unwrap();
+        let loaded = load_profiles(&paths).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].gateway_address, None);
+    }
+
+    #[test]
+    fn upsert_profile_rejects_invalid_gateway_address() {
+        let paths = temp_paths("gateway-invalid");
+        let profile = Profile {
+            id: "gw".into(),
+            name: "GW".into(),
+            hosts: vec![],
+            bastion: None,
+            bootstrap: BootstrapPolicy::default(),
+            kubeconfig: None,
+            manage_hosts_file: false,
+            gateway_address: Some("203.0.113.10\n127.0.0.1 evil".into()),
+            trusted_cas: Vec::new(),
+            local_runtime: None,
+        };
+        assert!(upsert_profile(&paths, profile.clone()).is_err());
+        let unspecified = Profile {
+            gateway_address: Some("0.0.0.0".into()),
+            ..profile
+        };
+        assert!(upsert_profile(&paths, unspecified).is_err());
+    }
+
+    #[test]
     fn upsert_profile_rejects_invalid_profile_id() {
         let paths = temp_paths("invalid-id");
         let profile = Profile {
@@ -284,6 +352,7 @@ profiles:
             bootstrap: BootstrapPolicy::default(),
             kubeconfig: None,
             manage_hosts_file: false,
+            gateway_address: None,
             trusted_cas: Vec::new(),
             local_runtime: None,
         };
@@ -301,6 +370,7 @@ profiles:
             bootstrap: BootstrapPolicy::default(),
             kubeconfig: None,
             manage_hosts_file: false,
+            gateway_address: None,
             trusted_cas: vec![crate::services::ca_trust::TrustedCa {
                 secret_ref: "platform-system/apisix-gateway-tls-secret".into(),
                 fingerprint_sha256:
@@ -362,6 +432,7 @@ profiles:
             bootstrap: BootstrapPolicy::default(),
             kubeconfig: None,
             manage_hosts_file: false,
+            gateway_address: None,
             trusted_cas: Vec::new(),
             local_runtime: None,
         };
@@ -393,6 +464,7 @@ profiles:
                 context: "cka".into(),
             }),
             manage_hosts_file: false,
+            gateway_address: None,
             trusted_cas: Vec::new(),
             local_runtime: None,
         };
@@ -458,6 +530,7 @@ profiles:
             bootstrap: BootstrapPolicy::default(),
             kubeconfig: None,
             manage_hosts_file: false,
+            gateway_address: None,
             trusted_cas: Vec::new(),
             local_runtime: Some(LocalRuntimeSource {
                 provider: crate::services::local_runtime_lifecycle::LocalRuntimeProvider::Colima,
@@ -483,6 +556,7 @@ profiles:
             bootstrap: BootstrapPolicy::default(),
             kubeconfig: None,
             manage_hosts_file: false,
+            gateway_address: None,
             trusted_cas: Vec::new(),
             local_runtime: None,
         }

@@ -6,6 +6,7 @@ The format follows the principles of Keep a Changelog and uses semantic versioni
 
 ## [Unreleased]
 
+- Add optional per-profile `gateway_address` (IP only): when set, every discovered Ingress/APISIX/Istio/Gateway/Service endpoint, and so the `/etc/hosts` block, maps to it instead of the cluster LB IP or the control-plane private address. Fixes endpoints of private-node cloud clusters behind an external load balancer. Existing profiles are unchanged ([ADR-0010](docs/adr/0010-profile-gateway-address.md))
 - Absorb InfraDeck into ClusterDeck: observe local VM inventory across Colima, VirtualBox, VMware Fusion, and Vagrant with exact-identity reconciliation (`runtime:runtime_id`), resource capacity totals (CPU, RAM, disk in GiB), and evidence-based Kubernetes detection ([ADR-0008](docs/adr/0008-vm-inventory-environment-source.md))
 - Add one-click "Set up cluster" action from observed multi-node environments, auto-saving a new profile via `store::upsert_profile` (superseding ADR-0005 D1 for this flow) and safely refreshing host address/port without overwriting custom profile settings
 - Enforce bounded provider process execution via `CommandRunner::run_bounded` (10s timeout, 2 MiB stream caps, `LC_ALL=C`, stdin null, `kill_on_drop(true)`) and strict path-segment validation before any local file read

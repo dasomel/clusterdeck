@@ -141,6 +141,7 @@ mod tests {
             bootstrap: BootstrapPolicy::default(),
             kubeconfig: None,
             manage_hosts_file: false,
+            gateway_address: None,
             trusted_cas: Vec::new(),
             local_runtime: None,
         }

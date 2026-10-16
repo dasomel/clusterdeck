@@ -193,6 +193,8 @@ and never touches any other line in the file:
 # <<< ClusterDeck END (profile: <profile-id>) <<<
 ```
 
+Discovered ingress/gateway endpoints map to the cluster's LoadBalancer IP, or the control-plane address as a fallback. A profile can set an optional `gateway_address` (IP only, validated) to override that for all discovered endpoints, e.g. an external cloud load balancer in front of private nodes ([ADR-0010](adr/0010-profile-gateway-address.md)).
+
 Writing `/etc/hosts` requires root, so ClusterDeck performs a single
 `osascript ... with administrator privileges` call per `connect_profile` invocation (never more
 than one password prompt per action) rather than running the whole app elevated. The block is

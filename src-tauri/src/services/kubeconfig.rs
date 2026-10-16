@@ -1748,6 +1748,7 @@ users:
                 context: "cka".to_string(),
             }),
             manage_hosts_file: false,
+            gateway_address: None,
             trusted_cas: Vec::new(),
             local_runtime: None,
         };
@@ -1825,6 +1826,7 @@ users:
                 context: id.to_string(),
             }),
             manage_hosts_file: false,
+            gateway_address: None,
             trusted_cas: Vec::new(),
             local_runtime: None,
         }
@@ -2099,6 +2101,7 @@ users:
                 context: "cka-perms".to_string(),
             }),
             manage_hosts_file: false,
+            gateway_address: None,
             trusted_cas: Vec::new(),
             local_runtime: None,
         };
@@ -2349,6 +2352,7 @@ users:
                 context: "candidate-test".to_string(),
             }),
             manage_hosts_file: false,
+            gateway_address: None,
             trusted_cas: Vec::new(),
             local_runtime: None,
         };
@@ -2436,6 +2440,7 @@ users:
                 context: "empty-path-test".to_string(),
             }),
             manage_hosts_file: false,
+            gateway_address: None,
             trusted_cas: Vec::new(),
             local_runtime: None,
         };
@@ -3057,6 +3062,7 @@ users:
                 context: "cka-lab".to_string(),
             }),
             manage_hosts_file: false,
+            gateway_address: None,
             trusted_cas: Vec::new(),
             local_runtime: None,
         };
@@ -3159,6 +3165,7 @@ users:
                 context: "cka".to_string(),
             }),
             manage_hosts_file: false,
+            gateway_address: None,
             trusted_cas: Vec::new(),
             local_runtime: None,
         };
@@ -3195,6 +3202,7 @@ users:
             bootstrap: BootstrapPolicy::default(),
             kubeconfig: None,
             manage_hosts_file: false,
+            gateway_address: None,
             trusted_cas: Vec::new(),
             local_runtime: None,
         };
@@ -3370,6 +3378,7 @@ users:
                 context: "lab".to_string(),
             }),
             manage_hosts_file: false,
+            gateway_address: None,
             trusted_cas: Vec::new(),
             local_runtime: None,
         };
@@ -3486,6 +3495,7 @@ users:
                 context: "lab".to_string(),
             }),
             manage_hosts_file: false,
+            gateway_address: None,
             trusted_cas: Vec::new(),
             local_runtime: None,
         };

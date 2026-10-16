@@ -35,6 +35,12 @@ pub fn render_hosts_block_with_endpoints(
         }
     }
 
+    if let Some(gateway) = &profile.gateway_address {
+        if !crate::services::validate::is_safe_gateway_address(gateway) {
+            return Err(format!("invalid gateway_address: {gateway}"));
+        }
+    }
+
     for ep in endpoints {
         if !crate::services::validate::is_safe_host_domain(&ep.host)
             || !crate::services::validate::is_safe_ip_address(&ep.ip)
@@ -184,6 +190,7 @@ mod tests {
             bootstrap: BootstrapPolicy::default(),
             kubeconfig: None,
             manage_hosts_file: true,
+            gateway_address: None,
             trusted_cas: Vec::new(),
             local_runtime: None,
         }
@@ -196,6 +203,13 @@ mod tests {
         assert!(block.contains("192.0.2.10 cka-m1.cka-lab.clusterdeck.local"));
         assert!(block.contains("198.51.100.1 bastion01.cka-lab.clusterdeck.local"));
         assert!(block.contains("# <<< ClusterDeck END (profile: cka-lab) <<<"));
+    }
+
+    #[test]
+    fn render_hosts_block_rejects_invalid_gateway_address() {
+        let mut p = profile();
+        p.gateway_address = Some("203.0.113.10\n127.0.0.1 evil".into());
+        assert!(render_hosts_block(&p).is_err());
     }
 
     #[test]
