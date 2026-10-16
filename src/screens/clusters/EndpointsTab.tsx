@@ -155,7 +155,7 @@ export default function EndpointsTab({
               <div>
                 <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
                   <span className="host-name mono" style={{ fontSize: '12px' }}>
-                    {profile.bastion.name}.${profile.id}.clusterdeck.local
+                    {profile.bastion.name}.{profile.id}.clusterdeck.local
                   </span>
                   <Tag>Bastion</Tag>
                 </div>
