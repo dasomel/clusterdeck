@@ -128,7 +128,7 @@ export default function HostsConflictModal({
                     </li>
                   ))}
                 </ul>
-                {owner?.manage_hosts_file && (
+                {owner?.host_mapping === 'hosts' && (
                   <div className="status-banner warning" style={{ marginTop: 'var(--space-2)', fontSize: 'var(--fs-sm)' }}>
                     Auto-sync is on for this profile, so its next Connect/Sync will add the block back. Turn off
                     auto-sync on {owner.name} to keep it removed.

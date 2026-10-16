@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 use crate::services::config::{
-    Bastion, BootstrapPolicy, Host, KubeconfigSource, LocalRuntimeSource, Profile,
+    Bastion, BootstrapPolicy, Host, HostMapping, KubeconfigSource, LocalRuntimeSource, Profile,
 };
 use crate::services::paths::ClusterDeckPaths;
 
@@ -25,8 +25,15 @@ struct ProfileBody {
     bootstrap: BootstrapPolicy,
     #[serde(default)]
     kubeconfig: Option<KubeconfigSource>,
+    /// Legacy bool, still written (true iff `host_mapping == Hosts`) so an older build that
+    /// reads this file keeps Hosts profiles working (plan R9). Only the fallback on read.
     #[serde(default)]
     manage_hosts_file: bool,
+    /// Wins over `manage_hosts_file` when present.
+    #[serde(default)]
+    host_mapping: Option<HostMapping>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    approved_dns_zones: Vec<String>,
     #[serde(default)]
     trusted_cas: Vec<crate::services::ca_trust::TrustedCa>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -53,7 +60,8 @@ pub fn load_profiles(paths: &ClusterDeckPaths) -> Result<Vec<Profile>, String> {
                 bastion: body.bastion,
                 bootstrap: body.bootstrap,
                 kubeconfig: body.kubeconfig,
-                manage_hosts_file: body.manage_hosts_file,
+                host_mapping: HostMapping::migrate(body.host_mapping, body.manage_hosts_file),
+                approved_dns_zones: body.approved_dns_zones,
                 trusted_cas: body.trusted_cas,
                 gateway_address: body.gateway_address,
                 local_runtime: body.local_runtime,
@@ -92,6 +100,53 @@ impl ProfileWriteGuard {
     }
 }
 
+/// True when any profile mapping in `yaml` already has a `host_mapping` key. Unparseable
+/// content counts as "no" so it gets backed up rather than silently overwritten.
+fn has_host_mapping_key(yaml: &str) -> bool {
+    let Ok(value) = serde_yaml::from_str::<serde_yaml::Value>(yaml) else {
+        return false;
+    };
+    value
+        .get("profiles")
+        .and_then(|p| p.as_mapping())
+        .is_some_and(|m| m.values().any(|body| body.get("host_mapping").is_some()))
+}
+
+/// Rejects `zone` when it is reserved or overlaps (equal, parent or child) a zone approved
+/// for any profile other than `owner_id`/`also_allowed`. Overlap across profiles would let a
+/// parent-zone owner publish names under a child zone owned by someone else.
+fn check_zone_ownership(
+    profiles: &[Profile],
+    zone: &str,
+    allowed_owners: &[&str],
+) -> Result<(), String> {
+    use crate::services::local_dns::zone_file::is_name_in_zone;
+    if !crate::services::validate::is_allowed_private_zone(zone) {
+        return Err(format!("invalid or disallowed DNS zone: {zone}"));
+    }
+    if crate::services::validate::is_reserved_clusterdeck_zone(zone) {
+        return Err(format!(
+            "DNS zone {zone} is reserved for ClusterDeck node aliases (clusterdeck.local)"
+        ));
+    }
+    for p in profiles
+        .iter()
+        .filter(|p| !allowed_owners.contains(&p.id.as_str()))
+    {
+        if let Some(other) = p
+            .approved_dns_zones
+            .iter()
+            .find(|o| is_name_in_zone(zone, o) || is_name_in_zone(o, zone))
+        {
+            return Err(format!(
+                "DNS zone {zone} overlaps zone {other} approved for profile '{}'; switch ownership explicitly",
+                p.id
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub fn save_profiles(paths: &ClusterDeckPaths, profiles: &[Profile]) -> Result<(), String> {
     let file_path = paths.profiles_file();
     let parent = file_path
@@ -109,7 +164,9 @@ pub fn save_profiles(paths: &ClusterDeckPaths, profiles: &[Profile]) -> Result<(
                 bastion: p.bastion.clone(),
                 bootstrap: p.bootstrap.clone(),
                 kubeconfig: p.kubeconfig.clone(),
-                manage_hosts_file: p.manage_hosts_file,
+                manage_hosts_file: p.host_mapping == HostMapping::Hosts,
+                host_mapping: Some(p.host_mapping),
+                approved_dns_zones: p.approved_dns_zones.clone(),
                 trusted_cas: p.trusted_cas.clone(),
                 gateway_address: p.gateway_address.clone(),
                 local_runtime: p.local_runtime.clone(),
@@ -118,6 +175,23 @@ pub fn save_profiles(paths: &ClusterDeckPaths, profiles: &[Profile]) -> Result<(
     }
     let file = ProfilesFile { profiles: map };
     let yaml = serde_yaml::to_string(&file).map_err(|e| e.to_string())?;
+
+    // Plan R9: keep a one-time copy of a pre-local-dns file so a downgrade or a bad migration
+    // is recoverable. A failed backup fails the save: never migrate without it.
+    let backup_path = parent.join("profiles.yaml.pre-local-dns.bak");
+    if !backup_path.exists() {
+        if let Ok(existing) = std::fs::read_to_string(&file_path) {
+            if !has_host_mapping_key(&existing) {
+                std::fs::write(&backup_path, &existing).map_err(|e| {
+                    format!(
+                        "could not back up {} to {} before migrating: {e}",
+                        file_path.display(),
+                        backup_path.display()
+                    )
+                })?;
+            }
+        }
+    }
 
     // Atomic write: write to a temporary file in the same directory, then rename to target path.
     // Placing the tmp file in the same directory guarantees rename is atomic within the filesystem.
@@ -160,10 +234,44 @@ pub fn upsert_profile(paths: &ClusterDeckPaths, profile: Profile) -> Result<(), 
         }
     }
     let mut profiles = load_profiles(paths)?;
+    // Plan R11: a zone has a single owner. Moving it is an explicit `switch_dns_zone_owner`.
+    for zone in &profile.approved_dns_zones {
+        check_zone_ownership(&profiles, zone, &[profile.id.as_str()])?;
+    }
     if let Some(pos) = profiles.iter().position(|p| p.id == profile.id) {
         profiles[pos] = profile;
     } else {
         profiles.push(profile);
+    }
+    save_profiles(paths, &profiles)
+}
+
+/// Atomically moves `zone` from its current owner to `to_profile` (one `profiles.yaml` write).
+/// Callers hold the profile write mutex, like every other mutator here.
+pub fn switch_dns_zone_owner(
+    paths: &ClusterDeckPaths,
+    zone: &str,
+    to_profile: &str,
+) -> Result<(), String> {
+    let mut profiles = load_profiles(paths)?;
+    // Check against the state after the move: the exact zone leaves its current owner, so
+    // only a different parent/child zone held by another profile blocks it.
+    let mut after = profiles.clone();
+    for p in &mut after {
+        p.approved_dns_zones.retain(|z| z != zone);
+    }
+    check_zone_ownership(&after, zone, &[to_profile])?;
+    if !profiles.iter().any(|p| p.id == to_profile) {
+        return Err(format!("Profile not found: {to_profile}"));
+    }
+    for p in &mut profiles {
+        if p.id == to_profile {
+            if !p.approved_dns_zones.iter().any(|z| z == zone) {
+                p.approved_dns_zones.push(zone.to_string());
+            }
+        } else {
+            p.approved_dns_zones.retain(|z| z != zone);
+        }
     }
     save_profiles(paths, &profiles)
 }
@@ -219,7 +327,8 @@ mod tests {
             bastion: None,
             bootstrap: BootstrapPolicy::default(),
             kubeconfig: None,
-            manage_hosts_file: true,
+            host_mapping: crate::services::config::HostMapping::Hosts,
+            approved_dns_zones: Vec::new(),
             gateway_address: None,
             trusted_cas: Vec::new(),
             local_runtime: None,
@@ -228,7 +337,7 @@ mod tests {
         let loaded = get_profile(&paths, "cka").unwrap();
         assert_eq!(loaded.name, "CKA Lab");
         assert_eq!(loaded.hosts.len(), 1);
-        assert!(loaded.manage_hosts_file);
+        assert_eq!(loaded.host_mapping, HostMapping::Hosts);
     }
 
     #[test]
@@ -241,7 +350,8 @@ mod tests {
             bastion: None,
             bootstrap: BootstrapPolicy::default(),
             kubeconfig: None,
-            manage_hosts_file: false,
+            host_mapping: crate::services::config::HostMapping::Off,
+            approved_dns_zones: Vec::new(),
             gateway_address: None,
             trusted_cas: Vec::new(),
             local_runtime: None,
@@ -289,7 +399,8 @@ profiles:
             bastion: None,
             bootstrap: BootstrapPolicy::default(),
             kubeconfig: None,
-            manage_hosts_file: false,
+            host_mapping: crate::services::config::HostMapping::Off,
+            approved_dns_zones: Vec::new(),
             gateway_address: None,
             trusted_cas: Vec::new(),
             local_runtime: None,
@@ -328,7 +439,8 @@ profiles:
             bastion: None,
             bootstrap: BootstrapPolicy::default(),
             kubeconfig: None,
-            manage_hosts_file: false,
+            host_mapping: crate::services::config::HostMapping::Off,
+            approved_dns_zones: Vec::new(),
             gateway_address: Some("203.0.113.10\n127.0.0.1 evil".into()),
             trusted_cas: Vec::new(),
             local_runtime: None,
@@ -351,7 +463,8 @@ profiles:
             bastion: None,
             bootstrap: BootstrapPolicy::default(),
             kubeconfig: None,
-            manage_hosts_file: false,
+            host_mapping: crate::services::config::HostMapping::Off,
+            approved_dns_zones: Vec::new(),
             gateway_address: None,
             trusted_cas: Vec::new(),
             local_runtime: None,
@@ -369,7 +482,8 @@ profiles:
             bastion: None,
             bootstrap: BootstrapPolicy::default(),
             kubeconfig: None,
-            manage_hosts_file: false,
+            host_mapping: crate::services::config::HostMapping::Off,
+            approved_dns_zones: Vec::new(),
             gateway_address: None,
             trusted_cas: vec![crate::services::ca_trust::TrustedCa {
                 secret_ref: "platform-system/apisix-gateway-tls-secret".into(),
@@ -431,7 +545,8 @@ profiles:
             bastion: None,
             bootstrap: BootstrapPolicy::default(),
             kubeconfig: None,
-            manage_hosts_file: false,
+            host_mapping: crate::services::config::HostMapping::Off,
+            approved_dns_zones: Vec::new(),
             gateway_address: None,
             trusted_cas: Vec::new(),
             local_runtime: None,
@@ -463,7 +578,8 @@ profiles:
                 local_path: "".into(),
                 context: "cka".into(),
             }),
-            manage_hosts_file: false,
+            host_mapping: crate::services::config::HostMapping::Off,
+            approved_dns_zones: Vec::new(),
             gateway_address: None,
             trusted_cas: Vec::new(),
             local_runtime: None,
@@ -529,7 +645,8 @@ profiles:
             bastion: None,
             bootstrap: BootstrapPolicy::default(),
             kubeconfig: None,
-            manage_hosts_file: false,
+            host_mapping: crate::services::config::HostMapping::Off,
+            approved_dns_zones: Vec::new(),
             gateway_address: None,
             trusted_cas: Vec::new(),
             local_runtime: Some(LocalRuntimeSource {
@@ -555,7 +672,8 @@ profiles:
             bastion: None,
             bootstrap: BootstrapPolicy::default(),
             kubeconfig: None,
-            manage_hosts_file: false,
+            host_mapping: crate::services::config::HostMapping::Off,
+            approved_dns_zones: Vec::new(),
             gateway_address: None,
             trusted_cas: Vec::new(),
             local_runtime: None,
@@ -629,6 +747,252 @@ profiles:
             max_concurrent.load(Ordering::SeqCst),
             1,
             "ProfileWriteGuard must allow only 1 concurrent writer"
+        );
+    }
+
+    fn write_legacy(paths: &ClusterDeckPaths, yaml: &str) {
+        std::fs::create_dir_all(paths.profiles_file().parent().unwrap()).unwrap();
+        std::fs::write(paths.profiles_file(), yaml).unwrap();
+    }
+
+    #[test]
+    fn legacy_manage_hosts_file_migrates_to_host_mapping() {
+        let paths = temp_paths("hm-legacy");
+        write_legacy(
+            &paths,
+            "profiles:\n  on:\n    name: On\n    hosts: []\n    manage_hosts_file: true\n  off:\n    name: Off\n    hosts: []\n    manage_hosts_file: false\n  absent:\n    name: Absent\n    hosts: []\n",
+        );
+        let loaded = load_profiles(&paths).unwrap();
+        let mode = |id: &str| loaded.iter().find(|p| p.id == id).unwrap().host_mapping;
+        assert_eq!(mode("on"), HostMapping::Hosts);
+        assert_eq!(mode("off"), HostMapping::Off);
+        assert_eq!(mode("absent"), HostMapping::Off);
+        // Round trip: re-saving keeps the meaning.
+        save_profiles(&paths, &loaded).unwrap();
+        let again = load_profiles(&paths).unwrap();
+        assert_eq!(
+            again.iter().find(|p| p.id == "on").unwrap().host_mapping,
+            HostMapping::Hosts
+        );
+    }
+
+    #[test]
+    fn host_mapping_wins_over_legacy_bool_and_both_are_written() {
+        let paths = temp_paths("hm-wins");
+        write_legacy(
+            &paths,
+            "profiles:\n  a:\n    name: A\n    hosts: []\n    manage_hosts_file: true\n    host_mapping: local_dns\n",
+        );
+        let loaded = load_profiles(&paths).unwrap();
+        assert_eq!(loaded[0].host_mapping, HostMapping::LocalDns);
+
+        save_profiles(&paths, &loaded).unwrap();
+        let yaml = std::fs::read_to_string(paths.profiles_file()).unwrap();
+        assert!(yaml.contains("host_mapping: local_dns"), "{yaml}");
+        assert!(yaml.contains("manage_hosts_file: false"), "{yaml}");
+
+        let mut p = loaded[0].clone();
+        p.host_mapping = HostMapping::Hosts;
+        save_profiles(&paths, &[p]).unwrap();
+        let yaml = std::fs::read_to_string(paths.profiles_file()).unwrap();
+        assert!(yaml.contains("host_mapping: hosts"), "{yaml}");
+        assert!(yaml.contains("manage_hosts_file: true"), "{yaml}");
+    }
+
+    #[test]
+    fn approved_dns_zones_roundtrip_and_are_omitted_when_empty() {
+        let paths = temp_paths("zones-roundtrip");
+        let mut p = sample_profile("z1");
+        upsert_profile(&paths, p.clone()).unwrap();
+        let yaml = std::fs::read_to_string(paths.profiles_file()).unwrap();
+        assert!(!yaml.contains("approved_dns_zones"), "{yaml}");
+
+        p.approved_dns_zones = vec!["lab.example.internal".into()];
+        upsert_profile(&paths, p).unwrap();
+        let loaded = get_profile(&paths, "z1").unwrap();
+        assert_eq!(loaded.approved_dns_zones, vec!["lab.example.internal"]);
+    }
+
+    #[test]
+    fn upsert_rejects_invalid_zones() {
+        let paths = temp_paths("zones-invalid");
+        for bad in [
+            "example.com",
+            "Lab.Example.Internal",
+            "internal",
+            "a.internal",
+            "x y.example.internal",
+        ] {
+            let mut p = sample_profile("z1");
+            p.approved_dns_zones = vec![bad.into()];
+            assert!(upsert_profile(&paths, p).is_err(), "{bad} must be rejected");
+        }
+    }
+
+    #[test]
+    fn zone_has_a_single_owner_and_switch_moves_it() {
+        let paths = temp_paths("zones-owner");
+        let mut a = sample_profile("a");
+        a.approved_dns_zones = vec!["lab.example.internal".into()];
+        upsert_profile(&paths, a).unwrap();
+
+        let mut b = sample_profile("b");
+        b.approved_dns_zones = vec!["lab.example.internal".into()];
+        let err = upsert_profile(&paths, b.clone()).unwrap_err();
+        assert!(err.contains("'a'"), "error must name the owner: {err}");
+
+        // Re-saving the owner itself is fine.
+        let mut a2 = get_profile(&paths, "a").unwrap();
+        a2.name = "Renamed".into();
+        upsert_profile(&paths, a2).unwrap();
+
+        b.approved_dns_zones.clear();
+        upsert_profile(&paths, b).unwrap();
+        switch_dns_zone_owner(&paths, "lab.example.internal", "b").unwrap();
+        assert!(get_profile(&paths, "a")
+            .unwrap()
+            .approved_dns_zones
+            .is_empty());
+        assert_eq!(
+            get_profile(&paths, "b").unwrap().approved_dns_zones,
+            vec!["lab.example.internal"]
+        );
+
+        assert!(switch_dns_zone_owner(&paths, "lab.example.internal", "missing").is_err());
+        assert!(switch_dns_zone_owner(&paths, "example.com", "b").is_err());
+    }
+
+    #[test]
+    fn pre_local_dns_backup_is_created_once() {
+        let paths = temp_paths("hm-backup");
+        let legacy = "profiles:\n  a:\n    name: A\n    hosts: []\n    manage_hosts_file: true\n";
+        write_legacy(&paths, legacy);
+        let backup = paths
+            .profiles_file()
+            .with_file_name("profiles.yaml.pre-local-dns.bak");
+
+        upsert_profile(&paths, sample_profile("b")).unwrap();
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), legacy);
+
+        // Later saves (file now has host_mapping, backup exists) never overwrite it.
+        upsert_profile(&paths, sample_profile("c")).unwrap();
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), legacy);
+    }
+
+    #[test]
+    fn no_backup_when_no_profiles_file_existed() {
+        let paths = temp_paths("hm-nobackup");
+        upsert_profile(&paths, sample_profile("a")).unwrap();
+        let backup = paths
+            .profiles_file()
+            .with_file_name("profiles.yaml.pre-local-dns.bak");
+        assert!(!backup.exists());
+    }
+
+    #[test]
+    fn overlapping_zones_across_profiles_are_rejected() {
+        let paths = temp_paths("zones-overlap");
+        let mut a = sample_profile("a");
+        a.approved_dns_zones = vec!["lab.example.internal".into()];
+        upsert_profile(&paths, a).unwrap();
+
+        for zone in ["dev.lab.example.internal", "example.test"] {
+            let mut b = sample_profile("b");
+            b.approved_dns_zones = vec![zone.into()];
+            let r = upsert_profile(&paths, b);
+            if zone == "dev.lab.example.internal" {
+                assert!(r.unwrap_err().contains("'a'"));
+            } else {
+                assert!(r.is_err(), "two-label zone is invalid anyway");
+            }
+        }
+        // A parent of an existing child is rejected too.
+        let mut c = sample_profile("c");
+        c.approved_dns_zones = vec!["x.example.internal".into()];
+        upsert_profile(&paths, c).unwrap();
+        let mut d = sample_profile("d");
+        d.approved_dns_zones = vec!["a.x.example.internal".into()];
+        assert!(upsert_profile(&paths, d).is_err());
+        // The same profile may hold nested zones.
+        let mut a2 = get_profile(&paths, "a").unwrap();
+        a2.approved_dns_zones
+            .push("dev.lab.example.internal".into());
+        upsert_profile(&paths, a2).unwrap();
+    }
+
+    #[test]
+    fn switch_rejects_overlap_with_third_profile_and_reserved_zone() {
+        let paths = temp_paths("zones-switch-overlap");
+        let mut a = sample_profile("a");
+        a.approved_dns_zones = vec![
+            "dev.lab.example.internal".into(),
+            "lab.example.internal".into(),
+        ];
+        upsert_profile(&paths, a).unwrap();
+        upsert_profile(&paths, sample_profile("b")).unwrap();
+        // Moving only the child would leave a's parent overlapping b's child.
+        let err = switch_dns_zone_owner(&paths, "dev.lab.example.internal", "b").unwrap_err();
+        assert!(err.contains("'a'"), "{err}");
+        assert!(switch_dns_zone_owner(&paths, "foo.clusterdeck.local", "b").is_err());
+    }
+
+    #[test]
+    fn upsert_rejects_zone_under_clusterdeck_local() {
+        let paths = temp_paths("zones-reserved");
+        for zone in [
+            "clusterdeck.local",
+            "x.clusterdeck.local",
+            "a.b.clusterdeck.local",
+        ] {
+            let mut p = sample_profile("a");
+            p.approved_dns_zones = vec![zone.into()];
+            assert!(upsert_profile(&paths, p).is_err(), "{zone}");
+        }
+    }
+
+    #[test]
+    fn backup_decision_parses_yaml_instead_of_substring() {
+        let paths = temp_paths("hm-backup-parse");
+        // "host_mapping" appears only inside a name/value, no key: still needs a backup.
+        let legacy = "profiles:\n  host_mapping_lab:\n    name: host_mapping\n    hosts: []\n    manage_hosts_file: false\n";
+        write_legacy(&paths, legacy);
+        let backup = paths
+            .profiles_file()
+            .with_file_name("profiles.yaml.pre-local-dns.bak");
+        upsert_profile(&paths, sample_profile("b")).unwrap();
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), legacy);
+    }
+
+    #[test]
+    fn no_backup_when_a_profile_already_has_host_mapping_key() {
+        let paths = temp_paths("hm-backup-has-key");
+        write_legacy(
+            &paths,
+            "profiles:\n  a:\n    name: A\n    hosts: []\n    host_mapping: off\n",
+        );
+        let backup = paths
+            .profiles_file()
+            .with_file_name("profiles.yaml.pre-local-dns.bak");
+        upsert_profile(&paths, sample_profile("b")).unwrap();
+        assert!(!backup.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failing_backup_fails_the_save_and_leaves_profiles_untouched() {
+        let paths = temp_paths("hm-backup-fails");
+        let legacy = "profiles:\n  a:\n    name: A\n    hosts: []\n    manage_hosts_file: true\n";
+        write_legacy(&paths, legacy);
+        // Dangling symlink: `exists()` is false but writing through it fails.
+        let backup = paths
+            .profiles_file()
+            .with_file_name("profiles.yaml.pre-local-dns.bak");
+        std::os::unix::fs::symlink("/nonexistent-clusterdeck-dir/x.bak", &backup).unwrap();
+        let err = upsert_profile(&paths, sample_profile("b")).unwrap_err();
+        assert!(err.contains("back up"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(paths.profiles_file()).unwrap(),
+            legacy
         );
     }
 }

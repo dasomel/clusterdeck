@@ -35,6 +35,8 @@ export type LocalRuntimeSource = {
   instance: string;
 };
 
+export type HostMapping = 'off' | 'local_dns' | 'hosts';
+
 export type Profile = {
   id: string;
   name: string;
@@ -42,7 +44,8 @@ export type Profile = {
   bastion: Bastion | null;
   bootstrap: BootstrapPolicy;
   kubeconfig: KubeconfigSource | null;
-  manage_hosts_file: boolean;
+  host_mapping: HostMapping;
+  approved_dns_zones?: string[];
   gateway_address?: string | null;
   trusted_cas: TrustedCa[];
   local_runtime?: LocalRuntimeSource | null;

@@ -557,7 +557,7 @@ pub async fn connect_profile(
         }
     }
 
-    if profile.manage_hosts_file {
+    if profile.host_mapping == crate::services::config::HostMapping::Hosts {
         if let Err(e) = crate::services::hosts_file::upsert_hosts_block_with_endpoints(
             &runner, &profile, &endpoints,
         )
@@ -677,7 +677,7 @@ pub async fn get_hosts_file_status(profile_id: String) -> Result<HostsFileStatus
     let conflicts = crate::services::hosts_file::find_hostname_conflicts(&existing, &profile_id);
 
     Ok(HostsFileStatus {
-        managed_by_profile: profile.manage_hosts_file,
+        managed_by_profile: profile.host_mapping == crate::services::config::HostMapping::Hosts,
         is_synced,
         active_entries,
         pending_entries,
@@ -883,7 +883,8 @@ mod tests {
             bastion: None,
             bootstrap: BootstrapPolicy::default(),
             kubeconfig: None,
-            manage_hosts_file: false,
+            host_mapping: crate::services::config::HostMapping::Off,
+            approved_dns_zones: Vec::new(),
             gateway_address: None,
             trusted_cas: Vec::new(),
             local_runtime: None,

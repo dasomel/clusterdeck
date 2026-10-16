@@ -31,7 +31,7 @@ export function connectMessage(result: ConnectionResult, selected: Profile): Omi
       successDetails.push(
         `Endpoints: discovered ${result.endpoints.length} external service(s) (APISIX/Ingress/Gateways)`
       );
-      if (selected.manage_hosts_file) {
+      if (selected.host_mapping === 'hosts') {
         successDetails.push('Hosts file: synced cluster endpoints and hosts to /etc/hosts');
       }
     }

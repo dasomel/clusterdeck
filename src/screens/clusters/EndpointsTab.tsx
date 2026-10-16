@@ -48,8 +48,8 @@ export default function EndpointsTab({
             <Pill variant={isSynced ? 'ok' : 'warn'}>
               {isSynced ? '/etc/hosts Synced' : 'Not in /etc/hosts'}
             </Pill>
-            <Pill variant={profile.manage_hosts_file ? 'ok' : 'idle'}>
-              {profile.manage_hosts_file ? 'Auto-sync: On' : 'Auto-sync: Off'}
+            <Pill variant={profile.host_mapping === 'hosts' ? 'ok' : 'idle'}>
+              {profile.host_mapping === 'hosts' ? 'Auto-sync: On' : 'Auto-sync: Off'}
             </Pill>
           </div>
 
