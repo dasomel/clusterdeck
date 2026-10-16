@@ -333,7 +333,12 @@ profiles:
             trusted_cas: Vec::new(),
             local_runtime: None,
         };
-        assert!(upsert_profile(&paths, profile).is_err());
+        assert!(upsert_profile(&paths, profile.clone()).is_err());
+        let unspecified = Profile {
+            gateway_address: Some("0.0.0.0".into()),
+            ..profile
+        };
+        assert!(upsert_profile(&paths, unspecified).is_err());
     }
 
     #[test]

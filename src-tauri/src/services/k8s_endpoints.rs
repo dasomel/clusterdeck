@@ -8,7 +8,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::services::process::CommandRunner;
-use crate::services::validate::{is_safe_host_domain, is_safe_ip_address};
+use crate::services::validate::{is_safe_gateway_address, is_safe_host_domain, is_safe_ip_address};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiscoveredEndpoint {
@@ -797,7 +797,7 @@ pub async fn discover_cluster_endpoints(
     // Kubernetes cannot know an external cloud LB's address (the gateway Service is typically
     // NodePort behind it), so anything it reports is a private address the user cannot reach.
     // Re-validated here because this is the single place the override reaches endpoint data.
-    if let Some(gw) = gateway_address.filter(|g| is_safe_ip_address(g)) {
+    if let Some(gw) = gateway_address.filter(|g| is_safe_gateway_address(g)) {
         for ep in &mut endpoints {
             ep.ip = gw.to_string();
         }
@@ -1393,10 +1393,9 @@ mod tests {
             }"#
             .into(),
         };
-        let kc =
-            std::env::temp_dir().join(format!("test-gw-kc-{}.yaml", gateway.unwrap_or("none")));
+        let kc = std::env::temp_dir().join(format!("test-gw-kc-{}.yaml", gateway.is_some()));
         let _ = std::fs::write(&kc, "dummy");
-        let eps = discover_cluster_endpoints(&runner, &kc, Some("172.16.0.10"), gateway)
+        let eps = discover_cluster_endpoints(&runner, &kc, Some("198.51.100.10"), gateway)
             .await
             .unwrap();
         let _ = std::fs::remove_file(&kc);

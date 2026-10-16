@@ -36,7 +36,7 @@ pub fn render_hosts_block_with_endpoints(
     }
 
     if let Some(gateway) = &profile.gateway_address {
-        if !crate::services::validate::is_safe_ip_address(gateway) {
+        if !crate::services::validate::is_safe_gateway_address(gateway) {
             return Err(format!("invalid gateway_address: {gateway}"));
         }
     }

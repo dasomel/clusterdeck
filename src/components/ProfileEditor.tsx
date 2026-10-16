@@ -833,7 +833,7 @@ export default function ProfileEditor({ initial, onClose, onSaved, onDeleteReque
                 spellCheck={false}
               />
               <p className="form-helper">
-                IP that discovered ingress/gateway endpoints map to, for example a cloud load balancer in front of private nodes. Leave empty to use the cluster's own load balancer or control-plane address.
+                Applies to the endpoint list and, when /etc/hosts management is on, to the hosts entries (independent of that setting). IP that discovered ingress/gateway endpoints map to, for example a cloud load balancer in front of private nodes. Leave empty to use the cluster's own load balancer or control-plane address.
               </p>
             </div>
           </div>

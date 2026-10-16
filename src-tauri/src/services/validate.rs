@@ -15,6 +15,13 @@ pub fn is_safe_ip_address(s: &str) -> bool {
     s.parse::<std::net::IpAddr>().is_ok()
 }
 
+/// `Profile.gateway_address` must be a concrete IP: an unspecified address (`0.0.0.0`, `::`)
+/// parses as an IP but would map every endpoint hostname to "any host" in `/etc/hosts`.
+pub fn is_safe_gateway_address(s: &str) -> bool {
+    s.parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| !ip.is_unspecified())
+}
+
 /// Sink validator for `open_url_in_browser`: only http(s) URLs with no whitespace or control
 /// characters may reach the `open` argv (macOS treats some URL schemes/args specially).
 pub fn is_safe_open_url(url: &str) -> bool {
@@ -210,7 +217,7 @@ pub fn validate_profile(profile: &crate::services::config::Profile) -> Result<()
     if let Some(gateway) = &profile.gateway_address {
         // Becomes the IP column of /etc/hosts lines, so it must be a bare IP (no whitespace,
         // comments or newlines that could inject extra hosts entries).
-        if !is_safe_ip_address(gateway) {
+        if !is_safe_gateway_address(gateway) {
             return Err(format!("invalid gateway_address: {gateway}"));
         }
     }
@@ -421,6 +428,15 @@ mod tests {
         assert!(!is_safe_known_hosts_path("-oProxyCommand=evil"));
         assert!(!is_safe_known_hosts_path("/tmp/evil\"; rm -rf /"));
         assert!(!is_safe_known_hosts_path("/tmp/evil\nHost x"));
+    }
+
+    #[test]
+    fn is_safe_gateway_address_rejects_unspecified_and_non_ips() {
+        assert!(is_safe_gateway_address("203.0.113.10"));
+        assert!(is_safe_gateway_address("2001:db8::1"));
+        assert!(!is_safe_gateway_address("0.0.0.0"));
+        assert!(!is_safe_gateway_address("::"));
+        assert!(!is_safe_gateway_address("203.0.113.10\nevil"));
     }
 
     #[test]
