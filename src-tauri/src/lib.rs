@@ -49,6 +49,14 @@ pub fn run() {
             commands::inventory::discover_inventory,
             commands::inventory::create_profile_from_environment,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running ClusterDeck");
+        .build(tauri::generate_context!())
+        .expect("error while building ClusterDeck")
+        .run(|_app, event| {
+            // ADR-0009: tunnels are children of this process; don't leave `ssh -N` behind.
+            if let tauri::RunEvent::Exit = event {
+                tauri::async_runtime::block_on(
+                    services::tunnel::global().stop_all(&services::process::SystemRunner),
+                );
+            }
+        });
 }

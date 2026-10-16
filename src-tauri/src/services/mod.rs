@@ -14,5 +14,6 @@ pub mod ssh;
 pub mod ssh_config;
 pub mod state;
 pub mod store;
+pub mod tunnel;
 pub mod validate;
 pub mod verify;
