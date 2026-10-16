@@ -10,6 +10,7 @@ import PatchRail from '../../components/rail/PatchRail';
 import Tabs, { type TabItem } from '../../components/ui/Tabs';
 import NodesTab from './NodesTab';
 import EndpointsTab from './EndpointsTab';
+import HostsConflictModal from '../../components/HostsConflictModal';
 import TrustTab from './TrustTab';
 import KubeconfigTab from './KubeconfigTab';
 
@@ -30,7 +31,7 @@ export default function ClusterDetail({
   autoFocusConnect = false,
   isVisible = true,
 }: ClusterDetailProps) {
-  const { trustVersion } = useProfiles();
+  const { trustVersion, profiles } = useProfiles();
   const { pushStatus } = useStatus();
   const [activeTab, setActiveTab] = useState('nodes');
   const [merging, setMerging] = useState(false);
@@ -154,6 +155,7 @@ export default function ClusterDetail({
           onScan={endpoints.discoverEndpoints}
           onSync={endpoints.syncHosts}
           onClear={endpoints.clearHosts}
+          onResolveConflicts={endpoints.openConflictResolver}
           onOpenUrl={endpoints.openUrl}
         />
       ),
@@ -207,6 +209,18 @@ export default function ClusterDetail({
       <PatchRail steps={railSteps} variant="full" />
 
       <Tabs tabs={tabs} activeTab={activeTab} onChange={setActiveTab} />
+
+      {endpoints.conflictGroups && (
+        <HostsConflictModal
+          groups={endpoints.conflictGroups}
+          currentProfileName={profile.name}
+          profiles={profiles}
+          busy={endpoints.resolvingConflicts}
+          error={endpoints.resolveError}
+          onConfirm={endpoints.resolveConflicts}
+          onCancel={endpoints.closeConflictResolver}
+        />
+      )}
     </div>
   );
 }

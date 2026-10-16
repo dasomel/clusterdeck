@@ -1,5 +1,6 @@
 import { RefreshCw, FileText, Trash2, ExternalLink } from 'lucide-react';
 import type { ConnectionResult, HostsFileStatus, Profile } from '../../api/tauri';
+import { groupBlockingConflicts, hasBlockingConflicts } from '../../lib/hostsConflicts';
 import Pill from '../../components/ui/Pill';
 import Tag from '../../components/ui/Tag';
 import CopyButton from '../../components/ui/CopyButton';
@@ -15,6 +16,7 @@ type EndpointsTabProps = {
   onScan: () => void;
   onSync: () => void;
   onClear: () => void;
+  onResolveConflicts: () => void;
   onOpenUrl: (url: string) => void;
 };
 
@@ -28,11 +30,13 @@ export default function EndpointsTab({
   onScan,
   onSync,
   onClear,
+  onResolveConflicts,
   onOpenUrl,
 }: EndpointsTabProps) {
   const isSynced = hostsStatus?.is_synced ?? false;
   const endpoints = lastResult?.endpoints ?? [];
   const conflicts = hostsStatus?.conflicts ?? [];
+  const canResolve = hasBlockingConflicts(groupBlockingConflicts(conflicts, profile.id));
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
@@ -110,6 +114,16 @@ export default function EndpointsTab({
             <div style={{ marginTop: '4px', color: 'var(--text-secondary)' }}>
               Clear the other profile&apos;s /etc/hosts block (or the unmanaged line) to resolve this.
             </div>
+            {canResolve && (
+              <button
+                type="button"
+                className="secondary-button compact-btn"
+                style={{ marginTop: '6px' }}
+                onClick={onResolveConflicts}
+              >
+                Resolve…
+              </button>
+            )}
           </div>
         )}
       </div>

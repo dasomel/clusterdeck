@@ -8,6 +8,12 @@ import {
 } from '../api/tauri';
 import { EMPTY_VERIFICATION } from './useClusterSession';
 import { useStatus } from '../state/StatusContext';
+import {
+  groupBlockingConflicts,
+  hasBlockingConflicts,
+  isSafeProfileId,
+  type ConflictGroups,
+} from '../lib/hostsConflicts';
 
 export function useEndpoints(
   profile: Profile | null,
@@ -16,6 +22,9 @@ export function useEndpoints(
   trustVersion?: number,
 ) {
   const { pushStatus } = useStatus();
+  const [conflictGroups, setConflictGroups] = useState<ConflictGroups | null>(null);
+  const [resolvingConflicts, setResolvingConflicts] = useState(false);
+  const [resolveError, setResolveError] = useState<string | null>(null);
   const [hostsStatus, setHostsStatus] = useState<HostsFileStatus | null>(null);
   const [caViews, setCaViews] = useState<DiscoveredCaView[]>([]);
   const [caActionTarget, setCaActionTarget] = useState<DiscoveredCaView | null>(null);
@@ -153,6 +162,8 @@ export function useEndpoints(
       setLastResult((prev) => (prev ? { ...prev, endpoints: res.endpoints } : null));
       await loadHostsStatus(profile.id);
       pushStatus('success', 'Hosts File Synced', [res.message]);
+      const groups = groupBlockingConflicts(res.conflicts ?? [], profile.id);
+      if (hasBlockingConflicts(groups)) setConflictGroups(groups);
     } catch (err) {
       pushStatus('error', 'Sync Hosts failed', [String(err)]);
     } finally {
@@ -173,6 +184,51 @@ export function useEndpoints(
       setClearingHosts(false);
     }
   }, [profile, loadHostsStatus, pushStatus]);
+
+  const openConflictResolver = useCallback(() => {
+    if (!profile) return;
+    const groups = groupBlockingConflicts(hostsStatus?.conflicts ?? [], profile.id);
+    if (hasBlockingConflicts(groups)) setConflictGroups(groups);
+  }, [profile, hostsStatus]);
+
+  const closeConflictResolver = useCallback(() => {
+    setConflictGroups(null);
+    setResolveError(null);
+  }, []);
+
+  // Sequential on purpose: each removal shows its own admin prompt, and the first
+  // failure must stop the rest so the user is not asked to authorize more work.
+  const resolveConflicts = useCallback(async () => {
+    if (!profile || !conflictGroups) return;
+    setResolveError(null);
+    setResolvingConflicts(true);
+    const removed: string[] = [];
+    try {
+      for (const { ownerId } of conflictGroups.owners) {
+        if (ownerId === profile.id || !isSafeProfileId(ownerId)) continue;
+        await api.removeHostsFile(ownerId);
+        removed.push(ownerId);
+        // Drop it right away so a retry after a later failure never re-removes it.
+        setConflictGroups((prev) =>
+          prev ? { ...prev, owners: prev.owners.filter((o) => o.ownerId !== ownerId) } : prev,
+        );
+      }
+      setConflictGroups(null);
+      setResolveError(null);
+      pushStatus('success', 'Removed conflicting /etc/hosts blocks', [
+        removed.length > 0 ? `Removed ClusterDeck blocks for: ${removed.join(', ')}` : 'Nothing to remove.',
+      ]);
+    } catch (err) {
+      setResolveError(String(err));
+      pushStatus('error', 'Remove conflicting block failed', [
+        ...(removed.length > 0 ? [`Already removed: ${removed.join(', ')}`] : []),
+        String(err),
+      ]);
+    } finally {
+      await loadHostsStatus(profile.id);
+      setResolvingConflicts(false);
+    }
+  }, [profile, conflictGroups, loadHostsStatus, pushStatus]);
 
   const openSshSession = useCallback(async (hostName: string) => {
     if (!profile) return;
@@ -210,6 +266,12 @@ export function useEndpoints(
     executeCaRemoveAction,
     syncHosts,
     clearHosts,
+    conflictGroups,
+    resolvingConflicts,
+    resolveError,
+    openConflictResolver,
+    closeConflictResolver,
+    resolveConflicts,
     openSshSession,
     openUrl,
   };
