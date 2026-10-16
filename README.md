@@ -21,9 +21,10 @@ ClusterDeck asks macOS for permission before touching anything outside its own d
 - **Login Keychain (CA certificates)** — when you choose to trust a cluster's internal CA (an opt-in action per discovered endpoint, or from Settings → Trusted CAs), ClusterDeck adds that certificate to your **login keychain** (never the System keychain), scoped only to the SSL/TLS trust policy. macOS will show its own authorization prompt (password or Touch ID) each time. You can inspect what's trusted in Keychain Access.app at any time, or remove it from ClusterDeck itself (Settings → Trusted CAs, or the "Remove" action on a trusted endpoint) — both properly untrust the certificate rather than just forgetting it locally.
 - **`/etc/hosts`** — off by default, opt-in per Profile. When enabled, ClusterDeck writes cluster-internal domain entries inside a single marked block (`# >>> ClusterDeck BEGIN (profile: <id>) >>>` … `# <<< ClusterDeck END (profile: <id>) <<<`) via a macOS admin-privileged prompt. It only ever edits its own block for that profile.
   - Optional **Gateway public address** (IP): for clusters whose gateway sits behind an external load balancer (private nodes), discovered endpoints map to this IP instead of the cluster's private address.
+- **Local DNS (`/etc/resolver/<zone>`)** — opt-in per Profile (`host_mapping: local_dns`). Recommended over `/etc/hosts` for full macOS Safari/Network.framework compatibility and zero-prompt record updates. Writes dedicated `/etc/resolver/<zone>` files pointing to a loopback-only authoritative responder (`127.0.0.1:15353`) run via a user LaunchAgent. See [Local DNS User Guide](docs/LOCAL-DNS.md).
 - **`~/.ssh/config`** — ClusterDeck adds one `Include ~/.clusterdeck/ssh/*.conf` line and keeps its own per-profile SSH options in that included directory, rather than writing directly into your config.
 
-If you ever want to remove everything ClusterDeck has added: untrust its CAs from Keychain Access.app (or ClusterDeck's own Settings), delete the marked block(s) from `/etc/hosts` if you opted in, remove the `Include` line from `~/.ssh/config`, and delete `~/.clusterdeck/`.
+If you ever want to remove everything ClusterDeck has added: untrust its CAs from Keychain Access.app (or ClusterDeck's own Settings), delete the marked block(s) from `/etc/hosts` if you opted in, remove any marked files from `/etc/resolver/`, remove the `Include` line from `~/.ssh/config`, and delete `~/.clusterdeck/`.
 
 ## Core Flow
 
@@ -71,6 +72,7 @@ Kubernetes Connectivity Check
 - `kubectl` connectivity verification
 - Local VM inventory observation across Colima, VirtualBox, VMware Fusion, and Vagrant
 - One-click profile creation from detected multi-node VM environments
+- Built-in local DNS responder via /etc/resolver for zero-prompt record updates and full Safari compatibility
 - In-app demo mode for trying ClusterDeck without host hypervisors
 
 ClusterDeck is not intended to become a general Kubernetes administration console.
@@ -129,6 +131,7 @@ cargo check --manifest-path src-tauri/Cargo.toml
 
 - [Architecture](docs/ARCHITECTURE.md) — workstation access layers and component boundaries
 - [MVP Design](docs/03-mvp-design.md) — intended MVP behavior and design detail
+- [Local DNS](docs/LOCAL-DNS.md) — built-in loopback DNS responder, per-zone /etc/resolver configuration, and troubleshooting
 - [Contributing](CONTRIBUTING.md) — contribution workflow
 - [Security](SECURITY.md) — vulnerability reporting and security policy
 - [Repository Engineering Rules](AGENTS.md) — repository-local engineering contract

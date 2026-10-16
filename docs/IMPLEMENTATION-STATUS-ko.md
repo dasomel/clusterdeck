@@ -23,6 +23,7 @@ Last verified: 2026-09-23 against `feat/14-local-runtime-lifecycle`
 - Colima/Lima instance에 대한 local runtime lifecycle action(Start/Stop/Restart, VM shell 열기, instance의 Docker/kube context로 scope된 host-side shell 열기, runtime info 복사)을 추가했습니다: `LocalRuntimeProvider` enum dispatch, 모든 action 전 fresh-discovery 재확인, 동일 instance에 대한 두 번째 동시 Start/Stop/Restart를 거부하는 per-instance concurrency guard, Settings 패널의 Stop/Restart 확인 모달을 포함합니다 (#14 Phase 2, ADR-0007 참조). 실제 `colima` instance(`nqa-node2`)로 검증: Stopped → Start → Running 확인 → Stop → Stopped 확인.
 - 실제 대상에 대한 fresh-session replay로 `clusterdeck-connection-workflow` Agent Skill을 재검증했습니다; `openforge-maturity`는 다시 `verified`입니다 (#22).
 - Host별 명시적 SSH 인증 모드(`key`, 기본값, 또는 `password`)를 추가했습니다: password 모드는 Connect, Test Connection, kubeconfig fetch 전 경로에서 일관되게 `sshpass -e`/`SSHPASS`를 사용하고, sshpass가 응답할 password prompt를 막는 `BatchMode=yes`는 생략하되 `StrictHostKeyChecking=accept-new`는 유지하며, password는 frontend state에만 존재하는 ephemeral 값입니다. 이 field가 없던 기존 profile YAML은 변경 없이 `key`로 역직렬화됩니다 (#26).
+- 사용자 LaunchAgent 기반 loopback authoritative 응답기(`127.0.0.1:15353`)와 존별 `/etc/resolver` 파일을 사용하는 내장 Local DNS(`host_mapping: local_dns`): 반복적인 `/etc/hosts` 관리자 권한 프롬프트 없이 노드 별칭 및 승인된 프라이빗 ingress 존을 제공하며, macOS Safari/URLSession의 이름 확인 불일치 문제를 해결합니다([ADR-0011](adr/0011-built-in-local-dns.md) 및 [Local DNS 가이드](LOCAL-DNS-ko.md) 참조).
 
 ## 진행 중 (In progress)
 
@@ -62,3 +63,5 @@ Last verified: 2026-09-23 against `feat/14-local-runtime-lifecycle`
 - `docs/adr/0008-vm-inventory-environment-source.md` (VM 인벤토리 환경 소스 및 프로필 생성)
 - `docs/ROADMAP-infrastructure.md` (InfraDeck에서 보존된 인프라 로드맵)
 - `.omc/plans/infradeck-merge.md` (InfraDeck 통합 계획 및 아키텍처 개정 사항)
+- `docs/adr/0011-built-in-local-dns.md` (존별 `/etc/resolver` 항목을 사용하는 내장 Local DNS)
+- `docs/LOCAL-DNS-ko.md` (내장 Local DNS 사용자 가이드 및 문제 해결)

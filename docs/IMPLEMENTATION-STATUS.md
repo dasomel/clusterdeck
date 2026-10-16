@@ -23,6 +23,7 @@ This file records current default-branch behavior, not future product direction.
 - Local runtime lifecycle actions for Colima/Lima instances (Start/Stop/Restart, open VM shell, open a host-side shell scoped to the instance's Docker/kube context, copy runtime info): a `LocalRuntimeProvider` enum dispatch, a fresh-discovery re-check before every action, a per-instance concurrency guard rejecting a second in-flight Start/Stop/Restart, and Stop/Restart confirmation modals in the Settings panel (#14 Phase 2, see ADR-0007). Verified against a real `colima` instance (`nqa-node2`): Stopped → Start → confirmed Running → Stop → confirmed Stopped.
 - `clusterdeck-connection-workflow` Agent Skill re-verified via a fresh-session replay against a real target; `openforge-maturity` is `verified` again (#22).
 - Explicit per-host SSH authentication mode (`key`, the default, or `password`): password mode uses `sshpass -e`/`SSHPASS` consistently across Connect, Test Connection, and kubeconfig fetch, omits `BatchMode=yes` (which would block the password prompt) while keeping `StrictHostKeyChecking=accept-new`, and keeps the password ephemeral in frontend state only. Profile YAML written before this field existed deserializes unchanged as `key` (#26).
+- Built-in local DNS (`host_mapping: local_dns`) using a user LaunchAgent authoritative loopback responder (`127.0.0.1:15353`) and per-zone `/etc/resolver` files for node aliases and approved private ingress zones, resolving macOS Safari/URLSession resolution divergence without recurring `/etc/hosts` privileged writes (see [ADR-0011](adr/0011-built-in-local-dns.md) and [Local DNS Guide](LOCAL-DNS.md)).
 
 ## In progress
 
@@ -62,3 +63,5 @@ This file records current default-branch behavior, not future product direction.
 - `docs/adr/0008-vm-inventory-environment-source.md` (VM inventory environment source and profile creation)
 - `docs/ROADMAP-infrastructure.md` (infrastructure roadmap preserved from InfraDeck)
 - `.omc/plans/infradeck-merge.md` (InfraDeck absorption plan and architectural amendments)
+- `docs/adr/0011-built-in-local-dns.md` (built-in local DNS with per-zone `/etc/resolver` entries)
+- `docs/LOCAL-DNS.md` (built-in local DNS user guide and troubleshooting)
