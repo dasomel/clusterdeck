@@ -38,6 +38,7 @@ pub struct SyncHostsResult {
     pub hosts_count: usize,
     pub endpoints: Vec<DiscoveredEndpoint>,
     pub message: String,
+    pub conflicts: Vec<crate::services::hosts_file::HostnameConflict>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -46,6 +47,7 @@ pub struct HostsFileStatus {
     pub is_synced: bool,
     pub active_entries: Vec<String>,
     pub pending_entries: Vec<String>,
+    pub conflicts: Vec<crate::services::hosts_file::HostnameConflict>,
 }
 
 /// Loads a profile and, if it was created from a detected Colima/Lima instance
@@ -635,6 +637,11 @@ pub async fn sync_hosts_file_cmd(profile_id: String) -> Result<SyncHostsResult, 
     let hosts_count = profile.hosts.len() + if profile.bastion.is_some() { 1 } else { 0 };
     let endpoints_count = endpoints.len();
 
+    // Warning only: the block is already written, so our entries are in the file now.
+    let written =
+        std::fs::read_to_string(crate::services::hosts_file::HOSTS_FILE_PATH).unwrap_or_default();
+    let conflicts = crate::services::hosts_file::find_hostname_conflicts(&written, &profile_id);
+
     Ok(SyncHostsResult {
         success: true,
         endpoints_count,
@@ -643,6 +650,7 @@ pub async fn sync_hosts_file_cmd(profile_id: String) -> Result<SyncHostsResult, 
         message: format!(
             "Successfully synced {hosts_count} host(s) and {endpoints_count} cluster endpoint(s) to /etc/hosts"
         ),
+        conflicts,
     })
 }
 
@@ -665,11 +673,15 @@ pub async fn get_hosts_file_status(profile_id: String) -> Result<HostsFileStatus
         .map(|s| s.to_string())
         .collect();
 
+    // D1: current reality (what /etc/hosts resolves now), not a prediction of a future sync.
+    let conflicts = crate::services::hosts_file::find_hostname_conflicts(&existing, &profile_id);
+
     Ok(HostsFileStatus {
         managed_by_profile: profile.manage_hosts_file,
         is_synced,
         active_entries,
         pending_entries,
+        conflicts,
     })
 }
 
@@ -686,6 +698,7 @@ pub async fn remove_hosts_file_cmd(profile_id: String) -> Result<SyncHostsResult
         hosts_count: 0,
         endpoints: vec![],
         message: format!("Successfully removed entries for profile '{profile_id}' from /etc/hosts"),
+        conflicts: vec![],
     })
 }
 
