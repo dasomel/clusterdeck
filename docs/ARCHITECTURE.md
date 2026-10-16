@@ -195,7 +195,7 @@ and never touches any other line in the file:
 
 Discovered ingress/gateway endpoints map to the cluster's LoadBalancer IP, or the control-plane address as a fallback. A profile can set an optional `gateway_address` (IP only, validated) to override that for all discovered endpoints, e.g. an external cloud load balancer in front of private nodes ([ADR-0010](adr/0010-profile-gateway-address.md)).
 
-On some macOS setups the Network.framework path used by Safari ignores `/etc/hosts` while honoring `/etc/resolver/<domain>`; [ADR-0011](adr/0011-safari-resolution-via-resolver-and-local-dns.md) (Proposed) adds an opt-in per-host resolver mode backed by an always-on loopback DNS responder (user LaunchAgent).
+On some macOS setups the Network.framework path used by Safari ignores `/etc/hosts` while honoring `/etc/resolver/<domain>`. [ADR-0011](adr/0011-built-in-local-dns.md) (Proposed) adds `host_mapping: local_dns`: a built-in authoritative DNS responder (user LaunchAgent, loopback only) serving approved per-profile zones through `/etc/resolver`, so `/etc/hosts` no longer needs to change.
 
 Writing `/etc/hosts` requires root, so ClusterDeck performs a single
 `osascript ... with administrator privileges` call per `connect_profile` invocation (never more
