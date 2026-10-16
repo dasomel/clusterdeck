@@ -1,6 +1,6 @@
 # ADR-0011: Built-in local DNS with per-zone `/etc/resolver` entries instead of `/etc/hosts`
 
-- Status: Proposed (blocked on the verification spike below)
+- Status: Proposed (verification spike passed 2026-10-16; awaiting acceptance)
 - Date: 2026-10-16
 - Issue: #86
 - Relates to: [ADR-0004](0004-hosts-file-toctou-mitigation.md), [ADR-0009](0009-bastion-api-tunnel.md), [ADR-0010](0010-profile-gateway-address.md)
@@ -72,13 +72,13 @@ For each active zone the app writes `/etc/resolver/<zone>`. The file has a first
 | A for a served name | the address, TTL 30 s |
 | AAAA (IPv4-only record), HTTPS (65), SVCB, other types for a served name | `NOERROR` with no data |
 | Unknown name inside an active zone | `NXDOMAIN`, authoritative |
-| Anything outside active zones | `REFUSED` |
+| Anything outside active zones, including `_dns.resolver.arpa` DDR probes | `REFUSED` |
 
 The responder is never recursive. Answers are generated from validated records (`is_safe_host_domain`, `is_safe_ip_address`) and never from the query. Because the server is authoritative, real DNS names under an active zone are hidden while the zone is active. This is why zones must be dedicated private suffixes and require approval (D3).
 
 ### D6 — Node aliases
 
-Node aliases live under `.clusterdeck.local`, and mDNSResponder treats `.local` specially. Until the spike proves resolver files work there, `local_dns` profiles keep serving node aliases through the hosts block. Those aliases are used by SSH, which goes through `getaddrinfo`. If the spike fails for `.local`, a follow-up ADR may move the aliases to a non-`.local` zone, e.g. `<profile>.clusterdeck.internal`. That would be a user-visible rename.
+The spike showed that `/etc/resolver/<zone>` works for `.clusterdeck.local` zones on both paths. Node aliases (`<host>.<profile>.clusterdeck.local`) are therefore served by the same responder: each `local_dns` profile gets the zone `<profile>.clusterdeck.local`, which needs no user approval because ClusterDeck owns the `clusterdeck.local` namespace. Aliases keep their names, so there is no user-visible rename.
 
 ## Consequences
 
@@ -92,18 +92,23 @@ Node aliases live under `.clusterdeck.local`, and mDNSResponder treats `.local` 
   - Unknown queries are refused or answered NXDOMAIN, never forwarded.
 - **Scope:** ClusterDeck still does not become a general DNS server. It serves only the zones the user approved for its own profiles.
 
-## Verification spike (must pass before Accepted)
+## Verification spike (passed 2026-10-16)
 
-Each check below must be run on macOS 27 with `dscacheutil -q host`, `dns-sd -G v4`, `scutil --dns` and `URLSession`, not `dig`, which bypasses mDNSResponder.
+The spike ran on macOS 27.0.1 with a std-only Rust prototype responder (four instances behind four test resolver files) and the RFC 5737 test addresses. Each item was checked on both paths, `getaddrinfo`/`dscacheutil` and `URLSession` (the Safari stack), and cross-checked against the responder's query log:
 
-**Already shown by the prototype:** context items 1–3, i.e. zone resolution without `/etc/hosts` on both paths, and the 30 s stall when the responder is down.
+| # | Claim | Result |
+|---|---|---|
+| 1 | The `port` directive is honored, including TCP fallback | Pass: a UDP answer with TC=1 made the system retry over TCP on the same port |
+| 2 | A more specific zone file takes precedence over a suffix file | Pass: queries under the specific zone reached only its responder |
+| 3 | `.clusterdeck.local` names resolve under a resolver file | Pass, on both paths (D6) |
+| 4 | Negative and no-data answers do not stall | Pass: an unknown in-zone name failed with `NSURLErrorCannotFindHost` in 0.01 s; AAAA and HTTPS (type 65) queries got NOERROR/NODATA |
+| 5 | Agent ownership check and file cleanup | Deferred to the implementation tests (app logic, not OS behaviour) |
 
-**Still open:**
-1. The `port` directive is honored for TCP fallback as well as UDP.
-2. A zone file takes precedence over a less specific unowned suffix file, and an equally specific unowned file is detected and reported.
-3. Behaviour of `.clusterdeck.local` names under a resolver file (D6).
-4. `NXDOMAIN` and `NOERROR`/no-data answers do not stall Safari.
-5. The agent's ownership check (`launchctl` + `lsof`) and the removal of files when the agent is gone.
+Findings that change the plan:
+
+- **`dns-sd -G` is not a valid oracle.** It reported "No Such Record" for names that `URLSession` resolved through the same resolver files. Verification uses `URLSession` and the responder log instead.
+- **DDR probes.** mDNSResponder sends `_dns.resolver.arpa` (type 64, SVCB) to each configured nameserver. The responder must answer `REFUSED`, which signals no encrypted-DNS upgrade; the prototype did this without side effects.
+- **Earlier measurements (Context 1–3).** Zone resolution without `/etc/hosts` and the 30 s `getaddrinfo` stall when the responder is down stand as recorded.
 
 ## Alternatives considered
 
