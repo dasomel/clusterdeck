@@ -53,6 +53,17 @@ Generated kubeconfigs can contain client certificates and private keys.
 - Back up user-managed kubeconfig before any merge operation.
 - Avoid deleting contexts that ClusterDeck does not own.
 
+## Built-in Local DNS
+
+ClusterDeck provides a built-in authoritative local DNS responder for macOS (`host_mapping: local_dns`) as an alternative to `/etc/hosts` ([ADR-0011](adr/0011-built-in-local-dns.md), [LOCAL-DNS.md](LOCAL-DNS.md)). Security properties include:
+
+- **Loopback-Only Authoritative Responder:** Binds strictly to `127.0.0.1:15353` as an unprivileged user LaunchAgent (`KeepAlive: true`). Never listens on external network interfaces and never runs as root.
+- **Authoritative and Non-Recursive:** Answers strictly from local records without recursion or upstream forwarding. Queries outside approved active zones (including `_dns.resolver.arpa` DDR probes) return `REFUSED`.
+- **Marker-Checked Root Script:** Privileged scripts verify the `# managed by ClusterDeck (profile: <id>)` header before modifying or removing any `/etc/resolver` file; third-party or unmanaged files are never touched.
+- **Make-Before-Break (MBB):** Mode transitions between `hosts` and `local_dns` execute atomically in one prompt, preventing resolution outages during migration.
+- **Ownership Gate & D-DEAD Recovery:** The manager verifies that the LaunchAgent PID matches the socket listener before pointing system resolver files at it. If the responder is stopped or the port is unowned, ClusterDeck prompts to clean up resolver files immediately to prevent 30-second lookup stalls.
+- **Private-TLD Rule:** Zones require at least three labels and must end in designated private TLDs (`.internal`, `.test`, `.example`, `.local`, `.home.arpa`, `.localhost`, `.invalid`), preventing interception of public domains.
+
 ## Logging
 
 Logs should contain operational state but not secrets.

@@ -21,9 +21,10 @@ ClusterDeck은 자체 데이터 디렉터리(`~/.clusterdeck/`) 밖의 무언가
 - **로그인 키체인(CA 인증서)** — 클러스터의 내부 CA를 신뢰하기로 선택하면(발견된 엔드포인트별 opt-in 동작, 또는 설정 → Trusted CAs에서), ClusterDeck은 그 인증서를 **로그인 키체인**(System 키체인이 아님)에 추가하며, SSL/TLS 신뢰 정책으로만 범위를 제한한다. 매번 macOS 자체 인증 프롬프트(암호 또는 Touch ID)가 뜬다. 신뢰된 항목은 언제든 Keychain Access.app에서 확인할 수 있고, ClusterDeck 자체(설정 → Trusted CAs, 또는 신뢰된 엔드포인트의 "제거" 동작)에서도 제거할 수 있다 — 둘 다 로컬에서 그냥 잊어버리는 게 아니라 인증서를 실제로 신뢰 해제한다.
 - **`/etc/hosts`** — 기본값은 비활성화이며 Profile별 opt-in이다. 활성화하면 ClusterDeck은 클러스터 내부 도메인 항목을 하나의 표시된 블록(`# >>> ClusterDeck BEGIN (profile: <id>) >>>` … `# <<< ClusterDeck END (profile: <id>) <<<`) 안에만 macOS 관리자 권한 프롬프트를 통해 작성한다. 해당 프로필의 자기 블록만 편집한다.
   - 선택 사항인 **Gateway public address**(IP): 게이트웨이가 외부 로드밸런서 뒤에 있는 클러스터(프라이빗 노드)에서, 검색된 엔드포인트를 클러스터 사설 주소 대신 이 IP로 매핑한다.
+- **Local DNS (`/etc/resolver/<zone>`)** — Profile별 opt-in(`host_mapping: local_dns`). macOS Safari/Network.framework의 완벽한 호환성과 암호 입력 없는 레코드 갱신을 위해 `/etc/hosts`보다 권장된다. 사용자 LaunchAgent로 실행되는 루프백 전용 authoritative 응답기(`127.0.0.1:15353`)를 가리키는 전용 `/etc/resolver/<zone>` 파일을 작성한다. [Local DNS 사용자 가이드](docs/LOCAL-DNS-ko.md)를 참조한다.
 - **`~/.ssh/config`** — ClusterDeck은 `Include ~/.clusterdeck/ssh/*.conf` 한 줄만 추가하고, 프로필별 SSH 옵션은 그 include된 디렉터리 안에 보관한다. 사용자의 config 파일에 직접 쓰지 않는다.
 
-ClusterDeck이 추가한 모든 것을 제거하고 싶다면: Keychain Access.app(또는 ClusterDeck 자체 설정)에서 CA 신뢰를 해제하고, opt-in했다면 `/etc/hosts`의 표시된 블록을 삭제하고, `~/.ssh/config`에서 `Include` 줄을 제거하고, `~/.clusterdeck/`를 삭제하면 된다.
+ClusterDeck이 추가한 모든 것을 제거하고 싶다면: Keychain Access.app(또는 ClusterDeck 자체 설정)에서 CA 신뢰를 해제하고, opt-in했다면 `/etc/hosts`의 표시된 블록을 삭제하고, `/etc/resolver/`에서 마커가 표시된 파일을 제거하고, `~/.ssh/config`에서 `Include` 줄을 제거하고, `~/.clusterdeck/`를 삭제하면 된다.
 
 ## 핵심 흐름
 
@@ -71,6 +72,7 @@ Kubernetes 연결 확인
 - `kubectl` 기반 연결 확인
 - Colima, VirtualBox, VMware Fusion, Vagrant 로컬 VM 인벤토리 관찰
 - 감지된 멀티노드 VM 환경 기반 원클릭 프로필 생성
+- /etc/resolver 기반의 내장 로컬 DNS 응답기를 통한 무프롬프트 레코드 갱신 및 Safari 완벽 호환
 - 하이퍼바이저 설치 없이 사용 가능한 인앱 Demo 모드
 
 ClusterDeck은 일반적인 Kubernetes 관리자 콘솔을 목표로 하지 않는다.
@@ -133,6 +135,7 @@ cargo check --manifest-path src-tauri/Cargo.toml
 
 - [Architecture](docs/ARCHITECTURE.md) — Workstation Access 계층과 책임 경계
 - [MVP Design](docs/03-mvp-design.md) — MVP 동작과 설계 상세
+- [Local DNS](docs/LOCAL-DNS-ko.md) — 내장 루프백 DNS 응답기, 존별 /etc/resolver 설정 및 문제 해결
 - [Contributing](CONTRIBUTING.md) — 기여 절차
 - [Security](SECURITY.md) — 보안 정책과 취약점 제보
 - [Repository Engineering Rules](AGENTS.md) — 저장소 엔지니어링 계약
