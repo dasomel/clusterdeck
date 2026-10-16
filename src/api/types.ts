@@ -126,11 +126,18 @@ export type DnsConflict = {
   profile_ids: string[];
 };
 
+export type SkippedReasonKind =
+  | 'outside_zones'
+  | 'covered_by_other_profile'
+  | 'invalid_dns_name'
+  | 'invalid_ipv4';
+
 /** A discovered host local DNS did not publish; `suggested_zones` are approvable parents. */
 export type DnsSkippedHost = {
   profile_id: string;
   host: string;
   reason: string;
+  reason_kind: SkippedReasonKind;
   suggested_zones: string[];
 };
 
@@ -140,6 +147,7 @@ export type SyncHostsResult = {
   hosts_count: number;
   endpoints: DiscoveredEndpoint[];
   message: string;
+  warning?: string | null;
   conflicts: HostnameConflict[];
   /** Absent from older backends; only set for local-DNS profiles. */
   dns_conflicts?: DnsConflict[];
@@ -313,4 +321,9 @@ export type LocalDnsStatus = {
   last_error: string | null;
   port: number;
   zones: LocalDnsZoneView[];
+};
+
+export type SuggestedDnsZones = {
+  zones: string[];
+  by_host: Record<string, string[]>;
 };

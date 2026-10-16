@@ -1,11 +1,14 @@
+import { useState, useEffect, useMemo, useCallback } from 'react';
 import { RefreshCw, FileText, Trash2, ExternalLink } from 'lucide-react';
-import type {
-  ConnectionResult,
-  DnsConflict,
-  DnsSkippedHost,
-  HostsFileStatus,
-  LocalDnsStatus,
-  Profile,
+import {
+  api,
+  type ConnectionResult,
+  type DnsConflict,
+  type DnsSkippedHost,
+  type HostsFileStatus,
+  type LocalDnsStatus,
+  type Profile,
+  type SuggestedDnsZones,
 } from '../../api/tauri';
 import { groupBlockingConflicts, hasBlockingConflicts } from '../../lib/hostsConflicts';
 import Pill from '../../components/ui/Pill';
@@ -76,22 +79,158 @@ export default function EndpointsTab({
       : profile.host_mapping === 'hosts'
         ? 'Hosts (/etc/hosts)'
         : 'Off';
-  const aliasZone = `${profile.id.toLowerCase().replace(/_/g, '-')}.clusterdeck.local`;
-  const zoneRows = [aliasZone, ...(profile.approved_dns_zones ?? [])].map((zone) => {
-    const served = dnsStatus?.zones.find((z) => z.zone === zone);
-    const state = !dnsStatus
-      ? 'unknown'
-      : !served
-        ? 'not served'
-        : served.owner === profile.id
-          ? 'served'
-          : `owned by ${served.owner}`;
-    return { zone, state, records: served?.records ?? 0 };
-  });
-  const servedZoneFor = (host: string) =>
-    zoneRows
-      .filter((r) => host === r.zone || host.endsWith(`.${r.zone}`))
-      .sort((a, b) => b.zone.length - a.zone.length)[0]?.zone;
+  const aliasZone = useMemo(
+    () => `${profile.id.toLowerCase().replace(/_/g, '-')}.clusterdeck.local`,
+    [profile.id],
+  );
+
+  const isResponderRunning = Boolean(dnsStatus?.agent_loaded && dnsStatus?.pid != null);
+
+  const isZoneServedByUs = useCallback(
+    (zone: string) => {
+      const lowerZone = zone.toLowerCase();
+      return Boolean(
+        dnsStatus?.zones.some(
+          (z) => z.zone.toLowerCase() === lowerZone && z.owner === profile.id,
+        ),
+      );
+    },
+    [dnsStatus, profile.id],
+  );
+
+  const getZoneDnsStatus = useCallback(
+    (zone: string): { label: string; color: string } => {
+      const lower = zone.toLowerCase();
+      const conflict = dnsConflicts.find((c) => c.zone.toLowerCase() === lower);
+      if (conflict) {
+        return {
+          label: `Conflict: ${conflict.zone}`,
+          color: 'var(--warning)',
+        };
+      }
+      const served = dnsStatus?.zones.find((z) => z.zone.toLowerCase() === lower);
+      if (served && served.owner !== profile.id) {
+        return {
+          label: `Served by another profile (${served.owner})`,
+          color: 'var(--text-tertiary)',
+        };
+      }
+      const isServed = isZoneServedByUs(zone);
+      if (isResponderRunning && isServed) {
+        return {
+          label: `Served by local DNS (${zone})`,
+          color: 'var(--success)',
+        };
+      }
+      if (!isResponderRunning) {
+        return {
+          label: 'Local DNS responder not running',
+          color: 'var(--text-tertiary)',
+        };
+      }
+      return {
+        label: 'Pending: press Sync to local DNS',
+        color: 'var(--text-tertiary)',
+      };
+    },
+    [isResponderRunning, isZoneServedByUs, dnsConflicts, dnsStatus, profile.id],
+  );
+
+  const aliasDnsStatus = useMemo(
+    () => getZoneDnsStatus(aliasZone),
+    [getZoneDnsStatus, aliasZone],
+  );
+
+  const approvedZoneFor = useCallback(
+    (host: string) => {
+      const lowerHost = host.toLowerCase();
+      const approved = profile.approved_dns_zones ?? [];
+      return (
+        approved
+          .filter((zone) => {
+            const lowerZone = zone.toLowerCase();
+            return lowerHost === lowerZone || lowerHost.endsWith(`.${lowerZone}`);
+          })
+          .sort((a, b) => b.length - a.length)[0] ?? null
+      );
+    },
+    [profile.approved_dns_zones],
+  );
+
+  const zoneRows = useMemo(() => {
+    return [aliasZone, ...(profile.approved_dns_zones ?? [])].map((zone) => {
+      const lowerZone = zone.toLowerCase();
+      const served = dnsStatus?.zones.find((z) => z.zone.toLowerCase() === lowerZone);
+      const conflict = dnsConflicts.find((c) => c.zone.toLowerCase() === lowerZone);
+      const state = conflict
+        ? `conflict (${conflict.kind})`
+        : !dnsStatus
+          ? 'unknown'
+          : !served
+            ? 'not served'
+            : served.owner === profile.id
+              ? isResponderRunning
+                ? 'served'
+                : 'responder not running'
+              : `owned by ${served.owner}`;
+      return { zone, state, records: served?.records ?? 0 };
+    });
+  }, [aliasZone, profile.approved_dns_zones, profile.id, dnsStatus, dnsConflicts, isResponderRunning]);
+
+  const [suggestedZones, setSuggestedZones] = useState<SuggestedDnsZones | null>(null);
+
+  const notServedKey = useMemo(() => {
+    if (!isLocalDns) return '';
+    return endpoints
+      .filter((ep) => !approvedZoneFor(ep.host))
+      .map((ep) => ep.host.toLowerCase())
+      .join('\n');
+  }, [isLocalDns, endpoints, approvedZoneFor]);
+
+  useEffect(() => {
+    if (!isLocalDns || !notServedKey) {
+      setSuggestedZones((prev) => (prev === null ? prev : null));
+      return;
+    }
+    const hosts = notServedKey.split('\n');
+    let active = true;
+    api
+      .suggestDnsZones(hosts)
+      .then((res) => {
+        if (!active) return;
+        setSuggestedZones((prev) => {
+          if (
+            prev &&
+            prev.zones.length === res.zones.length &&
+            prev.zones.every((z, i) => z === res.zones[i]) &&
+            Object.keys(prev.by_host).length === Object.keys(res.by_host).length &&
+            Object.entries(prev.by_host).every(([h, zones]) => {
+              const resZones = res.by_host[h];
+              return (
+                resZones &&
+                resZones.length === zones.length &&
+                resZones.every((rz, i) => rz === zones[i])
+              );
+            })
+          ) {
+            return prev;
+          }
+          return res;
+        });
+      })
+      .catch(() => {
+        if (active) setSuggestedZones((prev) => (prev === null ? prev : null));
+      });
+    return () => {
+      active = false;
+    };
+  }, [isLocalDns, notServedKey]);
+
+  const availableSuggestedZones = useMemo(() => {
+    if (!suggestedZones) return [];
+    const approved = (profile.approved_dns_zones ?? []).map((z) => z.toLowerCase());
+    return suggestedZones.zones.filter((z) => !approved.includes(z.toLowerCase()));
+  }, [suggestedZones, profile.approved_dns_zones]);
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
@@ -102,12 +241,12 @@ export default function EndpointsTab({
             <span style={{ fontSize: '13px', fontWeight: 600 }}>Name resolution</span>
             <Pill variant={profile.host_mapping === 'off' ? 'idle' : 'ok'}>{modeLabel}</Pill>
             {isLocalDns ? (
-              <Pill variant={dnsStatus?.agent_loaded && !dnsStatus.last_error ? 'ok' : 'warn'}>
+              <Pill variant={isResponderRunning && !dnsStatus?.last_error ? 'ok' : 'warn'}>
                 {dnsStatus
-                  ? dnsStatus.agent_loaded
-                    ? `Responder running${dnsStatus.pid ? ` (pid ${dnsStatus.pid})` : ''} · gen ${dnsStatus.generation}`
-                    : 'Responder not running'
-                  : 'Responder status unknown'}
+                  ? isResponderRunning
+                    ? `Responder running (pid ${dnsStatus.pid}) · gen ${dnsStatus.generation}`
+                    : 'Local DNS responder not running'
+                  : 'Local DNS responder not running'}
               </Pill>
             ) : (
               <Pill variant={isSynced ? 'ok' : 'warn'}>
@@ -178,6 +317,26 @@ export default function EndpointsTab({
                 </div>
               ))}
             </div>
+            {availableSuggestedZones.length > 0 && (
+              <div style={{ marginTop: '10px', display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                <span style={{ fontSize: '12px', color: 'var(--text-secondary)' }}>
+                  Suggested zones:
+                </span>
+                {availableSuggestedZones.map((zone) => (
+                  <button
+                    key={zone}
+                    type="button"
+                    className="secondary-button compact-btn"
+                    disabled={approvingZone !== null}
+                    onClick={() => onApproveZone(zone)}
+                    title={`Serve everything under ${zone} from local DNS (requires admin approval)`}
+                  >
+                    {approvingZone === zone ? <RefreshCw size={10} className="spin" /> : null}
+                    Approve {zone}
+                  </button>
+                ))}
+              </div>
+            )}
           </>
         ) : (
           <p style={{ margin: '8px 0 0', fontSize: '12px', color: 'var(--text-secondary)' }}>
@@ -200,33 +359,31 @@ export default function EndpointsTab({
           </div>
         )}
 
-        {isLocalDns && dnsSkipped.length > 0 && (
-          <div className="status-banner warning" style={{ marginTop: '10px', fontSize: '12px' }}>
-            <div style={{ fontWeight: 600, marginBottom: '4px' }}>
-              Hosts skipped by local DNS. Approve a zone to publish them.
+        {isLocalDns && dnsSkipped.length > 0 && (() => {
+          const outsideCount = dnsSkipped.filter((s) => s.reason_kind === 'outside_zones').length;
+          const approvedLower = (profile.approved_dns_zones ?? []).map((z) => z.toLowerCase());
+          const skippedZones = Array.from(new Set(dnsSkipped.flatMap((s) => s.suggested_zones)))
+            .filter((z) => !approvedLower.includes(z.toLowerCase()));
+          const zonesStr = skippedZones.join(', ');
+          const title = outsideCount > 0 && zonesStr
+            ? `${outsideCount} endpoint${outsideCount === 1 ? ' is' : 's are'} not served: approve ${zonesStr} to publish ${outsideCount === 1 ? 'it' : 'them'}`
+            : 'Hosts skipped by local DNS. Approve a zone to publish them.';
+
+          return (
+            <div className="status-banner warning" style={{ marginTop: '10px', fontSize: '12px' }}>
+              <div style={{ fontWeight: 600, marginBottom: '4px' }}>
+                {title}
+              </div>
+              <ul style={{ margin: 0, paddingLeft: '18px' }}>
+                {dnsSkipped.map((s) => (
+                  <li key={`${s.profile_id}-${s.host}`}>
+                    <span style={{ fontFamily: 'var(--font-mono)' }}>{s.host}</span> ({s.reason})
+                  </li>
+                ))}
+              </ul>
             </div>
-            <ul style={{ margin: 0, paddingLeft: '18px' }}>
-              {dnsSkipped.map((s) => (
-                <li key={`${s.profile_id}-${s.host}`}>
-                  <span style={{ fontFamily: 'var(--font-mono)' }}>{s.host}</span> ({s.reason})
-                  {s.suggested_zones.map((zone) => (
-                    <button
-                      key={zone}
-                      type="button"
-                      className="secondary-button compact-btn"
-                      style={{ marginLeft: '6px' }}
-                      disabled={approvingZone !== null}
-                      onClick={() => onApproveZone(zone)}
-                      title={`Serve everything under ${zone} from local DNS (requires admin approval)`}
-                    >
-                      Approve zone {zone}
-                    </button>
-                  ))}
-                </li>
-              ))}
-            </ul>
-          </div>
-        )}
+          );
+        })()}
 
         {!isLocalDns && conflicts.length > 0 && (
           <div className="status-banner warning" style={{ marginTop: '10px', fontSize: '12px' }}>
@@ -277,7 +434,14 @@ export default function EndpointsTab({
                   </div>
                   <div className="host-address">
                     Target IP: <strong>{host.address}</strong> (port {host.port})
-                    {isLocalDns && ` · Served by local DNS (${aliasZone})`}
+                    {isLocalDns && (
+                      <>
+                        {' · '}
+                        <span style={{ color: aliasDnsStatus.color }}>
+                          {aliasDnsStatus.label}
+                        </span>
+                      </>
+                    )}
                   </div>
                 </div>
                 <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
@@ -308,6 +472,14 @@ export default function EndpointsTab({
                 </div>
                 <div className="host-address">
                   Target IP: <strong>{profile.bastion.address}</strong> (port {profile.bastion.port})
+                  {isLocalDns && (
+                    <>
+                      {' · '}
+                      <span style={{ color: aliasDnsStatus.color }}>
+                        {aliasDnsStatus.label}
+                      </span>
+                    </>
+                  )}
                 </div>
               </div>
               <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
@@ -340,13 +512,99 @@ export default function EndpointsTab({
                   </div>
                   <div className="host-address">
                     Target IP: <strong>{ep.ip}</strong> · Resource: {ep.resource_name}
-                    {isLocalDns &&
-                      (servedZoneFor(ep.host)
-                        ? ` · Served by local DNS (${servedZoneFor(ep.host)})`
-                        : ' · Not served (outside approved zones)')}
+                    {isLocalDns && (
+                      <>
+                        {' · '}
+                        {(() => {
+                          const lowerHost = ep.host.toLowerCase();
+                          const conflict = dnsConflicts.find(
+                            (c) =>
+                              lowerHost === c.zone.toLowerCase() ||
+                              lowerHost.endsWith(`.${c.zone.toLowerCase()}`),
+                          );
+                          if (conflict) {
+                            return (
+                              <span style={{ color: 'var(--warning)' }}>
+                                Conflict: {conflict.zone}
+                              </span>
+                            );
+                          }
+
+                          const skipped = dnsSkipped.find(
+                            (s) => s.host.toLowerCase() === lowerHost,
+                          );
+                          if (skipped?.reason_kind === 'covered_by_other_profile') {
+                            const coveringZone = dnsStatus?.zones.find(
+                              (z) =>
+                                lowerHost === z.zone.toLowerCase() ||
+                                lowerHost.endsWith(`.${z.zone.toLowerCase()}`),
+                            );
+                            const owner = coveringZone?.owner;
+                            return (
+                              <span style={{ color: 'var(--text-tertiary)' }}>
+                                {owner
+                                  ? `Served by another profile (${owner})`
+                                  : 'Served by another profile'}
+                              </span>
+                            );
+                          }
+                          if (skipped?.reason_kind === 'invalid_dns_name') {
+                            return (
+                              <span style={{ color: 'var(--warning)' }}>
+                                Not served (invalid DNS name)
+                              </span>
+                            );
+                          }
+                          if (skipped?.reason_kind === 'invalid_ipv4') {
+                            return (
+                              <span style={{ color: 'var(--warning)' }}>
+                                Not served (invalid IPv4 address)
+                              </span>
+                            );
+                          }
+
+                          const matchedZone = approvedZoneFor(ep.host);
+                          if (!matchedZone) {
+                            return (
+                              <span style={{ color: 'var(--text-tertiary)' }}>
+                                Not served (outside approved zones)
+                              </span>
+                            );
+                          }
+                          const status = getZoneDnsStatus(matchedZone);
+                          return (
+                            <span style={{ color: status.color }}>
+                              {status.label}
+                            </span>
+                          );
+                        })()}
+                      </>
+                    )}
                   </div>
                 </div>
                 <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                  {isLocalDns &&
+                    !approvedZoneFor(ep.host) &&
+                    !dnsSkipped.some(
+                      (s) =>
+                        s.host.toLowerCase() === ep.host.toLowerCase() &&
+                        s.reason_kind === 'covered_by_other_profile',
+                    ) &&
+                    (suggestedZones?.by_host[ep.host] ?? suggestedZones?.by_host[ep.host.toLowerCase()] ?? [])
+                      .filter((z) => !(profile.approved_dns_zones ?? []).some((az) => az.toLowerCase() === z.toLowerCase()))
+                      .map((zone) => (
+                        <button
+                          key={zone}
+                          type="button"
+                          className="secondary-button compact-btn"
+                          disabled={approvingZone !== null}
+                          onClick={() => onApproveZone(zone)}
+                          title={`Serve everything under ${zone} from local DNS (requires admin approval)`}
+                        >
+                          {approvingZone === zone ? <RefreshCw size={10} className="spin" /> : null}
+                          Approve {zone}
+                        </button>
+                      ))}
                   <CopyButton text={ep.host} title={`Copy ${ep.host}`} />
                   <button
                     type="button"

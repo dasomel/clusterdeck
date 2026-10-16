@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::services::config::{HostMapping, Profile};
 use crate::services::k8s_endpoints::DiscoveredEndpoint;
@@ -17,12 +17,22 @@ use crate::services::validate::{
     is_safe_host_domain, profile_dns_label,
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkippedReasonKind {
+    OutsideZones,
+    CoveredByOtherProfile,
+    InvalidDnsName,
+    InvalidIpv4,
+}
+
 /// A name that could not be published, surfaced to the UI instead of silently dropped.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkippedHost {
     pub profile_id: String,
     pub host: String,
     pub reason: String,
+    pub reason_kind: SkippedReasonKind,
 }
 
 /// A zone claimed by more than one profile. It is never served, so neither claimant silently
@@ -40,11 +50,12 @@ pub struct BuildOutput {
     pub conflicts: Vec<ZoneConflict>,
 }
 
-fn skip(profile_id: &str, host: &str, reason: &str) -> SkippedHost {
+fn skip(profile_id: &str, host: &str, reason: &str, reason_kind: SkippedReasonKind) -> SkippedHost {
     SkippedHost {
         profile_id: profile_id.to_string(),
         host: host.to_string(),
         reason: reason.to_string(),
+        reason_kind,
     }
 }
 
@@ -139,11 +150,21 @@ pub fn build_zones(
             for (name, address) in aliased {
                 let fqdn = format!("{name}.{alias_zone}").to_ascii_lowercase();
                 if !is_safe_host_domain(&fqdn) {
-                    skipped.push(skip(&p.id, name, "alias is not a valid DNS name"));
+                    skipped.push(skip(
+                        &p.id,
+                        name,
+                        "alias is not a valid DNS name",
+                        SkippedReasonKind::InvalidDnsName,
+                    ));
                     continue;
                 }
                 if validate_record_ipv4(&fqdn, address).is_err() {
-                    skipped.push(skip(&p.id, name, "address is not a usable IPv4 literal"));
+                    skipped.push(skip(
+                        &p.id,
+                        name,
+                        "address is not a usable IPv4 literal",
+                        SkippedReasonKind::InvalidIpv4,
+                    ));
                     continue;
                 }
                 records
@@ -160,13 +181,23 @@ pub fn build_zones(
         for ep in endpoints_by_profile.get(&p.id).into_iter().flatten() {
             let host = ep.host.to_ascii_lowercase();
             if !is_safe_host_domain(&host) {
-                skipped.push(skip(&p.id, &ep.host, "not a valid DNS name"));
+                skipped.push(skip(
+                    &p.id,
+                    &ep.host,
+                    "not a valid DNS name",
+                    SkippedReasonKind::InvalidDnsName,
+                ));
                 continue;
             }
             // Same override rule as discovery (`k8s_endpoints`): the gateway address wins.
             let ip = gateway.unwrap_or(&ep.ip);
             if validate_record_ipv4(&host, ip).is_err() {
-                skipped.push(skip(&p.id, &ep.host, "target is not a usable IPv4 address"));
+                skipped.push(skip(
+                    &p.id,
+                    &ep.host,
+                    "target is not a usable IPv4 address",
+                    SkippedReasonKind::InvalidIpv4,
+                ));
                 continue;
             }
             // The most specific claimed zone across ALL profiles decides: a parent zone owner
@@ -188,8 +219,14 @@ pub fn build_zones(
                     &p.id,
                     &ep.host,
                     &format!("covered by zone {zone} of another profile"),
+                    SkippedReasonKind::CoveredByOtherProfile,
                 )),
-                None => skipped.push(skip(&p.id, &ep.host, "outside every approved zone")),
+                None => skipped.push(skip(
+                    &p.id,
+                    &ep.host,
+                    "outside every approved zone",
+                    SkippedReasonKind::OutsideZones,
+                )),
             }
         }
     }

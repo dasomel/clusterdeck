@@ -20,6 +20,7 @@ import type {
   ManagedProfileKubeconfig,
   MergeKubeconfigResult,
   Profile,
+  SuggestedDnsZones,
   SyncHostsResult,
   TrustedCa,
   UserKubeconfigDetails,
@@ -85,6 +86,8 @@ export const api = {
   removeHostsFile: (profileId: string) =>
     invoke<SyncHostsResult>('remove_hosts_file_cmd', { profileId }),
   localDnsStatus: () => invoke<LocalDnsStatus>('local_dns_status'),
+  suggestDnsZones: (hosts: string[]) =>
+    invoke<SuggestedDnsZones>('suggest_dns_zones', { hosts }),
   approveDnsZone: (profileId: string, zone: string) =>
     invoke<DnsApplyView>('approve_dns_zone', { profileId, zone }),
   openUrlInBrowser: (url: string) =>

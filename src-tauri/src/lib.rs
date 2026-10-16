@@ -60,6 +60,7 @@ pub fn run() {
             commands::local_dns::switch_dns_zone_owner,
             commands::local_dns::local_dns_status,
             commands::local_dns::local_dns_disable,
+            commands::local_dns::suggest_dns_zones,
         ])
         .build(tauri::generate_context!())
         .expect("error while building ClusterDeck")

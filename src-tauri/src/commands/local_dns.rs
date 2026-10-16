@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex as StdMutex;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::commands::connection::SyncHostsResult;
 use crate::services::config::{HostMapping, Profile};
@@ -21,14 +21,16 @@ use crate::services::k8s_endpoints::DiscoveredEndpoint;
 use crate::services::local_dns::agent::{self, AgentPaths};
 use crate::services::local_dns::manager::{self, ApplyRequest, HostsUpdate, ManagerEnv};
 use crate::services::local_dns::zone_file::{load_status, ZonesFile, ZONES_FILE_VERSION};
-use crate::services::local_dns::zones_builder::build_zones;
+use crate::services::local_dns::zones_builder::{build_zones, SkippedReasonKind};
 use crate::services::paths::ClusterDeckPaths;
 use crate::services::process::SystemRunner;
 use crate::services::resolver_files::{
     parse_marker, Conflict, ConflictKind, DEFAULT_DNS_PORT, RESOLVER_DIR,
 };
 use crate::services::store::{self, ProfileWriteGuard};
-use crate::services::validate::{is_allowed_private_zone, is_reserved_clusterdeck_zone};
+use crate::services::validate::{
+    is_allowed_private_zone, is_reserved_clusterdeck_zone, is_safe_host_domain,
+};
 
 const ENDPOINTS_CACHE_FILE: &str = "endpoints.json";
 
@@ -55,11 +57,12 @@ pub struct DnsConflict {
     pub profile_ids: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DnsSkippedHost {
     pub profile_id: String,
     pub host: String,
     pub reason: String,
+    pub reason_kind: SkippedReasonKind,
     /// Parent domains the user could approve to cover this host (only for hosts that fell
     /// outside every approved zone).
     pub suggested_zones: Vec<String>,
@@ -211,9 +214,6 @@ fn suggested_zones(host: &str) -> Vec<String> {
     out
 }
 
-/// Must match `zones_builder`'s reason for a host that no approved zone covers.
-const OUTSIDE_ZONES_REASON: &str = "outside every approved zone";
-
 async fn disable(
     env: &ManagerEnv<'_>,
     hosts: Option<HostsUpdate<'_>>,
@@ -248,18 +248,13 @@ async fn disable(
     Ok(view)
 }
 
-/// Rebuilds and applies the zones of every `LocalDns` profile. `exclude` drops one profile from
-/// the set (removal/deletion); `record` stores that profile's freshly discovered endpoints first.
-/// With no `LocalDns` profile left the resolver files and the agent are torn down.
-pub async fn reapply(
+async fn reapply_locked(
     paths: &ClusterDeckPaths,
     env: &ManagerEnv<'_>,
     exclude: Option<&str>,
     hosts: Option<HostsUpdate<'_>>,
     record: Option<(&str, &[DiscoveredEndpoint])>,
-) -> Result<DnsApplyView, String> {
-    let _lane_guard = lock_lane().await;
-
+) -> Result<(DnsApplyView, EndpointCache), String> {
     let profiles: Vec<Profile> = store::load_profiles(paths)?
         .into_iter()
         .filter(|p| Some(p.id.as_str()) != exclude)
@@ -280,15 +275,18 @@ pub async fn reapply(
         })?;
     }
 
+    let cached = cache_load(&cache_file);
+
     if !profiles
         .iter()
         .any(|p| p.host_mapping == HostMapping::LocalDns)
     {
-        return disable(env, hosts).await;
+        let view = disable(env, hosts).await?;
+        return Ok((view, cached));
     }
 
     // The generation is assigned by the manager; 0 here is ignored.
-    let build = build_zones(&profiles, &cache_load(&cache_file), 0, env.port);
+    let build = build_zones(&profiles, &cached, 0, env.port);
     let switches = approved_switches(env.resolver_dir, &build.zones);
     let owner_of: HashMap<&str, &str> = build
         .zones
@@ -338,7 +336,8 @@ pub async fn reapply(
             profile_id: s.profile_id.clone(),
             host: s.host.clone(),
             reason: s.reason.clone(),
-            suggested_zones: if s.reason == OUTSIDE_ZONES_REASON {
+            reason_kind: s.reason_kind,
+            suggested_zones: if s.reason_kind == SkippedReasonKind::OutsideZones {
                 suggested_zones(&s.host)
             } else {
                 Vec::new()
@@ -346,12 +345,30 @@ pub async fn reapply(
         })
         .collect();
 
-    Ok(DnsApplyView {
-        conflicts,
-        skipped_hosts,
-        prompted: result.prompted,
-        cancelled: result.cancelled,
-    })
+    Ok((
+        DnsApplyView {
+            conflicts,
+            skipped_hosts,
+            prompted: result.prompted,
+            cancelled: result.cancelled,
+        },
+        cached,
+    ))
+}
+
+/// Rebuilds and applies the zones of every `LocalDns` profile. `exclude` drops one profile from
+/// the set (removal/deletion); `record` stores that profile's freshly discovered endpoints first.
+/// With no `LocalDns` profile left the resolver files and the agent are torn down.
+pub async fn reapply(
+    paths: &ClusterDeckPaths,
+    env: &ManagerEnv<'_>,
+    exclude: Option<&str>,
+    hosts: Option<HostsUpdate<'_>>,
+    record: Option<(&str, &[DiscoveredEndpoint])>,
+) -> Result<DnsApplyView, String> {
+    let _lane_guard = lock_lane().await;
+    let (view, _) = reapply_locked(paths, env, exclude, hosts, record).await?;
+    Ok(view)
 }
 
 /// Whether /etc/hosts still has this profile's block, so a hosts step (and its prompt) is only
@@ -361,6 +378,43 @@ fn stale_block_present(hosts_path: &Path, profile_id: &str) -> bool {
     get_profile_hosts_block(&existing, profile_id).is_some()
 }
 
+fn sanitize_discovery_error(err: &str) -> String {
+    let first = err
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    if first.chars().count() > 120 {
+        let truncated: String = first.chars().take(117).collect();
+        format!("{truncated}...")
+    } else {
+        first.to_string()
+    }
+}
+
+fn is_connection_or_tunnel_down(err: &str) -> bool {
+    let lower = err.to_ascii_lowercase();
+    lower.contains("connect first")
+        || lower.contains("kubeconfig not found")
+        || lower.contains("connection refused")
+        || lower.contains("unable to connect")
+        || lower.contains("failed to connect")
+        || lower.contains("connection reset")
+        || lower.contains("connection closed")
+        || lower.contains("broken pipe")
+        || lower.contains("network is unreachable")
+        || lower.contains("no route to host")
+        || lower.contains("timed out")
+        || lower.contains("timeout")
+        || lower.contains("i/o timeout")
+        || lower.contains("unreachable")
+        || lower.contains("could not resolve host")
+        || lower.contains("dial tcp")
+}
+
+pub const DISCOVERY_FAILED_WARNING: &str =
+    "Could not discover endpoints (Connect first); serving the last known records.";
+
 /// `sync_hosts_file_cmd` for a `LocalDns` profile. A leftover /etc/hosts block from the Hosts
 /// mode is removed in the same privileged script as the resolver changes.
 pub async fn sync_local_dns_profile(
@@ -368,7 +422,7 @@ pub async fn sync_local_dns_profile(
     env: &ManagerEnv<'_>,
     hosts_path: &Path,
     profile: &Profile,
-    endpoints: Vec<DiscoveredEndpoint>,
+    endpoints: Result<Vec<DiscoveredEndpoint>, &str>,
 ) -> Result<SyncHostsResult, String> {
     let id = profile.id.clone();
     let strip = move |existing: &str| compute_updated_hosts_content(existing, &id, None);
@@ -376,20 +430,42 @@ pub async fn sync_local_dns_profile(
         path: hosts_path,
         compute: &strip,
     });
-    let view = reapply(
-        paths,
-        env,
-        None,
-        hosts,
-        Some((&profile.id, endpoints.as_slice())),
-    )
-    .await?
-    .for_profile(&profile.id);
+
+    let (record, discovery_err) = match &endpoints {
+        Ok(eps) => (Some((profile.id.as_str(), eps.as_slice())), None),
+        Err(e) => (None, Some(*e)),
+    };
+
+    let _lane_guard = lock_lane().await;
+    let (view, cached) = reapply_locked(paths, env, None, hosts, record).await?;
+    let view = view.for_profile(&profile.id);
+
+    let served_endpoints = match endpoints {
+        Ok(eps) => eps,
+        Err(_) => cached.get(&profile.id).cloned().unwrap_or_default(),
+    };
 
     let hosts_count = profile.hosts.len() + usize::from(profile.bastion.is_some());
-    let endpoints_count = endpoints.len();
+    let endpoints_count = served_endpoints.len();
+
+    let warning_msg = discovery_err.map(|e| {
+        let sanitized = sanitize_discovery_error(e);
+        let down = is_connection_or_tunnel_down(e) || sanitized.is_empty();
+        if down {
+            if sanitized.is_empty() {
+                DISCOVERY_FAILED_WARNING.to_string()
+            } else {
+                format!("Could not discover endpoints (Connect first); serving the last known records: {sanitized}")
+            }
+        } else {
+            format!("Endpoint discovery failed: {sanitized}; serving the last known records.")
+        }
+    });
+
     let message = if view.cancelled {
         "Admin approval was cancelled; local DNS was not changed".to_string()
+    } else if let Some(w) = &warning_msg {
+        w.clone()
     } else {
         format!(
             "Local DNS updated: {hosts_count} node alias(es), {endpoints_count} cluster endpoint(s) \
@@ -398,17 +474,81 @@ pub async fn sync_local_dns_profile(
             view.conflicts.len()
         )
     };
+
     Ok(SyncHostsResult {
-        success: !view.cancelled,
+        success: !view.cancelled && warning_msg.is_none(),
         endpoints_count,
         hosts_count,
-        endpoints,
+        endpoints: served_endpoints,
         message,
+        warning: warning_msg,
         conflicts: vec![],
         dns_conflicts: view.conflicts,
         skipped_hosts: view.skipped_hosts,
         dns_prompted: view.prompted,
     })
+}
+
+/// Refreshes local DNS after endpoint discovery in `connect_profile`.
+/// Reloads the profile inside the lane mutex: does nothing (and touches no cache) unless
+/// the current profile is LocalDns.
+/// Non-fatal on cancel, conflicts or errors: reports them into `errors` and never fails.
+pub async fn refresh_local_dns_on_connect(
+    paths: &ClusterDeckPaths,
+    env: &ManagerEnv<'_>,
+    profile_id: &str,
+    discovery: Result<&[DiscoveredEndpoint], &str>,
+    errors: &mut Vec<String>,
+) {
+    let _lane_guard = lock_lane().await;
+    let profiles = match store::load_profiles(paths) {
+        Ok(ps) => ps,
+        Err(e) => {
+            errors.push(format!("Could not load profiles to refresh local DNS: {e}"));
+            return;
+        }
+    };
+    let Some(current) = profiles.into_iter().find(|p| p.id == profile_id) else {
+        return;
+    };
+    if current.host_mapping != HostMapping::LocalDns {
+        return;
+    }
+
+    let record = match discovery {
+        Ok(eps) => Some((profile_id, eps)),
+        Err(err) => {
+            let sanitized = sanitize_discovery_error(err);
+            if sanitized.is_empty() {
+                errors.push(
+                    "Could not discover endpoints; serving the last known records.".to_string(),
+                );
+            } else {
+                errors.push(format!(
+                    "Could not discover endpoints; serving the last known records: {sanitized}"
+                ));
+            }
+            None
+        }
+    };
+
+    match reapply_locked(paths, env, None, None, record).await {
+        Ok((view, _)) => {
+            let view = view.for_profile(profile_id);
+            if view.cancelled {
+                errors.push("Admin approval was cancelled; local DNS was not changed".to_string());
+            }
+            for conflict in view.conflicts {
+                errors.push(format!(
+                    "Local DNS conflict on zone {}: {}",
+                    conflict.zone, conflict.kind
+                ));
+            }
+        }
+        Err(e) => {
+            errors.push(format!("Local DNS update failed: {e}"));
+        }
+    }
 }
 
 /// `remove_hosts_file_cmd` for a `LocalDns` profile: its zones leave local DNS (the profile
@@ -436,6 +576,7 @@ pub async fn remove_local_dns_profile(
         } else {
             format!("Removed profile '{profile_id}' from local DNS")
         },
+        warning: None,
         conflicts: vec![],
         dns_conflicts: vec![],
         skipped_hosts: vec![],
@@ -664,6 +805,33 @@ pub async fn local_dns_disable() -> Result<LocalDnsDisableResult, String> {
         cancelled: torn.cancelled,
         agent_removed: torn.agent_removed,
     })
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SuggestedDnsZones {
+    pub zones: Vec<String>,
+    pub by_host: HashMap<String, Vec<String>>,
+}
+
+const MAX_SUGGEST_HOSTS: usize = 1000;
+
+#[tauri::command]
+pub fn suggest_dns_zones(hosts: Vec<String>) -> SuggestedDnsZones {
+    let mut zones = Vec::new();
+    let mut by_host = HashMap::new();
+    for host in hosts.into_iter().take(MAX_SUGGEST_HOSTS) {
+        if !is_safe_host_domain(&host) {
+            continue;
+        }
+        let suggested = suggested_zones(&host);
+        for z in &suggested {
+            if !zones.contains(z) {
+                zones.push(z.clone());
+            }
+        }
+        by_host.insert(host, suggested);
+    }
+    SuggestedDnsZones { zones, by_host }
 }
 
 pub fn hosts_path() -> &'static Path {
