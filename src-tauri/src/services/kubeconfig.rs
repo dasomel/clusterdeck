@@ -190,6 +190,24 @@ pub(crate) fn original_api_target(raw_yaml: &str) -> Result<(String, u16), Strin
     Ok((host, port))
 }
 
+/// True unless the (first) cluster's `insecure-skip-tls-verify` is absent or explicitly false.
+/// An allow-list rather than matching "true": kubectl decodes kubeconfigs with YAML 1.1
+/// semantics, where `yes`/`on`/`y` are also true but serde_yaml (YAML 1.2) yields a string, and
+/// guessing wrong here hands credentials to a loopback impostor (ADR-0009 Security).
+fn cluster_skips_tls_verify(val: &serde_yaml::Value) -> bool {
+    match val["clusters"][0]["cluster"].get("insecure-skip-tls-verify") {
+        None | Some(serde_yaml::Value::Null) => false,
+        Some(serde_yaml::Value::Bool(b)) => *b,
+        Some(serde_yaml::Value::String(s)) => !matches!(
+            s.trim().to_ascii_lowercase().as_str(),
+            "false" | "no" | "off" | "n"
+        ),
+        Some(_) => true,
+    }
+}
+
+const INSECURE_TUNNEL_REFUSAL: &str = "API tunnel refused: kubeconfig disables TLS verification (insecure-skip-tls-verify); a loopback endpoint could be impersonated by any local process";
+
 /// Points an already-written profile kubeconfig at a (possibly different) local tunnel port.
 /// Used when the tunnel is re-established on a new port after an app restart. Returns whether
 /// the file changed.
@@ -199,6 +217,10 @@ pub(crate) fn retarget_tunnel_port(
 ) -> Result<bool, String> {
     let raw = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
     let mut val: serde_yaml::Value = serde_yaml::from_str(&raw).map_err(|e| e.to_string())?;
+    // ADR-0009 Security: never move credentials onto a loopback port without TLS verification.
+    if cluster_skips_tls_verify(&val) {
+        return Ok(false);
+    }
     let Some(server) = val
         .get_mut("clusters")
         .and_then(|v| v.get_mut(0))
@@ -266,6 +288,10 @@ pub fn normalize_with_endpoint(
 
     if clusters_len != Some(1) || contexts_len != Some(1) || users_len != Some(1) {
         return Err("multi-cluster kubeconfig is not supported in MVP".to_string());
+    }
+    // Defense in depth (ADR-0009 Security); callers already avoid this combination.
+    if matches!(endpoint, ApiEndpoint::Tunnel { .. }) && cluster_skips_tls_verify(&val) {
+        return Err(INSECURE_TUNNEL_REFUSAL.to_string());
     }
 
     let profile_val = serde_yaml::Value::String(profile_id.to_string());
@@ -572,7 +598,17 @@ pub async fn fetch_and_store(
     // direct endpoint, exactly the pre-tunnel behaviour, and report why.
     let mut tunnel_error = None;
     let mut endpoint = ApiEndpoint::Direct;
-    if profile.bastion.is_some() {
+    // Security (ADR-0009): TLS verification is the only thing stopping another local process
+    // from squatting the loopback port while the tunnel is down, so a cluster that skips
+    // verification is never tunnelled. A cluster with no CA configured is fine: it is verified
+    // against the system trust roots for the original host, which a local impostor cannot
+    // satisfy.
+    let insecure = serde_yaml::from_str::<serde_yaml::Value>(&raw_yaml)
+        .map(|v| cluster_skips_tls_verify(&v))
+        .unwrap_or(false);
+    if insecure && profile.bastion.is_some() {
+        tunnel_error = Some(INSECURE_TUNNEL_REFUSAL.to_string());
+    } else if profile.bastion.is_some() {
         let ensured = match original_api_target(&raw_yaml) {
             Ok((orig_host, orig_port)) => {
                 crate::services::tunnel::global()
@@ -3125,5 +3161,134 @@ users:
   user: {}
 "#;
         assert_eq!(generated, expected);
+    }
+
+    fn insecure_sample(value: &str) -> String {
+        SAMPLE.replace(
+            "      certificate-authority-data: ZmFrZS1jYQ==",
+            &format!("      insecure-skip-tls-verify: {value}"),
+        )
+    }
+
+    #[test]
+    fn tunnel_normalize_refuses_insecure_skip_tls_verify() {
+        for v in ["true", "\"true\"", "\"True\"", "yes", "on", "Y", "1"] {
+            let err = normalize_with_endpoint(
+                &insecure_sample(v),
+                "lab",
+                None,
+                ApiEndpoint::Tunnel { local_port: 16500 },
+            )
+            .unwrap_err();
+            assert!(err.contains("insecure-skip-tls-verify"), "{v}: {err}");
+        }
+        // Direct and `false` are unaffected.
+        assert!(normalize_with_endpoint(
+            &insecure_sample("true"),
+            "lab",
+            None,
+            ApiEndpoint::Direct
+        )
+        .is_ok());
+        for v in ["false", "\"false\"", "no", "off"] {
+            assert!(
+                normalize_with_endpoint(
+                    &insecure_sample(v),
+                    "lab",
+                    None,
+                    ApiEndpoint::Tunnel { local_port: 16500 }
+                )
+                .is_ok(),
+                "{v} must be treated as verifying TLS"
+            );
+        }
+    }
+
+    #[test]
+    fn retarget_is_a_noop_on_insecure_kubeconfig() {
+        for v in ["true", "\"true\""] {
+            let path = std::env::temp_dir().join(format!(
+                "clusterdeck-retarget-insecure-{}-{}.yaml",
+                std::process::id(),
+                v.len()
+            ));
+            let raw =
+                insecure_sample(v).replace("https://192.0.2.10:6443", "https://127.0.0.1:16443");
+            std::fs::write(&path, &raw).unwrap();
+            assert!(!retarget_tunnel_port(&path, 16500).unwrap());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), raw);
+            std::fs::remove_file(&path).ok();
+        }
+    }
+
+    struct SpawnCountingRunner {
+        inner: FakeSshRunner,
+        spawns: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl CommandRunner for SpawnCountingRunner {
+        async fn run(&self, bin: &str, args: &[String]) -> Result<CommandOutput, String> {
+            self.inner.run(bin, args).await
+        }
+        async fn spawn_background(
+            &self,
+            _bin: &str,
+            _args: &[String],
+        ) -> Result<Box<dyn crate::services::process::BackgroundProcess>, String> {
+            self.spawns.fetch_add(1, Ordering::SeqCst);
+            Err("spawn must not be reached".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_and_store_does_not_tunnel_an_insecure_kubeconfig() {
+        let paths = ClusterDeckPaths::at(
+            std::env::temp_dir().join(format!("clusterdeck-kc-insecure-{}", std::process::id())),
+        );
+        let profile = Profile {
+            id: "lab".to_string(),
+            name: "Lab".to_string(),
+            hosts: vec![Host {
+                name: "m1".to_string(),
+                address: "10.0.0.10".to_string(),
+                port: 22,
+                user: "root".to_string(),
+                identity_file: None,
+                auth: AuthMode::Key,
+            }],
+            bastion: Some(crate::services::config::Bastion {
+                name: "bastion".to_string(),
+                address: "203.0.113.5".to_string(),
+                port: 22,
+                user: "ops".to_string(),
+                identity_file: None,
+            }),
+            bootstrap: BootstrapPolicy::default(),
+            kubeconfig: Some(KubeconfigSource {
+                remote_path: "/etc/kubernetes/admin.conf".to_string(),
+                control_plane: "m1".to_string(),
+                local_path: String::new(),
+                context: "lab".to_string(),
+            }),
+            manage_hosts_file: false,
+            trusted_cas: Vec::new(),
+            local_runtime: None,
+        };
+        let runner = SpawnCountingRunner {
+            inner: FakeSshRunner {
+                sample_yaml: insecure_sample("\"true\""),
+                ssh_called: AtomicBool::new(false),
+            },
+            spawns: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let summary = fetch_and_store(&runner, &paths, &profile, None)
+            .await
+            .unwrap();
+        assert_eq!(runner.spawns.load(Ordering::SeqCst), 0);
+        assert!(summary.tunnel_error.unwrap().contains("API tunnel refused"));
+        let written = std::fs::read_to_string(paths.kubeconfig_file("lab")).unwrap();
+        assert!(!written.contains("127.0.0.1"), "{written}");
+        std::fs::remove_dir_all(&paths.base).ok();
     }
 }
