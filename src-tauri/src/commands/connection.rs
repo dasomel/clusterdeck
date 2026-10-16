@@ -283,6 +283,47 @@ async fn compute_ssh_reachability(
     false
 }
 
+/// Re-merges the profile kubeconfig into `~/.kube/config` only if the profile is already
+/// merged there. Returns the error message on failure.
+async fn auto_merge_if_present(
+    runner: &dyn CommandRunner,
+    paths: &ClusterDeckPaths,
+    profile: &Profile,
+) -> Option<String> {
+    if !crate::services::kubeconfig::is_profile_present_in_user_config(&profile.id) {
+        return None;
+    }
+    crate::services::kubeconfig::merge_profile_kubeconfig_to_user_config(
+        runner, paths, profile, false,
+    )
+    .await
+    .err()
+    .map(|e| format!("automatic ~/.kube/config update failed: {e}"))
+}
+
+/// Brings the API tunnel of a bastion profile up for verification, from the live tunnel's target
+/// or the persisted one, and points the stored kubeconfig at its port. `Ok(true)` when the
+/// kubeconfig's port changed (the preferred port was taken after a restart).
+async fn ensure_verify_tunnel(
+    tunnels: &crate::services::tunnel::TunnelManager,
+    runner: &dyn CommandRunner,
+    paths: &ClusterDeckPaths,
+    profile: &Profile,
+    kubeconfig_path: &Path,
+) -> Result<bool, String> {
+    let target = match tunnels.live_target(&profile.id).await {
+        Some(t) => t,
+        None => state::get_tunnel_target(paths, &profile.id)?.ok_or_else(|| {
+            "no API tunnel target recorded; reconnect to re-establish the API tunnel".to_string()
+        })?,
+    };
+    let port = tunnels
+        .ensure_tunnel(runner, paths, profile, &target.host, target.port)
+        .await
+        .map_err(|e| format!("API tunnel failed: {e}"))?;
+    crate::services::kubeconfig::retarget_tunnel_port(kubeconfig_path, port)
+}
+
 #[tauri::command]
 pub async fn verify_profile(profile_id: String) -> Result<VerificationResult, String> {
     let paths = ClusterDeckPaths::resolve()?;
@@ -290,6 +331,31 @@ pub async fn verify_profile(profile_id: String) -> Result<VerificationResult, St
     let profile = load_profile_fresh(&runner, &paths, &profile_id).await?;
 
     let kubeconfig_path = paths.kubeconfig_file(&profile_id);
+
+    // ADR-0009 D5b: the tunnel dies with the app, so a bastion profile verified after a restart
+    // must bring it back up first. A failure must not abort verification (SSH reachability and
+    // the saved status still matter); VerificationResult has no detail field, so the reason is
+    // logged and verification then fails on its own as it did before tunnels existed.
+    if profile.bastion.is_some() && profile.kubeconfig.is_some() && kubeconfig_path.exists() {
+        match ensure_verify_tunnel(
+            crate::services::tunnel::global(),
+            &runner,
+            &paths,
+            &profile,
+            &kubeconfig_path,
+        )
+        .await
+        {
+            Ok(true) => {
+                if let Some(e) = auto_merge_if_present(&runner, &paths, &profile).await {
+                    eprintln!("profile '{profile_id}': {e}");
+                }
+            }
+            Ok(false) => {}
+            Err(e) => eprintln!("profile '{profile_id}': {e}"),
+        }
+    }
+
     let target_context = resolve_verify_context(&profile, &kubeconfig_path);
     let mut result = if kubeconfig_path.exists() {
         verify::verify_cluster(&runner, &kubeconfig_path, &target_context).await
@@ -409,7 +475,10 @@ pub async fn connect_profile(
 
     if profile.kubeconfig.is_some() && any_host_reachable {
         match crate::services::kubeconfig::fetch_and_store(&runner, &paths, &profile, pwd).await {
-            Ok(summary) => {
+            Ok(mut summary) => {
+                if let Some(e) = summary.tunnel_error.take() {
+                    errors.push(e);
+                }
                 kubeconfig_summary = Some(summary);
             }
             Err(e) => {
@@ -480,16 +549,9 @@ pub async fn connect_profile(
     }
 
     // If this profile was previously merged into ~/.kube/config, auto-sync fresh credentials
-    if verification.kubernetes
-        && kubeconfig_exists
-        && crate::services::kubeconfig::is_profile_present_in_user_config(&profile_id)
-    {
-        if let Err(e) = crate::services::kubeconfig::merge_profile_kubeconfig_to_user_config(
-            &runner, &paths, &profile, false,
-        )
-        .await
-        {
-            errors.push(format!("automatic ~/.kube/config update failed: {e}"));
+    if verification.kubernetes && kubeconfig_exists {
+        if let Some(e) = auto_merge_if_present(&runner, &paths, &profile).await {
+            errors.push(e);
         }
     }
 
@@ -1033,5 +1095,82 @@ mod tests {
         let stored = store::get_profile(&paths, "colima-default").unwrap();
         assert!(stored.local_runtime.is_none());
         assert_eq!(stored.hosts[0].port, 22);
+    }
+
+    fn bastion_profile() -> Profile {
+        let mut p = profile_with_hosts(vec![key_host("cp1")]);
+        p.bastion = Some(crate::services::config::Bastion {
+            name: "bastion".to_string(),
+            address: "203.0.113.5".to_string(),
+            port: 22,
+            user: "ops".to_string(),
+            identity_file: None,
+        });
+        p.kubeconfig = Some(crate::services::config::KubeconfigSource {
+            remote_path: String::new(),
+            control_plane: "cp1".to_string(),
+            local_path: String::new(),
+            context: "test".to_string(),
+        });
+        p
+    }
+
+    fn tunnel_test_paths(tag: &str) -> ClusterDeckPaths {
+        let dir = std::env::temp_dir().join(format!(
+            "clusterdeck-verify-tunnel-{tag}-{}",
+            std::process::id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        ClusterDeckPaths::at(dir)
+    }
+
+    #[tokio::test]
+    async fn ensure_verify_tunnel_reports_missing_target_without_spawning() {
+        let paths = tunnel_test_paths("missing");
+        let manager = crate::services::tunnel::TunnelManager::new(std::sync::Arc::new(
+            crate::services::tunnel::SystemPortProbe,
+        ));
+        let err = ensure_verify_tunnel(
+            &manager,
+            &NeverCalledRunner,
+            &paths,
+            &bastion_profile(),
+            &paths.kubeconfig_file("test"),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("reconnect"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn ensure_verify_tunnel_reports_tunnel_start_failure() {
+        let paths = tunnel_test_paths("failure");
+        state::save_tunnel_target(
+            &paths,
+            "test",
+            &crate::services::tunnel::TunnelTarget {
+                host: "127.0.0.1".to_string(),
+                port: 6443,
+            },
+        )
+        .unwrap();
+        let manager = crate::services::tunnel::TunnelManager::new(std::sync::Arc::new(
+            crate::services::tunnel::SystemPortProbe,
+        ));
+        // AlwaysSucceedsRunner keeps the default `spawn_background`, which is unsupported.
+        let runner = AlwaysSucceedsRunner {
+            calls: AtomicUsize::new(0),
+        };
+        let err = ensure_verify_tunnel(
+            &manager,
+            &runner,
+            &paths,
+            &bastion_profile(),
+            &paths.kubeconfig_file("test"),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("API tunnel failed"), "{err}");
+        std::fs::remove_dir_all(&paths.base).ok();
     }
 }

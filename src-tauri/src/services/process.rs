@@ -120,6 +120,15 @@ pub trait CommandRunner: Send + Sync {
     ) -> Result<CommandOutput, String> {
         self.run(bin, args).await
     }
+    /// Starts a long-lived child (stdin/stdout null, stderr captured). Default is unsupported so
+    /// existing fakes compile untouched; only `SystemRunner` and tunnel-aware fakes override it.
+    async fn spawn_background(
+        &self,
+        _bin: &str,
+        _args: &[String],
+    ) -> Result<Box<dyn BackgroundProcess>, String> {
+        Err("background processes not supported".to_string())
+    }
     /// `run_bounded` plus extra environment variables (e.g. `VAGRANT_CWD`: the runner has no
     /// cwd support). Default delegates to `run_with_env`, so fakes need no change.
     async fn run_bounded_with_env(
@@ -130,6 +139,65 @@ pub trait CommandRunner: Send + Sync {
         _limits: CommandLimits,
     ) -> Result<CommandOutput, String> {
         self.run_with_env(bin, args, env).await
+    }
+}
+
+/// A long-lived child process (e.g. an `ssh -N -L` tunnel) owned by the app, as opposed to the
+/// run-to-completion commands `run*` cover. Dropping it must terminate the child.
+#[async_trait]
+pub trait BackgroundProcess: Send {
+    /// `Some(code)` once the process has exited (`-1` when killed by a signal), `None` while
+    /// it is still running.
+    fn try_exit_status(&mut self) -> Option<i32>;
+    /// OS process id, when known.
+    fn pid(&self) -> Option<u32> {
+        None
+    }
+    async fn kill(&mut self);
+    /// The last `BACKGROUND_STDERR_TAIL_BYTES` of stderr, for error messages. Only meaningful
+    /// after the process has exited (the tail is collected when stderr reaches EOF).
+    async fn stderr_tail(&mut self) -> String;
+}
+
+const BACKGROUND_STDERR_TAIL_BYTES: usize = 4096;
+
+pub struct SystemBackgroundProcess {
+    child: tokio::process::Child,
+    stderr_task: Option<tokio::task::JoinHandle<Vec<u8>>>,
+}
+
+#[async_trait]
+impl BackgroundProcess for SystemBackgroundProcess {
+    fn try_exit_status(&mut self) -> Option<i32> {
+        match self.child.try_wait() {
+            Ok(Some(status)) => Some(status.code().unwrap_or(-1)),
+            Ok(None) => None,
+            // A wait error means the child can no longer be observed; treat it as gone.
+            Err(_) => Some(-1),
+        }
+    }
+
+    fn pid(&self) -> Option<u32> {
+        self.child.id()
+    }
+
+    async fn kill(&mut self) {
+        let _ = self.child.kill().await;
+        if let Some(task) = self.stderr_task.take() {
+            task.abort();
+        }
+    }
+
+    async fn stderr_tail(&mut self) -> String {
+        let Some(task) = self.stderr_task.take() else {
+            return String::new();
+        };
+        // Bounded wait: a grandchild that inherited stderr could keep the pipe open after the
+        // child exited, and an error message is not worth hanging on.
+        match tokio::time::timeout(std::time::Duration::from_millis(500), task).await {
+            Ok(Ok(bytes)) => String::from_utf8_lossy(&bytes).trim().to_owned(),
+            _ => String::new(),
+        }
     }
 }
 
@@ -191,6 +259,52 @@ impl CommandRunner for SystemRunner {
         limits: CommandLimits,
     ) -> Result<CommandOutput, String> {
         self.run_bounded_with_env(bin, args, &[], limits).await
+    }
+
+    async fn spawn_background(
+        &self,
+        bin: &str,
+        args: &[String],
+    ) -> Result<Box<dyn BackgroundProcess>, String> {
+        let path = resolve_cli_path(bin)?;
+        let mut cmd = Command::new(path);
+        cmd.args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        if let Some(child_path) = child_path_env() {
+            cmd.env("PATH", child_path);
+        }
+        let mut child = cmd
+            .spawn()
+            .map_err(|err| format!("{bin} execution failed: {err}"))?;
+        let mut stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| "stderr unavailable".to_string())?;
+        // Drain continuously so a chatty child can never block on a full pipe, keeping only
+        // the tail.
+        let stderr_task = tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let mut tail: Vec<u8> = Vec::new();
+            let mut buf = [0u8; 1024];
+            while let Ok(n) = stderr.read(&mut buf).await {
+                if n == 0 {
+                    break;
+                }
+                tail.extend_from_slice(&buf[..n]);
+                if tail.len() > BACKGROUND_STDERR_TAIL_BYTES {
+                    let excess = tail.len() - BACKGROUND_STDERR_TAIL_BYTES;
+                    tail.drain(..excess);
+                }
+            }
+            tail
+        });
+        Ok(Box::new(SystemBackgroundProcess {
+            child,
+            stderr_task: Some(stderr_task),
+        }))
     }
 
     async fn run_bounded_with_env(
@@ -438,6 +552,38 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err, "boom");
+    }
+
+    #[tokio::test]
+    async fn system_runner_spawn_background_reports_exit_and_stderr_tail() {
+        let mut proc = SystemRunner
+            .spawn_background(
+                "sh",
+                &["-c".to_string(), "echo boom >&2; exit 3".to_string()],
+            )
+            .await
+            .unwrap();
+        let mut code = None;
+        for _ in 0..100 {
+            code = proc.try_exit_status();
+            if code.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(code, Some(3));
+        assert_eq!(proc.stderr_tail().await, "boom");
+    }
+
+    #[tokio::test]
+    async fn system_runner_spawn_background_kill_terminates_child() {
+        let mut proc = SystemRunner
+            .spawn_background("sleep", &["30".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(proc.try_exit_status(), None);
+        proc.kill().await;
+        assert!(proc.try_exit_status().is_some());
     }
 
     #[tokio::test]

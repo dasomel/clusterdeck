@@ -12,6 +12,11 @@ pub struct KubeconfigSummary {
     pub cluster_name: String,
     pub context_name: String,
     pub local_path: String,
+    /// Why the bastion API tunnel could not be established (ADR-0009). Non-fatal: the
+    /// kubeconfig was still written with the direct endpoint. Not sent to the frontend; Connect
+    /// folds it into `ConnectionResult.errors`.
+    #[serde(skip)]
+    pub tunnel_error: Option<String>,
 }
 
 const CANDIDATE_KUBECONFIG_PATHS: [&str; 6] = [
@@ -140,6 +145,91 @@ pub(crate) fn extract_url_host(url: &str) -> Option<String> {
     )
 }
 
+/// Port of a `scheme://host[:port][/path]` URL, defaulting to 443 (https) when absent. `None`
+/// when the URL has no `://` or the port is not a valid u16.
+pub(crate) fn extract_url_port(url: &str) -> Option<u16> {
+    let after_scheme = url.split_once("://")?.1;
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(after_scheme);
+    let port_part = match authority.strip_prefix('[') {
+        Some(rest) => rest.split_once(']')?.1.strip_prefix(':'),
+        None => authority.rsplit_once(':').map(|(_, port)| port),
+    };
+    match port_part {
+        Some(p) => p.parse().ok(),
+        None => Some(443),
+    }
+}
+
+/// Replaces the authority (`host[:port]`) of `url`, keeping scheme, path, query and fragment.
+fn replace_url_authority(url: &str, new_authority: &str) -> String {
+    match url.split_once("://") {
+        Some((scheme, rest)) => {
+            let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+            format!("{scheme}://{new_authority}{}", &rest[end..])
+        }
+        None => url.to_string(),
+    }
+}
+
+/// The API server host/port of a freshly fetched (single-cluster) kubeconfig, exactly as written
+/// by the cluster -- i.e. relative to the control plane. This is the `-L` destination of the
+/// bastion API tunnel (ADR-0009 D2).
+pub(crate) fn original_api_target(raw_yaml: &str) -> Result<(String, u16), String> {
+    let val: serde_yaml::Value =
+        serde_yaml::from_str(raw_yaml).map_err(|e| format!("Invalid YAML format: {e}"))?;
+    let server = val["clusters"][0]["cluster"]["server"]
+        .as_str()
+        .ok_or_else(|| "kubeconfig has no cluster server".to_string())?;
+    let host =
+        extract_url_host(server).ok_or_else(|| format!("unparseable server URL: {server}"))?;
+    let port =
+        extract_url_port(server).ok_or_else(|| format!("unparseable server port: {server}"))?;
+    Ok((host, port))
+}
+
+/// Points an already-written profile kubeconfig at a (possibly different) local tunnel port.
+/// Used when the tunnel is re-established on a new port after an app restart. Returns whether
+/// the file changed.
+pub(crate) fn retarget_tunnel_port(
+    path: &std::path::Path,
+    local_port: u16,
+) -> Result<bool, String> {
+    let raw = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let mut val: serde_yaml::Value = serde_yaml::from_str(&raw).map_err(|e| e.to_string())?;
+    let Some(server) = val
+        .get_mut("clusters")
+        .and_then(|v| v.get_mut(0))
+        .and_then(|v| v.get_mut("cluster"))
+        .and_then(|v| v.get_mut("server"))
+    else {
+        return Ok(false);
+    };
+    let Some(current) = server.as_str() else {
+        return Ok(false);
+    };
+    let updated = replace_url_authority(current, &format!("127.0.0.1:{local_port}"));
+    if updated == current {
+        return Ok(false);
+    }
+    *server = serde_yaml::Value::String(updated);
+    let out = serde_yaml::to_string(&val).map_err(|e| e.to_string())?;
+    write_kubeconfig_file_atomic(path, &out)?;
+    Ok(true)
+}
+
+/// How the stored kubeconfig's `server` is made reachable from this Mac.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApiEndpoint {
+    /// Rewrite a loopback server to the host's SSH address (pre-ADR-0009 behaviour).
+    Direct,
+    /// ADR-0009 D3: the app-managed SSH tunnel listens on `127.0.0.1:local_port`. The server is
+    /// rewritten even when the original is a non-loopback address (the Mac cannot reach it).
+    Tunnel { local_port: u16 },
+}
+
 pub fn normalize(raw_yaml: &str, profile_id: &str) -> Result<String, String> {
     normalize_with_host(raw_yaml, profile_id, None)
 }
@@ -148,6 +238,15 @@ pub fn normalize_with_host(
     raw_yaml: &str,
     profile_id: &str,
     host: Option<&crate::services::config::Host>,
+) -> Result<String, String> {
+    normalize_with_endpoint(raw_yaml, profile_id, host, ApiEndpoint::Direct)
+}
+
+pub fn normalize_with_endpoint(
+    raw_yaml: &str,
+    profile_id: &str,
+    host: Option<&crate::services::config::Host>,
+    endpoint: ApiEndpoint,
 ) -> Result<String, String> {
     let mut val: serde_yaml::Value =
         serde_yaml::from_str(raw_yaml).map_err(|e| format!("Invalid YAML format: {e}"))?;
@@ -178,14 +277,23 @@ pub fn normalize_with_host(
                 profile_val.clone(),
             );
 
-            // Normalize endpoint and add tls-server-name if host is provided
-            if let Some(h) = host {
+            // Normalize endpoint and add tls-server-name if host is provided (or tunnelled)
+            if host.is_some() || matches!(endpoint, ApiEndpoint::Tunnel { .. }) {
                 if let Some(inner) = map.get_mut("cluster").and_then(|v| v.as_mapping_mut()) {
                     let mut original_host: Option<String> = None;
                     if let Some(server_val) = inner.get_mut("server") {
                         if let Some(s) = server_val.as_str() {
                             let original = s.to_string();
-                            let rewritten = rewrite_server_endpoint(&original, &h.address);
+                            let rewritten = match (endpoint, host) {
+                                (ApiEndpoint::Tunnel { local_port }, _) => replace_url_authority(
+                                    &original,
+                                    &format!("127.0.0.1:{local_port}"),
+                                ),
+                                (ApiEndpoint::Direct, Some(h)) => {
+                                    rewrite_server_endpoint(&original, &h.address)
+                                }
+                                (ApiEndpoint::Direct, None) => original.clone(),
+                            };
                             // Only set tls-server-name when the server URL was actually
                             // rewritten to a different host: the fetched kubeconfig's TLS cert
                             // is guaranteed to cover the ORIGINAL host it worked against on the
@@ -459,7 +567,27 @@ pub async fn fetch_and_store(
     )
     .await?;
 
-    let normalized_yaml = normalize_with_host(&raw_yaml, &profile.id, Some(host))?;
+    // ADR-0009 D1: only bastion profiles get an app-managed API tunnel; direct profiles keep
+    // the endpoint rewrite untouched. A tunnel failure is non-fatal (D5b): fall back to the
+    // direct endpoint, exactly the pre-tunnel behaviour, and report why.
+    let mut tunnel_error = None;
+    let mut endpoint = ApiEndpoint::Direct;
+    if profile.bastion.is_some() {
+        let ensured = match original_api_target(&raw_yaml) {
+            Ok((orig_host, orig_port)) => {
+                crate::services::tunnel::global()
+                    .ensure_tunnel(runner, paths, profile, &orig_host, orig_port)
+                    .await
+            }
+            Err(e) => Err(e),
+        };
+        match ensured {
+            Ok(local_port) => endpoint = ApiEndpoint::Tunnel { local_port },
+            Err(e) => tunnel_error = Some(format!("API tunnel failed: {e}")),
+        }
+    }
+
+    let normalized_yaml = normalize_with_endpoint(&raw_yaml, &profile.id, Some(host), endpoint)?;
 
     paths
         .ensure_dirs()
@@ -490,6 +618,7 @@ pub async fn fetch_and_store(
         cluster_name: profile.id.clone(),
         context_name: profile.id.clone(),
         local_path: dest_path.to_string_lossy().to_string(),
+        tunnel_error,
     })
 }
 
@@ -1896,6 +2025,96 @@ users:
         assert_eq!(mode, 0o600);
 
         std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    fn tunnel_server(raw: &str) -> (String, Option<String>) {
+        let out =
+            normalize_with_endpoint(raw, "lab", None, ApiEndpoint::Tunnel { local_port: 16500 })
+                .unwrap();
+        let v: serde_yaml::Value = serde_yaml::from_str(&out).unwrap();
+        (
+            v["clusters"][0]["cluster"]["server"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+            v["clusters"][0]["cluster"]["tls-server-name"]
+                .as_str()
+                .map(str::to_string),
+        )
+    }
+
+    #[test]
+    fn tunnel_endpoint_rewrites_loopback_server_and_sets_tls_server_name() {
+        let raw = SAMPLE.replace("https://192.0.2.10:6443", "https://127.0.0.1:6443");
+        assert_eq!(
+            tunnel_server(&raw),
+            (
+                "https://127.0.0.1:16500".to_string(),
+                Some("127.0.0.1".to_string())
+            )
+        );
+    }
+
+    #[test]
+    fn tunnel_endpoint_rewrites_non_loopback_server() {
+        let raw = SAMPLE.replace("https://192.0.2.10:6443", "https://10.20.30.10:6443");
+        assert_eq!(
+            tunnel_server(&raw),
+            (
+                "https://127.0.0.1:16500".to_string(),
+                Some("10.20.30.10".to_string())
+            )
+        );
+    }
+
+    #[test]
+    fn tunnel_endpoint_preserves_existing_tls_server_name() {
+        let raw = SAMPLE
+            .replace("https://192.0.2.10:6443", "https://10.20.30.10:6443")
+            .replace(
+                "      certificate-authority-data: ZmFrZS1jYQ==",
+                "      certificate-authority-data: ZmFrZS1jYQ==\n      tls-server-name: kubernetes",
+            );
+        assert_eq!(
+            tunnel_server(&raw),
+            (
+                "https://127.0.0.1:16500".to_string(),
+                Some("kubernetes".to_string())
+            )
+        );
+    }
+
+    #[test]
+    fn direct_endpoint_leaves_non_loopback_server_untouched() {
+        let host = Host {
+            name: "m1".to_string(),
+            address: "10.0.0.11".to_string(),
+            port: 22,
+            user: "root".to_string(),
+            identity_file: None,
+            auth: AuthMode::Key,
+        };
+        let raw = SAMPLE.replace("https://192.0.2.10:6443", "https://10.20.30.10:6443");
+        let out = normalize_with_host(&raw, "lab", Some(&host)).unwrap();
+        let v: serde_yaml::Value = serde_yaml::from_str(&out).unwrap();
+        assert_eq!(
+            v["clusters"][0]["cluster"]["server"].as_str().unwrap(),
+            "https://10.20.30.10:6443"
+        );
+    }
+
+    #[test]
+    fn original_api_target_parses_host_and_port_with_defaults() {
+        let t = |url: &str| original_api_target(&SAMPLE.replace("https://192.0.2.10:6443", url));
+        assert_eq!(
+            t("https://127.0.0.1:6443").unwrap(),
+            ("127.0.0.1".into(), 6443)
+        );
+        assert_eq!(t("https://10.0.0.10").unwrap(), ("10.0.0.10".into(), 443));
+        assert_eq!(
+            t("https://[fd00::10]:6443").unwrap(),
+            ("fd00::10".into(), 6443)
+        );
     }
 
     #[test]

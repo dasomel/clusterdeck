@@ -228,6 +228,7 @@ The model should support:
 - kubeconfig fetch through the Bastion.
 - Direct and Bastion access modes within the same Profile.
 - Multiple ProxyJump hops as a later extension.
+- An app-managed SSH API tunnel (`127.0.0.1:<port>` to the API server as seen from the control plane) so the stored kubeconfig is usable from the Mac; the tunnel lives only while the app runs. See [ADR-0009](adr/0009-bastion-api-tunnel.md).
 
 ## 9. Remote kubeconfig Flow
 

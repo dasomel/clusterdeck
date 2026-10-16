@@ -60,6 +60,9 @@ pub async fn delete_profile_cmd(
     if kc_file.exists() {
         let _ = std::fs::remove_file(kc_file);
     }
+    crate::services::tunnel::global()
+        .stop_tunnel(&profile_id)
+        .await;
     let _ = crate::services::state::delete_status(&paths, &profile_id);
 
     store::delete_profile(&paths, &profile_id)
