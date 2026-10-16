@@ -7,6 +7,11 @@ pub fn run() {
     tauri::Builder::default()
         .manage(services::local_runtime_lifecycle::LifecycleGuard::default())
         .manage(services::store::ProfileWriteGuard)
+        .setup(|_app| {
+            // D4: never blocks startup; prompts only if our resolver files must be removed.
+            tauri::async_runtime::spawn(commands::local_dns::startup_task());
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             commands::app::get_app_info,
             commands::profiles::list_profiles,
@@ -50,6 +55,11 @@ pub fn run() {
             commands::local_runtime::open_local_runtime_context,
             commands::inventory::discover_inventory,
             commands::inventory::create_profile_from_environment,
+            commands::local_dns::approve_dns_zone,
+            commands::local_dns::revoke_dns_zone,
+            commands::local_dns::switch_dns_zone_owner,
+            commands::local_dns::local_dns_status,
+            commands::local_dns::local_dns_disable,
         ])
         .build(tauri::generate_context!())
         .expect("error while building ClusterDeck")

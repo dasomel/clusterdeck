@@ -34,15 +34,30 @@ export default function ClustersScreen({
     if (!profileToDelete) return;
     setDeleting(true);
     try {
-      await remove(profileToDelete);
-      pushStatus('success', `Profile "${profileToDelete.name}" deleted`);
+      const view = await remove(profileToDelete);
+      if (view?.cancelled) {
+        pushStatus('warning', 'Profile Deleted (DNS Cleanup Incomplete)', [
+          'Admin approval was cancelled; local DNS resolver files could not be cleaned up.',
+        ]);
+      } else if (view && view.conflicts.length > 0) {
+        pushStatus('warning', 'Profile Deleted with DNS Conflicts', [
+          `Local DNS updated with conflicts: ${view.conflicts.map((c) => c.zone).join(', ')}`,
+        ]);
+      } else {
+        pushStatus('success', `Profile "${profileToDelete.name}" deleted`);
+      }
+    } catch (err) {
+      const msg = String(err);
+      if (msg.includes('local DNS')) {
+        pushStatus('warning', 'Profile Deleted (DNS Cleanup Incomplete)', [msg]);
+      } else {
+        pushStatus('error', 'Failed to delete profile', [msg]);
+      }
+    } finally {
       setProfileToDelete(null);
       if (editorState.open && editorState.profile?.id === profileToDelete.id) {
         setEditorState({ open: false, profile: null });
       }
-    } catch (err) {
-      pushStatus('error', 'Failed to delete profile', [String(err)]);
-    } finally {
       setDeleting(false);
     }
   };

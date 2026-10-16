@@ -2,6 +2,7 @@ import { invoke } from '@tauri-apps/api/core';
 import type {
   BackupKubeconfigResult,
   ConnectionResult,
+  DnsApplyView,
   DiscoveredCaView,
   DiscoveredEndpoint,
   DiscoveredHost,
@@ -13,6 +14,7 @@ import type {
   KubeconfigBackupInfo,
   KubeconfigSummary,
   LifecycleActionResult,
+  LocalDnsStatus,
   LocalKubeContext,
   LocalRuntimeLifecycleProvider,
   ManagedProfileKubeconfig,
@@ -29,8 +31,8 @@ export * from './types';
 export const api = {
   listProfiles: () => invoke<Profile[]>('list_profiles'),
   getProfile: (profileId: string) => invoke<Profile>('get_profile_cmd', { profileId }),
-  saveProfile: (profile: Profile) => invoke<void>('save_profile', { profile }),
-  deleteProfile: (profileId: string) => invoke<void>('delete_profile_cmd', { profileId }),
+  saveProfile: (profile: Profile) => invoke<DnsApplyView | null>('save_profile', { profile }),
+  deleteProfile: (profileId: string) => invoke<DnsApplyView | null>('delete_profile_cmd', { profileId }),
   discoverHosts: (input: string, port?: number) => invoke<DiscoveredHost[]>('discover_hosts', { input, port }),
   probeProfileHosts: (profileId: string, password?: string) =>
     invoke<HostStageResult[]>('probe_profile_hosts', { profileId, password }),
@@ -82,6 +84,9 @@ export const api = {
     invoke<HostsFileStatus>('get_hosts_file_status', { profileId }),
   removeHostsFile: (profileId: string) =>
     invoke<SyncHostsResult>('remove_hosts_file_cmd', { profileId }),
+  localDnsStatus: () => invoke<LocalDnsStatus>('local_dns_status'),
+  approveDnsZone: (profileId: string, zone: string) =>
+    invoke<DnsApplyView>('approve_dns_zone', { profileId, zone }),
   openUrlInBrowser: (url: string) =>
     invoke<void>('open_url_in_browser', { url }),
   discoverClusterCas: (profileId: string, endpoints: DiscoveredEndpoint[]) =>

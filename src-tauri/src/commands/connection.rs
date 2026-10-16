@@ -39,6 +39,13 @@ pub struct SyncHostsResult {
     pub endpoints: Vec<DiscoveredEndpoint>,
     pub message: String,
     pub conflicts: Vec<crate::services::hosts_file::HostnameConflict>,
+    /// Local-DNS (ADR-0011) outcome; empty/false for Hosts profiles.
+    #[serde(default)]
+    pub dns_conflicts: Vec<crate::commands::local_dns::DnsConflict>,
+    #[serde(default)]
+    pub skipped_hosts: Vec<crate::commands::local_dns::DnsSkippedHost>,
+    #[serde(default)]
+    pub dns_prompted: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -631,6 +638,18 @@ pub async fn sync_hosts_file_cmd(profile_id: String) -> Result<SyncHostsResult, 
         }
     }
 
+    if profile.host_mapping == crate::services::config::HostMapping::LocalDns {
+        let dns = crate::commands::local_dns::SystemDns::resolve()?;
+        return crate::commands::local_dns::sync_local_dns_profile(
+            &paths,
+            &dns.env(),
+            crate::commands::local_dns::hosts_path(),
+            &profile,
+            endpoints,
+        )
+        .await;
+    }
+
     crate::services::hosts_file::upsert_hosts_block_with_endpoints(&runner, &profile, &endpoints)
         .await?;
 
@@ -651,6 +670,9 @@ pub async fn sync_hosts_file_cmd(profile_id: String) -> Result<SyncHostsResult, 
             "Successfully synced {hosts_count} host(s) and {endpoints_count} cluster endpoint(s) to /etc/hosts"
         ),
         conflicts,
+        dns_conflicts: vec![],
+        skipped_hosts: vec![],
+        dns_prompted: false,
     })
 }
 
@@ -688,7 +710,17 @@ pub async fn get_hosts_file_status(profile_id: String) -> Result<HostsFileStatus
 #[tauri::command]
 pub async fn remove_hosts_file_cmd(profile_id: String) -> Result<SyncHostsResult, String> {
     let paths = ClusterDeckPaths::resolve()?;
-    let _profile = store::get_profile(&paths, &profile_id)?;
+    let profile = store::get_profile(&paths, &profile_id)?;
+    if profile.host_mapping == crate::services::config::HostMapping::LocalDns {
+        let dns = crate::commands::local_dns::SystemDns::resolve()?;
+        return crate::commands::local_dns::remove_local_dns_profile(
+            &paths,
+            &dns.env(),
+            crate::commands::local_dns::hosts_path(),
+            &profile_id,
+        )
+        .await;
+    }
     let runner = SystemRunner;
     crate::services::hosts_file::remove_hosts_block(&runner, &profile_id).await?;
 
@@ -699,6 +731,9 @@ pub async fn remove_hosts_file_cmd(profile_id: String) -> Result<SyncHostsResult
         endpoints: vec![],
         message: format!("Successfully removed entries for profile '{profile_id}' from /etc/hosts"),
         conflicts: vec![],
+        dns_conflicts: vec![],
+        skipped_hosts: vec![],
+        dns_prompted: false,
     })
 }
 

@@ -1,5 +1,6 @@
 import { useMemo, useState } from 'react';
 import { Plus, Trash2, X, Download, Search, RefreshCw } from 'lucide-react';
+import { useStatus } from '../state/StatusContext';
 import {
   api,
   type Profile,
@@ -36,6 +37,7 @@ const toLocalRuntimeSource = (host: DiscoveredLocalHost): LocalRuntimeSource | n
 };
 
 export default function ProfileEditor({ initial, onClose, onSaved, onDeleteRequest }: ProfileEditorProps) {
+  const { pushStatus } = useStatus();
   const isEditing = initial !== null;
 
   const [id, setId] = useState(initial?.id ?? '');
@@ -371,7 +373,16 @@ export default function ProfileEditor({ initial, onClose, onSaved, onDeleteReque
     try {
       setSaving(true);
       setSaveError(null);
-      await api.saveProfile(finalProfile);
+      const view = await api.saveProfile(finalProfile);
+      if (view?.cancelled) {
+        pushStatus('warning', 'Profile Saved (DNS Incomplete)', [
+          'Admin approval was cancelled; local DNS was not updated.',
+        ]);
+      } else if (view && view.conflicts.length > 0) {
+        pushStatus('warning', 'Profile Saved with DNS Conflicts', [
+          `Local DNS updated with conflicts: ${view.conflicts.map((c) => c.zone).join(', ')}`,
+        ]);
+      }
       onSaved(finalProfile);
       onClose();
     } catch (err) {
