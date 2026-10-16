@@ -1,6 +1,8 @@
 mod commands;
 mod services;
 
+pub use services::local_dns;
+
 pub fn run() {
     tauri::Builder::default()
         .manage(services::local_runtime_lifecycle::LifecycleGuard::default())
