@@ -12,6 +12,7 @@ use crate::services::validate::is_safe_ssh_identifier;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -272,13 +273,32 @@ impl TunnelManager {
                 return Ok(port);
             }
             old.process.kill().await;
+            let _ = remove_tunnel_record(paths, &profile.id);
         }
+
+        // ADR-0009 / Issue #97: Reap any orphan left behind from a previous crash
+        // for this profile so its preferred port is freed before choose_port.
+        let _ = reap_profile_orphan(runner, paths, &profile.id).await;
 
         let mut excluded: Vec<u16> = Vec::new();
         for attempt in 0..2 {
             let port = choose_port(&profile.id, self.probe.as_ref(), &excluded)?;
             let argv = tunnel_argv(&ssh_conf, port, &target, &alias)?;
-            let started = self.start_once(runner, &profile.id, &argv, port).await;
+            let record = TunnelRecord {
+                profile_id: profile.id.clone(),
+                pid: 0,
+                port,
+                target: target.clone(),
+                ssh_conf: ssh_conf.clone(),
+                alias: alias.clone(),
+                started_at_epoch_s: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+            };
+            let started = self
+                .start_once(runner, paths, &profile.id, &argv, port, record)
+                .await;
             self.in_flight.lock().unwrap().remove(&profile.id);
             match started {
                 Ok(process) => {
@@ -310,9 +330,11 @@ impl TunnelManager {
     async fn start_once(
         &self,
         runner: &dyn CommandRunner,
+        paths: &ClusterDeckPaths,
         profile_id: &str,
         argv: &[String],
         port: u16,
+        record: TunnelRecord,
     ) -> Result<Box<dyn BackgroundProcess>, StartError> {
         let other = |message: String| StartError {
             message,
@@ -326,12 +348,16 @@ impl TunnelManager {
                 .lock()
                 .unwrap()
                 .insert(profile_id.to_string(), pid);
+            let mut rec = record;
+            rec.pid = pid;
+            let _ = write_tunnel_record(paths, &rec);
         }
 
         let started = tokio::time::Instant::now();
         let mut consecutive = 0u8;
         loop {
             if let Some(code) = process.try_exit_status() {
+                let _ = remove_tunnel_record(paths, profile_id);
                 return Err(Self::exited(process.as_mut(), code).await);
             }
             if self.probe.is_open(port).await {
@@ -351,6 +377,7 @@ impl TunnelManager {
             }
             if started.elapsed() >= self.ready_timeout {
                 process.kill().await;
+                let _ = remove_tunnel_record(paths, profile_id);
                 return Err(other(format!(
                     "ssh tunnel not ready after {}s",
                     self.ready_timeout.as_secs()
@@ -359,6 +386,7 @@ impl TunnelManager {
             tokio::time::sleep(self.ready_poll).await;
         }
         if let Some(code) = process.try_exit_status() {
+            let _ = remove_tunnel_record(paths, profile_id);
             return Err(Self::exited(process.as_mut(), code).await);
         }
         Ok(process)
@@ -389,6 +417,7 @@ impl TunnelManager {
     /// longer points at the tunnel (ADR-0009 Security), so Verify cannot revive it.
     pub async fn retire(&self, paths: &ClusterDeckPaths, profile_id: &str) {
         self.stop_tunnel(profile_id).await;
+        let _ = remove_tunnel_record(paths, profile_id);
         let _ = crate::services::state::clear_tunnel_target(paths, profile_id);
     }
 
@@ -400,6 +429,9 @@ impl TunnelManager {
                 entry.process.kill().await;
             }
         }
+        if let Ok(paths) = ClusterDeckPaths::resolve() {
+            let _ = remove_tunnel_record(&paths, profile_id);
+        }
     }
 
     /// Kills every stored tunnel without waiting on in-flight `ensure_tunnel` calls (`try_lock`):
@@ -408,6 +440,23 @@ impl TunnelManager {
     /// (through the runner; there is no libc dependency), because their tasks are never dropped
     /// before the process exits, so `kill_on_drop` cannot be relied on.
     pub async fn stop_all(&self, runner: &dyn CommandRunner) {
+        if let Ok(paths) = ClusterDeckPaths::resolve() {
+            self.stop_all_with_paths(runner, &paths).await;
+        } else {
+            self.stop_all_internal(runner).await;
+        }
+    }
+
+    pub async fn stop_all_with_paths(&self, runner: &dyn CommandRunner, paths: &ClusterDeckPaths) {
+        self.stop_all_internal(runner).await;
+        if let Ok(records) = list_tunnel_records(paths) {
+            for record in records {
+                let _ = remove_tunnel_record(paths, &record.profile_id);
+            }
+        }
+    }
+
+    async fn stop_all_internal(&self, runner: &dyn CommandRunner) {
         let slots: Vec<Slot> = self.slots.lock().await.values().cloned().collect();
         for slot in slots {
             if let Ok(mut guard) = slot.try_lock() {
@@ -429,6 +478,222 @@ impl TunnelManager {
                 .await;
         }
     }
+}
+
+/// A persisted record of a live or in-flight tunnel child process.
+/// Stored in `~/.clusterdeck/tunnels/<profile_id>.json`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TunnelRecord {
+    pub profile_id: String,
+    pub pid: u32,
+    pub port: u16,
+    pub target: TunnelTarget,
+    pub ssh_conf: PathBuf,
+    pub alias: String,
+    pub started_at_epoch_s: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReapOutcome {
+    Killed { pid: u32 },
+    AlreadyDead { pid: u32 },
+    PidRecycled { pid: u32, actual_cmdline: String },
+    Failed { pid: u32, reason: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReapResult {
+    pub profile_id: String,
+    pub outcome: ReapOutcome,
+}
+
+pub fn write_tunnel_record(paths: &ClusterDeckPaths, record: &TunnelRecord) -> Result<(), String> {
+    if !crate::services::validate::is_safe_profile_id(&record.profile_id) {
+        return Err("invalid profile id in tunnel record".to_string());
+    }
+    paths.ensure_dirs()?;
+    let path = paths.tunnel_pid_file(&record.profile_id);
+    let json = serde_json::to_string_pretty(record).map_err(|e| e.to_string())?;
+    std::fs::write(&path, json).map_err(|e| e.to_string())
+}
+
+pub fn remove_tunnel_record(paths: &ClusterDeckPaths, profile_id: &str) -> Result<(), String> {
+    if !crate::services::validate::is_safe_profile_id(profile_id) {
+        return Err("invalid profile id".to_string());
+    }
+    let path = paths.tunnel_pid_file(profile_id);
+    if path.exists() {
+        std::fs::remove_file(path).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+pub fn read_tunnel_record(
+    paths: &ClusterDeckPaths,
+    profile_id: &str,
+) -> Result<Option<TunnelRecord>, String> {
+    if !crate::services::validate::is_safe_profile_id(profile_id) {
+        return Err("invalid profile id".to_string());
+    }
+    let path = paths.tunnel_pid_file(profile_id);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    serde_json::from_str(&content)
+        .map(Some)
+        .map_err(|e| e.to_string())
+}
+
+pub fn list_tunnel_records(paths: &ClusterDeckPaths) -> Result<Vec<TunnelRecord>, String> {
+    let dir = paths.tunnels_dir();
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut records = Vec::new();
+    let entries = std::fs::read_dir(dir).map_err(|e| e.to_string())?;
+    for entry in entries {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) == Some("json") {
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                if let Ok(record) = serde_json::from_str::<TunnelRecord>(&content) {
+                    records.push(record);
+                }
+            }
+        }
+    }
+    Ok(records)
+}
+
+/// Strict 5-point signature check verifying whether a process command line matches ClusterDeck's
+/// SSH child process. Prevents PID recycling from killing innocent processes.
+pub fn is_matching_tunnel_cmdline(cmdline: &str, record: &TunnelRecord) -> bool {
+    for line in cmdline.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+        if tokens.is_empty() {
+            continue;
+        }
+        let bin = tokens[0];
+        let is_ssh = bin == "ssh" || bin.ends_with("/ssh");
+        if !is_ssh {
+            continue;
+        }
+        if !tokens.contains(&"-N") {
+            continue;
+        }
+        let conf_str = record.ssh_conf.to_string_lossy();
+        let conf_filename = format!("{}.conf", record.profile_id);
+        let has_conf = (tokens.contains(&"-F")
+            && (trimmed.contains(&*conf_str) || trimmed.contains(&conf_filename)))
+            || tokens
+                .windows(2)
+                .any(|w| w[0] == "-F" && (w[1] == conf_str || w[1].ends_with(&conf_filename)));
+        if !has_conf {
+            continue;
+        }
+        let port_pattern = format!("127.0.0.1:{}:", record.port);
+        let has_port = tokens.contains(&"-L") && trimmed.contains(&port_pattern);
+        if !has_port {
+            continue;
+        }
+        if !trimmed.contains(&record.alias) {
+            continue;
+        }
+        return true;
+    }
+    false
+}
+
+pub async fn reap_single_orphan(
+    runner: &dyn CommandRunner,
+    paths: &ClusterDeckPaths,
+    record: &TunnelRecord,
+) -> ReapOutcome {
+    let ps_res = runner
+        .run(
+            "ps",
+            &[
+                "-p".to_string(),
+                record.pid.to_string(),
+                "-o".to_string(),
+                "args=".to_string(),
+            ],
+        )
+        .await;
+
+    match ps_res {
+        Err(e) => ReapOutcome::Failed {
+            pid: record.pid,
+            reason: format!("failed to inspect process with ps: {e}"),
+        },
+        Ok(out) if !out.success || out.stdout.trim().is_empty() => {
+            // Process does not exist (already exited). Stale record cleaned up.
+            let _ = remove_tunnel_record(paths, &record.profile_id);
+            ReapOutcome::AlreadyDead { pid: record.pid }
+        }
+        Ok(out) => {
+            let cmdline = out.stdout.trim();
+            if is_matching_tunnel_cmdline(cmdline, record) {
+                // Verified ClusterDeck SSH child. Safe to kill.
+                let kill_res = runner
+                    .run("kill", &["-9".to_string(), record.pid.to_string()])
+                    .await;
+                let _ = remove_tunnel_record(paths, &record.profile_id);
+                match kill_res {
+                    Ok(k) if k.success => ReapOutcome::Killed { pid: record.pid },
+                    Ok(k) => ReapOutcome::Failed {
+                        pid: record.pid,
+                        reason: format!("kill exited non-zero: {}", k.stderr),
+                    },
+                    Err(e) => ReapOutcome::Failed {
+                        pid: record.pid,
+                        reason: format!("kill failed: {e}"),
+                    },
+                }
+            } else {
+                // PID recycled by OS! Spared from termination.
+                let _ = remove_tunnel_record(paths, &record.profile_id);
+                ReapOutcome::PidRecycled {
+                    pid: record.pid,
+                    actual_cmdline: cmdline.to_string(),
+                }
+            }
+        }
+    }
+}
+
+pub async fn reap_profile_orphan(
+    runner: &dyn CommandRunner,
+    paths: &ClusterDeckPaths,
+    profile_id: &str,
+) -> Option<ReapOutcome> {
+    let record = read_tunnel_record(paths, profile_id).ok()??;
+    Some(reap_single_orphan(runner, paths, &record).await)
+}
+
+pub async fn reap_orphans(runner: &dyn CommandRunner, paths: &ClusterDeckPaths) -> Vec<ReapResult> {
+    let records = match list_tunnel_records(paths) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[ClusterDeck] failed to list tunnel records for reaping: {e}");
+            return Vec::new();
+        }
+    };
+
+    let mut results = Vec::new();
+    for record in records {
+        let outcome = reap_single_orphan(runner, paths, &record).await;
+        results.push(ReapResult {
+            profile_id: record.profile_id.clone(),
+            outcome,
+        });
+    }
+    results
 }
 
 #[cfg(test)]
@@ -532,6 +797,7 @@ mod tests {
         /// Stdout of `lsof`; `None` makes lsof unavailable.
         lsof: Option<String>,
         killed: StdMutex<Vec<String>>,
+        ps_map: StdMutex<HashMap<u32, CommandOutput>>,
     }
 
     impl FakeRunner {
@@ -542,10 +808,26 @@ mod tests {
                 scripts,
                 lsof: None,
                 killed: StdMutex::new(Vec::new()),
+                ps_map: StdMutex::new(HashMap::new()),
             }
         }
         fn with_lsof(mut self, stdout: &str) -> Self {
             self.lsof = Some(stdout.to_string());
+            self
+        }
+        fn with_ps(self, pid: u32, stdout: &str, success: bool) -> Self {
+            self.ps_map.lock().unwrap().insert(
+                pid,
+                CommandOutput {
+                    stdout: stdout.to_string(),
+                    stderr: if success {
+                        String::new()
+                    } else {
+                        "No such process".to_string()
+                    },
+                    success,
+                },
+            );
             self
         }
     }
@@ -553,20 +835,38 @@ mod tests {
     #[async_trait]
     impl CommandRunner for FakeRunner {
         async fn run(&self, bin: &str, args: &[String]) -> Result<CommandOutput, String> {
-            match (bin, &self.lsof) {
-                ("lsof", Some(stdout)) => Ok(CommandOutput {
-                    stdout: stdout.clone(),
-                    stderr: String::new(),
-                    success: !stdout.is_empty(),
-                }),
-                ("lsof", None) => Err("'lsof' executable not found".to_string()),
-                ("kill", _) => {
+            match bin {
+                "lsof" => match &self.lsof {
+                    Some(stdout) => Ok(CommandOutput {
+                        stdout: stdout.clone(),
+                        stderr: String::new(),
+                        success: !stdout.is_empty(),
+                    }),
+                    None => Err("'lsof' executable not found".to_string()),
+                },
+                "kill" => {
                     self.killed.lock().unwrap().push(args.join(" "));
                     Ok(CommandOutput {
                         stdout: String::new(),
                         stderr: String::new(),
                         success: true,
                     })
+                }
+                "ps" => {
+                    let pid: u32 = args
+                        .windows(2)
+                        .find(|w| w[0] == "-p")
+                        .and_then(|w| w[1].parse().ok())
+                        .unwrap_or(0);
+                    if let Some(out) = self.ps_map.lock().unwrap().get(&pid) {
+                        Ok(out.clone())
+                    } else {
+                        Ok(CommandOutput {
+                            stdout: String::new(),
+                            stderr: "process not found".to_string(),
+                            success: false,
+                        })
+                    }
                 }
                 _ => Err(format!("unexpected run {bin}")),
             }
@@ -960,5 +1260,259 @@ mod tests {
             PORT_RANGE_START + (first - PORT_RANGE_START + 1) % PORT_RANGE_LEN
         );
         assert_eq!(runner.spawns.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn reap_orphans_kills_verified_ssh_process() {
+        let paths = temp_paths("reap-kill");
+        let prof = profile();
+        let port = preferred_port(&prof.id);
+        let pid = 4242;
+        let ssh_conf = paths.ssh_conf(&prof.id);
+        let alias = "lab-cp1";
+        let target = TunnelTarget {
+            host: "10.0.0.10".into(),
+            port: 6443,
+        };
+        let record = TunnelRecord {
+            profile_id: prof.id.clone(),
+            pid,
+            port,
+            target: target.clone(),
+            ssh_conf: ssh_conf.clone(),
+            alias: alias.into(),
+            started_at_epoch_s: 1700000000,
+        };
+        write_tunnel_record(&paths, &record).unwrap();
+        assert!(read_tunnel_record(&paths, &prof.id).unwrap().is_some());
+
+        let cmdline = format!(
+            "ssh -F {} -o BatchMode=yes -o ConnectTimeout=5 -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -N -L 127.0.0.1:{port}:10.0.0.10:6443 -- {alias}",
+            ssh_conf.display()
+        );
+        let runner = FakeRunner::new(vec![]).with_ps(pid, &cmdline, true);
+
+        let reaped = reap_orphans(&runner, &paths).await;
+        assert_eq!(reaped.len(), 1);
+        assert_eq!(reaped[0].profile_id, "lab");
+        assert_eq!(reaped[0].outcome, ReapOutcome::Killed { pid });
+        assert_eq!(*runner.killed.lock().unwrap(), vec![format!("-9 {pid}")]);
+        assert!(read_tunnel_record(&paths, &prof.id).unwrap().is_none());
+        std::fs::remove_dir_all(&paths.base).ok();
+    }
+
+    #[tokio::test]
+    async fn reap_orphans_spares_recycled_pid_process() {
+        let paths = temp_paths("reap-recycle");
+        let prof = profile();
+        let port = preferred_port(&prof.id);
+        let pid = 4242;
+        let ssh_conf = paths.ssh_conf(&prof.id);
+        let record = TunnelRecord {
+            profile_id: prof.id.clone(),
+            pid,
+            port,
+            target: TunnelTarget {
+                host: "10.0.0.10".into(),
+                port: 6443,
+            },
+            ssh_conf,
+            alias: "lab-cp1".into(),
+            started_at_epoch_s: 1700000000,
+        };
+        write_tunnel_record(&paths, &record).unwrap();
+
+        // PID 4242 was recycled by macOS for another innocent process (e.g. Google Chrome or personal SSH)
+        let innocent_cmdline =
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome --type=renderer";
+        let runner = FakeRunner::new(vec![]).with_ps(pid, innocent_cmdline, true);
+
+        let reaped = reap_orphans(&runner, &paths).await;
+        assert_eq!(reaped.len(), 1);
+        assert_eq!(reaped[0].profile_id, "lab");
+        assert!(matches!(
+            reaped[0].outcome,
+            ReapOutcome::PidRecycled { pid: 4242, .. }
+        ));
+        // CRITICAL: The innocent process must NOT have been killed!
+        assert!(runner.killed.lock().unwrap().is_empty());
+        // Stale record file must have been cleaned up
+        assert!(read_tunnel_record(&paths, &prof.id).unwrap().is_none());
+        std::fs::remove_dir_all(&paths.base).ok();
+    }
+
+    #[tokio::test]
+    async fn reap_orphans_cleans_up_already_dead_process() {
+        let paths = temp_paths("reap-dead");
+        let prof = profile();
+        let pid = 4242;
+        let record = TunnelRecord {
+            profile_id: prof.id.clone(),
+            pid,
+            port: preferred_port(&prof.id),
+            target: TunnelTarget {
+                host: "10.0.0.10".into(),
+                port: 6443,
+            },
+            ssh_conf: paths.ssh_conf(&prof.id),
+            alias: "lab-cp1".into(),
+            started_at_epoch_s: 1700000000,
+        };
+        write_tunnel_record(&paths, &record).unwrap();
+
+        // ps exits with error/not found
+        let runner = FakeRunner::new(vec![]).with_ps(pid, "", false);
+
+        let reaped = reap_orphans(&runner, &paths).await;
+        assert_eq!(reaped.len(), 1);
+        assert_eq!(reaped[0].profile_id, "lab");
+        assert_eq!(reaped[0].outcome, ReapOutcome::AlreadyDead { pid });
+        assert!(runner.killed.lock().unwrap().is_empty());
+        assert!(read_tunnel_record(&paths, &prof.id).unwrap().is_none());
+        std::fs::remove_dir_all(&paths.base).ok();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ensure_tunnel_reaps_orphan_and_reclaims_preferred_port() {
+        let paths = temp_paths("reclaim-preferred");
+        let prof = profile();
+        let preferred = preferred_port(&prof.id);
+        let orphan_pid = 7777;
+        let ssh_conf = paths.ssh_conf(&prof.id);
+        let alias = "lab-cp1";
+
+        // Seed an orphan record from a previous crash holding the preferred port
+        let orphan_record = TunnelRecord {
+            profile_id: prof.id.clone(),
+            pid: orphan_pid,
+            port: preferred,
+            target: TunnelTarget {
+                host: "10.0.0.10".into(),
+                port: 6443,
+            },
+            ssh_conf: ssh_conf.clone(),
+            alias: alias.into(),
+            started_at_epoch_s: 1700000000,
+        };
+        write_tunnel_record(&paths, &orphan_record).unwrap();
+
+        let cmdline = format!(
+            "ssh -F {} -o BatchMode=yes -o ConnectTimeout=5 -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -N -L 127.0.0.1:{preferred}:10.0.0.10:6443 -- {alias}",
+            ssh_conf.display()
+        );
+        let mut script = Script::alive();
+        script.pid = Some(8888);
+        let runner = FakeRunner::new(vec![script]).with_ps(orphan_pid, &cmdline, true);
+        let manager = TunnelManager::new(FakeProbe::new(true));
+
+        let port = manager
+            .ensure_tunnel(&runner, &paths, &prof, "10.0.0.10", 6443)
+            .await
+            .unwrap();
+
+        // 1. The orphan was reaped and killed before selecting the port
+        assert_eq!(
+            *runner.killed.lock().unwrap(),
+            vec![format!("-9 {orphan_pid}")]
+        );
+        // 2. Preferred port was successfully reclaimed
+        assert_eq!(port, preferred);
+        // 3. New record written for the active tunnel
+        let current_rec = read_tunnel_record(&paths, &prof.id).unwrap().unwrap();
+        assert_eq!(current_rec.pid, 8888);
+        assert_eq!(current_rec.port, preferred);
+
+        std::fs::remove_dir_all(&paths.base).ok();
+    }
+
+    #[tokio::test]
+    async fn crash_during_readiness_leaves_record_for_startup_reap() {
+        let paths = temp_paths("crash-readiness");
+        let prof = profile();
+        let port = preferred_port(&prof.id);
+        let pid = 9999;
+        let ssh_conf = paths.ssh_conf(&prof.id);
+
+        // Simulate crash: an in-flight tunnel was spawned, wrote record, then app died
+        let record = TunnelRecord {
+            profile_id: prof.id.clone(),
+            pid,
+            port,
+            target: TunnelTarget {
+                host: "10.0.0.10".into(),
+                port: 6443,
+            },
+            ssh_conf: ssh_conf.clone(),
+            alias: "lab-cp1".into(),
+            started_at_epoch_s: 1700000000,
+        };
+        write_tunnel_record(&paths, &record).unwrap();
+
+        let cmdline = format!(
+            "/usr/bin/ssh -F {} -N -L 127.0.0.1:{port}:10.0.0.10:6443 -- lab-cp1",
+            ssh_conf.display()
+        );
+        let runner = FakeRunner::new(vec![]).with_ps(pid, &cmdline, true);
+
+        // Next app startup reaps the crashed child
+        let reaped = reap_orphans(&runner, &paths).await;
+        assert_eq!(reaped.len(), 1);
+        assert_eq!(reaped[0].outcome, ReapOutcome::Killed { pid });
+        assert_eq!(*runner.killed.lock().unwrap(), vec![format!("-9 {pid}")]);
+        assert!(read_tunnel_record(&paths, &prof.id).unwrap().is_none());
+
+        std::fs::remove_dir_all(&paths.base).ok();
+    }
+
+    #[test]
+    fn is_matching_tunnel_cmdline_edge_cases() {
+        let record = TunnelRecord {
+            profile_id: "lab".into(),
+            pid: 1234,
+            port: 16443,
+            target: TunnelTarget {
+                host: "10.0.0.10".into(),
+                port: 6443,
+            },
+            ssh_conf: PathBuf::from("/Users/test/.clusterdeck/ssh/lab.conf"),
+            alias: "lab-cp1".into(),
+            started_at_epoch_s: 1700000000,
+        };
+
+        // 1. Valid exact line -> true
+        let valid = "ssh -F /Users/test/.clusterdeck/ssh/lab.conf -o BatchMode=yes -N -L 127.0.0.1:16443:10.0.0.10:6443 -- lab-cp1";
+        assert!(is_matching_tunnel_cmdline(valid, &record));
+
+        // 2. /usr/bin/ssh path -> true
+        let valid_path = "/usr/bin/ssh -F /Users/test/.clusterdeck/ssh/lab.conf -N -L 127.0.0.1:16443:10.0.0.10:6443 -- lab-cp1";
+        assert!(is_matching_tunnel_cmdline(valid_path, &record));
+
+        // 3. Multiline with ps header -> true
+        let multiline = "COMMAND\nssh -F /Users/test/.clusterdeck/ssh/lab.conf -N -L 127.0.0.1:16443:10.0.0.10:6443 -- lab-cp1\n";
+        assert!(is_matching_tunnel_cmdline(multiline, &record));
+
+        // 4. Non-ssh binary -> false
+        let python = "python3 -F /Users/test/.clusterdeck/ssh/lab.conf -N -L 127.0.0.1:16443:10.0.0.10:6443 -- lab-cp1";
+        assert!(!is_matching_tunnel_cmdline(python, &record));
+
+        // 5. Missing -N flag -> false
+        let missing_n = "ssh -F /Users/test/.clusterdeck/ssh/lab.conf -L 127.0.0.1:16443:10.0.0.10:6443 -- lab-cp1";
+        assert!(!is_matching_tunnel_cmdline(missing_n, &record));
+
+        // 6. Mismatched config file -> false
+        let wrong_conf = "ssh -F /Users/test/.clusterdeck/ssh/other.conf -N -L 127.0.0.1:16443:10.0.0.10:6443 -- lab-cp1";
+        assert!(!is_matching_tunnel_cmdline(wrong_conf, &record));
+
+        // 7. Mismatched port -> false
+        let wrong_port = "ssh -F /Users/test/.clusterdeck/ssh/lab.conf -N -L 127.0.0.1:16444:10.0.0.10:6443 -- lab-cp1";
+        assert!(!is_matching_tunnel_cmdline(wrong_port, &record));
+
+        // 8. Mismatched alias -> false
+        let wrong_alias = "ssh -F /Users/test/.clusterdeck/ssh/lab.conf -N -L 127.0.0.1:16443:10.0.0.10:6443 -- other-cp1";
+        assert!(!is_matching_tunnel_cmdline(wrong_alias, &record));
+
+        // 9. Empty or whitespace -> false
+        assert!(!is_matching_tunnel_cmdline("", &record));
+        assert!(!is_matching_tunnel_cmdline("   \n\t  ", &record));
     }
 }

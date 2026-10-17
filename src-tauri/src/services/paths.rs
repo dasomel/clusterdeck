@@ -49,9 +49,19 @@ impl ClusterDeckPaths {
         self.base.join("dns").join("endpoints.json")
     }
 
+    pub fn tunnels_dir(&self) -> PathBuf {
+        self.base.join("tunnels")
+    }
+
+    pub fn tunnel_pid_file(&self, profile_id: &str) -> PathBuf {
+        debug_assert!(crate::services::validate::is_safe_profile_id(profile_id));
+        self.tunnels_dir().join(format!("{profile_id}.json"))
+    }
+
     pub fn ensure_dirs(&self) -> Result<(), String> {
         std::fs::create_dir_all(self.ssh_dir()).map_err(|e| e.to_string())?;
         std::fs::create_dir_all(self.kubeconfigs_dir()).map_err(|e| e.to_string())?;
+        std::fs::create_dir_all(self.tunnels_dir()).map_err(|e| e.to_string())?;
         Ok(())
     }
 }
@@ -75,6 +85,10 @@ mod tests {
             paths.kubeconfig_file("cka"),
             std::path::PathBuf::from("/tmp/clusterdeck-test-fixture/kubeconfigs/cka.yaml")
         );
+        assert_eq!(
+            paths.tunnel_pid_file("cka"),
+            std::path::PathBuf::from("/tmp/clusterdeck-test-fixture/tunnels/cka.json")
+        );
     }
 
     #[test]
@@ -84,6 +98,7 @@ mod tests {
         paths.ensure_dirs().unwrap();
         assert!(paths.ssh_dir().is_dir());
         assert!(paths.kubeconfigs_dir().is_dir());
+        assert!(paths.tunnels_dir().is_dir());
         std::fs::remove_dir_all(&dir).ok();
     }
 }
