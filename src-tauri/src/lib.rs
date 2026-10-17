@@ -8,6 +8,21 @@ pub fn run() {
         .manage(services::local_runtime_lifecycle::LifecycleGuard::default())
         .manage(services::store::ProfileWriteGuard)
         .setup(|_app| {
+            // ADR-0009 / Issue #97: Reap orphaned SSH tunnels left by previous crash/force-restart
+            if let Ok(paths) = services::paths::ClusterDeckPaths::resolve() {
+                tauri::async_runtime::spawn(async move {
+                    let runner = services::process::SystemRunner;
+                    let reaped = services::tunnel::reap_orphans(&runner, &paths).await;
+                    for r in reaped {
+                        if let services::tunnel::ReapOutcome::Killed { pid } = r.outcome {
+                            eprintln!(
+                                "[ClusterDeck] reaped orphaned SSH tunnel (PID {}, profile '{}')",
+                                pid, r.profile_id
+                            );
+                        }
+                    }
+                });
+            }
             // D4: never blocks startup; prompts only if our resolver files must be removed.
             tauri::async_runtime::spawn(commands::local_dns::startup_task());
             Ok(())
