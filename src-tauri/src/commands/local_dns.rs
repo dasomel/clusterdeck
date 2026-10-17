@@ -377,6 +377,7 @@ async fn disable(
                 zones: empty,
                 approved_switches: &[],
                 hosts,
+                scope_profile: None,
             },
         )
         .await?;
@@ -457,6 +458,7 @@ pub(crate) async fn reapply_locked<'a>(
     exclude: Option<&str>,
     hosts: Option<HostsUpdate<'_>>,
     record: Option<EndpointRecordUpdate<'a>>,
+    scope: Option<&str>,
 ) -> Result<(DnsApplyView, EndpointCache), String> {
     let profiles: Vec<Profile> = store::load_profiles(paths)?
         .into_iter()
@@ -507,6 +509,7 @@ pub(crate) async fn reapply_locked<'a>(
             zones: build.zones.clone(),
             approved_switches: &switches,
             hosts,
+            scope_profile: scope,
         },
     )
     .await?;
@@ -566,7 +569,7 @@ pub async fn reapply(
         endpoints,
         succeeded_kinds: None,
     });
-    let (view, _) = reapply_locked(paths, env, exclude, hosts, rec).await?;
+    let (view, _) = reapply_locked(paths, env, exclude, hosts, rec, exclude).await?;
     Ok(view)
 }
 
@@ -721,7 +724,7 @@ async fn sync_local_dns_profile_impl(
         .map(|inp| inp.failed_kinds.clone())
         .unwrap_or_default();
 
-    let (view, cached) = reapply_locked(paths, env, None, hosts, record).await?;
+    let (view, cached) = reapply_locked(paths, env, None, hosts, record, Some(&profile.id)).await?;
     let view = view.for_profile(&profile.id);
 
     let served_endpoints = cached.get(&profile.id).cloned().unwrap_or_default();
@@ -1069,7 +1072,7 @@ pub(crate) async fn reapply_after_save_locked(
         }),
         _ => None,
     };
-    let (view, _) = reapply_locked(paths, env, None, hosts, None).await?;
+    let (view, _) = reapply_locked(paths, env, None, hosts, None, Some(&latest.id)).await?;
     Ok(Some(view))
 }
 
@@ -1156,7 +1159,7 @@ async fn mutate_then_apply(
         return Ok(DnsApplyView::default());
     }
     let dns = SystemDns::resolve()?;
-    let (view, _) = reapply_locked(&paths, &dns.env(), None, None, None).await?;
+    let (view, _) = reapply_locked(&paths, &dns.env(), None, None, None, Some(profile_id)).await?;
     Ok(view)
 }
 

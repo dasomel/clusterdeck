@@ -75,6 +75,7 @@ pub struct ApplyRequest<'a> {
     /// `(zone, from_owner, to_owner)` as accepted by `plan_changes_for_port`.
     pub approved_switches: &'a [(String, String, String)],
     pub hosts: Option<HostsUpdate<'a>>,
+    pub scope_profile: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -481,12 +482,36 @@ pub async fn apply(env: &ManagerEnv<'_>, req: ApplyRequest<'_>) -> Result<ApplyR
         }
     }
 
+    if let Some(target_id) = req.scope_profile {
+        let is_in_scope = |zone: &str, profile: &str| -> bool {
+            profile == target_id
+                || req
+                    .approved_switches
+                    .iter()
+                    .any(|(z, f, t)| z == zone && (f == target_id || t == target_id))
+        };
+        plan.write
+            .retain(|(zone, winner)| is_in_scope(zone, winner));
+        plan.remove.retain(|(zone, owner)| is_in_scope(zone, owner));
+    }
+
     let conflicted: HashSet<&str> = plan.conflicts.iter().map(|c| c.zone.as_str()).collect();
+    let on_disk_names: HashSet<&str> = listing.files.iter().map(|(n, _)| n.as_str()).collect();
+    let will_write_names: HashSet<&str> = plan.write.iter().map(|(z, _)| z.as_str()).collect();
+
     let free: Vec<ZoneEntry> = req
         .zones
         .zones
         .iter()
         .filter(|z| !conflicted.contains(z.zone.as_str()))
+        .filter(|z| {
+            if req.scope_profile.is_some() {
+                on_disk_names.contains(z.zone.as_str())
+                    || will_write_names.contains(z.zone.as_str())
+            } else {
+                true
+            }
+        })
         .cloned()
         .collect();
     let mut result = ApplyResult {
@@ -1147,6 +1172,7 @@ mod tests {
             zones: z,
             approved_switches: &[],
             hosts: None,
+            scope_profile: None,
         }
     }
 
@@ -1767,6 +1793,7 @@ mod tests {
                     path: &hosts,
                     compute: &compute,
                 }),
+                scope_profile: None,
             },
         )
         .await
@@ -1826,6 +1853,7 @@ mod tests {
                     path: &hosts,
                     compute: &compute,
                 }),
+                scope_profile: None,
             },
         )
         .await
@@ -1851,6 +1879,7 @@ mod tests {
                     path: &hosts,
                     compute: &compute,
                 }),
+                scope_profile: None,
             },
         )
         .await
