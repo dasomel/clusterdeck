@@ -132,6 +132,7 @@ pub(crate) async fn delete_profile_internal(
         Some(&profile_id),
         None,
         None,
+        Some(&profile_id),
     )
     .await
     .map_err(|e| format!("profile deleted, but updating local DNS failed: {e}"))?;

@@ -162,6 +162,8 @@ Because DNS records are loaded from user space (`~/.clusterdeck/dns/zones.json`)
   2. Adding or updating endpoints when pods or services change IP addresses.
   3. Modifying node aliases or bastion targets within an existing profile.
   4. Periodic cluster sync or rescan (**Scan Endpoints** / **Sync to local DNS**).
+- **Scoped Resolver Operations:**
+  When saving a profile, switching host mapping, syncing local DNS, or deleting a profile, `/etc/resolver` operations are strictly scoped to that modified profile. Pending, unapproved, or unapplied zone changes belonging to other profiles are never carried over or unintentionally applied during these operations.
 
 ---
 

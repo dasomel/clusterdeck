@@ -216,9 +216,13 @@ mod test_support {
                                 if let Some(end_quote) = after_target.find('\'') {
                                     let target_path = &after_target[..end_quote];
                                     let prefix = &search[..mv_pos];
-                                    if let Some(marker_pos) =
-                                        prefix.rfind("# managed by ClusterDeck (profile: ")
-                                    {
+                                    let marker_opt = prefix
+                                        .rfind("/usr/bin/printf '%s\\\\n' '")
+                                        .map(|p| p + "/usr/bin/printf '%s\\\\n' '".len())
+                                        .or_else(|| {
+                                            prefix.rfind("# managed by ClusterDeck (profile: ")
+                                        });
+                                    if let Some(marker_pos) = marker_opt {
                                         let rest_marker = &prefix[marker_pos..];
                                         if let Some(marker_end) = rest_marker.find('\'') {
                                             let marker_line = &rest_marker[..marker_end];
