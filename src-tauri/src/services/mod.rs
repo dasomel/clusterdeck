@@ -11,6 +11,7 @@ pub mod local_runtime;
 pub mod local_runtime_lifecycle;
 pub mod paths;
 pub mod process;
+pub mod profile_document;
 pub mod resolver_files;
 pub mod ssh;
 pub mod ssh_config;

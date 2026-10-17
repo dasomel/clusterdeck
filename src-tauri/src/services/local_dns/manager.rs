@@ -39,6 +39,7 @@ pub struct ManagerEnv<'a> {
     pub port: u16,
     pub status_timeout: Duration,
     pub status_poll: Duration,
+    pub protect_resolver: bool,
 }
 
 impl<'a> ManagerEnv<'a> {
@@ -57,6 +58,7 @@ impl<'a> ManagerEnv<'a> {
             port,
             status_timeout: STATUS_WAIT,
             status_poll: STATUS_POLL,
+            protect_resolver: false,
         }
     }
 }
@@ -76,6 +78,7 @@ pub struct ApplyRequest<'a> {
     pub approved_switches: &'a [(String, String, String)],
     pub hosts: Option<HostsUpdate<'a>>,
     pub scope_profile: Option<&'a str>,
+    pub protect_resolver: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -495,6 +498,10 @@ pub async fn apply(env: &ManagerEnv<'_>, req: ApplyRequest<'_>) -> Result<ApplyR
         plan.remove.retain(|(zone, owner)| is_in_scope(zone, owner));
     }
 
+    if req.protect_resolver || env.protect_resolver {
+        plan.remove.clear();
+    }
+
     let conflicted: HashSet<&str> = plan.conflicts.iter().map(|c| c.zone.as_str()).collect();
     let on_disk_names: HashSet<&str> = listing.files.iter().map(|(n, _)| n.as_str()).collect();
     let will_write_names: HashSet<&str> = plan.write.iter().map(|(z, _)| z.as_str()).collect();
@@ -708,6 +715,12 @@ fn remaining_marker_files(listing: &Listing) -> Vec<String> {
 /// cancelled prompt, or any entry whose ownership cannot be read, leaves the agent running.
 pub async fn teardown(env: &ManagerEnv<'_>) -> Result<TeardownResult, String> {
     let _guard = MANAGER_MUTEX.lock().await;
+    if env.protect_resolver {
+        return Err(
+            "refusing to teardown local DNS: profiles.yaml contains unreadable or invalid entries"
+                .to_string(),
+        );
+    }
     let listing = read_resolver_listing(env.resolver_dir)?;
     let blockers = unreadable_candidates(&listing);
     if !blockers.is_empty() {
@@ -1173,6 +1186,7 @@ mod tests {
             approved_switches: &[],
             hosts: None,
             scope_profile: None,
+            protect_resolver: false,
         }
     }
 
@@ -1794,6 +1808,7 @@ mod tests {
                     compute: &compute,
                 }),
                 scope_profile: None,
+                protect_resolver: false,
             },
         )
         .await
@@ -1854,6 +1869,7 @@ mod tests {
                     compute: &compute,
                 }),
                 scope_profile: None,
+                protect_resolver: false,
             },
         )
         .await
@@ -1880,6 +1896,7 @@ mod tests {
                     compute: &compute,
                 }),
                 scope_profile: None,
+                protect_resolver: false,
             },
         )
         .await

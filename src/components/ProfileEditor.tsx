@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Plus, Trash2, X, Download, Search, RefreshCw } from 'lucide-react';
 import { useStatus } from '../state/StatusContext';
 import {
@@ -96,6 +96,15 @@ export default function ProfileEditor({ initial, onClose, onSaved, onDeleteReque
 
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
+  const [baseFingerprint, setBaseFingerprint] = useState<string | undefined>(undefined);
+
+  useEffect(() => {
+    if (initial?.id) {
+      api.getProfileFingerprint(initial.id).then((fp) => {
+        if (fp) setBaseFingerprint(fp);
+      }).catch(() => {});
+    }
+  }, [initial?.id]);
 
   const handleDelete = () => {
     if (!initial) return;
@@ -373,7 +382,7 @@ export default function ProfileEditor({ initial, onClose, onSaved, onDeleteReque
     try {
       setSaving(true);
       setSaveError(null);
-      const view = await api.saveProfile(finalProfile);
+      const view = await api.saveProfile(finalProfile, baseFingerprint);
       if (view?.cancelled) {
         pushStatus('warning', 'Profile Saved (DNS Incomplete)', [
           'Admin approval was cancelled; local DNS was not updated.',

@@ -71,7 +71,7 @@ async fn trust_ca_internal(
     profile_id: &str,
     secret_ref: &str,
 ) -> Result<TrustedCa, String> {
-    let mut profile = store::get_profile(paths, profile_id)?;
+    let _ = store::get_profile(paths, profile_id)?;
     let kubeconfig_path = paths.kubeconfig_file(profile_id);
     if !kubeconfig_path.exists() {
         return Err("kubeconfig not found for profile; please connect first".to_string());
@@ -91,9 +91,10 @@ async fn trust_ca_internal(
     };
     // Idempotent: replaces any prior record for this secret_ref rather than duplicating it,
     // so re-confirming an already-Trusted CA (or completing a Rotated -> trust cycle) is safe.
-    profile.trusted_cas.retain(|c| c.secret_ref != secret_ref);
-    profile.trusted_cas.push(record.clone());
-    store::upsert_profile(paths, profile)?;
+    let record_clone = record.clone();
+    store::patch_profile(paths, profile_id, |m| {
+        crate::services::profile_document::patch::set_trusted_ca(m, &record_clone)
+    })?;
 
     Ok(record)
 }
@@ -146,10 +147,9 @@ pub async fn replace_ca_cmd(
             // one failed to go in -- keeping the stale record would report a false "trusted"
             // status on the next discover. Drop it so the CA correctly shows as untrusted
             // again rather than lying about its state.
-            if let Ok(mut profile) = store::get_profile(&paths, &profile_id) {
-                profile.trusted_cas.retain(|c| c.secret_ref != secret_ref);
-                let _ = store::upsert_profile(&paths, profile);
-            }
+            let _ = store::patch_profile(&paths, &profile_id, |m| {
+                crate::services::profile_document::patch::remove_trusted_ca(m, &secret_ref)
+            });
             Err(e)
         }
     }
@@ -163,7 +163,7 @@ pub async fn remove_ca_cmd(
 ) -> Result<(), String> {
     let _lock = guard.lock().await;
     let paths = ClusterDeckPaths::resolve()?;
-    let mut profile = store::get_profile(&paths, &profile_id)?;
+    let profile = store::get_profile(&paths, &profile_id)?;
     let runner = SystemRunner;
 
     if let Some(record) = profile
@@ -176,6 +176,7 @@ pub async fn remove_ca_cmd(
         // own bookkeeping -- the user's intent is "stop tracking this as trusted".
         let _ = ca_trust::untrust_ca(&runner, &record.fingerprint_sha1).await;
     }
-    profile.trusted_cas.retain(|c| c.secret_ref != secret_ref);
-    store::upsert_profile(&paths, profile)
+    store::patch_profile(&paths, &profile_id, |m| {
+        crate::services::profile_document::patch::remove_trusted_ca(m, &secret_ref)
+    })
 }

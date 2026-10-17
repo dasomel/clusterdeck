@@ -33,7 +33,13 @@ export * from './types';
 export const api = {
   listProfiles: () => invoke<Profile[]>('list_profiles'),
   getProfile: (profileId: string) => invoke<Profile>('get_profile_cmd', { profileId }),
-  saveProfile: (profile: Profile) => invoke<DnsApplyView | null>('save_profile', { profile }),
+  getProfileFingerprint: (profileId: string) =>
+    invoke<string | null>('get_profile_fingerprint_cmd', { profileId }),
+  listInvalidProfiles: () => invoke<import('./types').InvalidProfileView[]>('list_invalid_profiles_cmd'),
+  deleteInvalidProfile: (key: string, expectedFingerprint: string) =>
+    invoke<void>('delete_invalid_profile_cmd', { key, expectedFingerprint }),
+  saveProfile: (profile: Profile, baseFingerprint?: string) =>
+    invoke<DnsApplyView | null>('save_profile', { profile, baseFingerprint }),
   deleteProfile: (profileId: string) => invoke<DnsApplyView | null>('delete_profile_cmd', { profileId }),
   discoverHosts: (input: string, port?: number) => invoke<DiscoveredHost[]>('discover_hosts', { input, port }),
   probeProfileHosts: (profileId: string, password?: string) =>
