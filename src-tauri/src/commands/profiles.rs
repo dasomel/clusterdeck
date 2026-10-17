@@ -7,6 +7,35 @@ pub fn list_profiles() -> Result<Vec<Profile>, String> {
 }
 
 #[tauri::command]
+pub fn list_invalid_profiles_cmd(
+) -> Result<Vec<crate::services::profile_document::InvalidProfileView>, String> {
+    let paths = ClusterDeckPaths::resolve()?;
+    let doc = store::load_document(&paths)?;
+    Ok(doc.invalid())
+}
+
+#[tauri::command]
+pub async fn delete_invalid_profile_cmd(
+    guard: tauri::State<'_, crate::services::store::ProfileWriteGuard>,
+    key: String,
+    expected_fingerprint: String,
+) -> Result<(), String> {
+    let _write_lock = guard.lock().await;
+    let paths = ClusterDeckPaths::resolve()?;
+    store::delete_invalid(&paths, &key, &expected_fingerprint)
+}
+
+#[tauri::command]
+pub fn get_profile_fingerprint_cmd(profile_id: String) -> Result<Option<String>, String> {
+    let paths = ClusterDeckPaths::resolve()?;
+    let doc = store::load_document(&paths)?;
+    Ok(doc
+        .raw(&profile_id)
+        .as_ref()
+        .map(crate::services::store::fingerprint))
+}
+
+#[tauri::command]
 pub fn get_profile_cmd(profile_id: String) -> Result<Profile, String> {
     let paths = ClusterDeckPaths::resolve()?;
     store::get_profile(&paths, &profile_id)
@@ -16,7 +45,11 @@ pub fn get_profile_cmd(profile_id: String) -> Result<Profile, String> {
 // temp ClusterDeckPaths, the same way services/store.rs's functions are -- `save_profile` itself
 // hardcodes ClusterDeckPaths::resolve() (reads $HOME), which a test should not override via a
 // global env var mutation.
-fn save_profile_with_paths(paths: &ClusterDeckPaths, mut profile: Profile) -> Result<(), String> {
+fn save_profile_with_paths(
+    paths: &ClusterDeckPaths,
+    mut profile: Profile,
+    base_fingerprint: Option<&str>,
+) -> Result<(), String> {
     // trusted_cas is backend-owned: it's only ever mutated by trust_ca_cmd/replace_ca_cmd
     // (services/ca_trust.rs), never by the profile-editor form. Preserve whatever is currently
     // stored rather than trusting the frontend's copy, which can be stale -- otherwise saving
@@ -25,7 +58,7 @@ fn save_profile_with_paths(paths: &ClusterDeckPaths, mut profile: Profile) -> Re
     if let Ok(existing) = store::get_profile(paths, &profile.id) {
         profile.trusted_cas = existing.trusted_cas;
     }
-    store::upsert_profile(paths, profile)
+    store::upsert_profile_editor(paths, profile, base_fingerprint)
 }
 
 use crate::commands::local_dns::DnsApplyView;
@@ -34,18 +67,21 @@ use crate::commands::local_dns::DnsApplyView;
 pub async fn save_profile(
     guard: tauri::State<'_, crate::services::store::ProfileWriteGuard>,
     profile: Profile,
+    base_fingerprint: Option<String>,
 ) -> Result<Option<DnsApplyView>, String> {
     let paths = ClusterDeckPaths::resolve()?;
-    save_profile_internal(
+    save_profile_internal_with_fp(
         &paths,
         &guard,
         profile,
+        base_fingerprint.as_deref(),
         crate::commands::local_dns::SystemDns::resolve,
         crate::commands::local_dns::hosts_path(),
     )
     .await
 }
 
+#[cfg(test)]
 pub(crate) async fn save_profile_internal<R>(
     paths: &ClusterDeckPaths,
     guard: &crate::services::store::ProfileWriteGuard,
@@ -56,11 +92,25 @@ pub(crate) async fn save_profile_internal<R>(
 where
     R: FnOnce() -> Result<crate::commands::local_dns::SystemDns, String>,
 {
+    save_profile_internal_with_fp(paths, guard, profile, None, resolve_dns, hosts_path).await
+}
+
+pub(crate) async fn save_profile_internal_with_fp<R>(
+    paths: &ClusterDeckPaths,
+    guard: &crate::services::store::ProfileWriteGuard,
+    profile: Profile,
+    base_fingerprint: Option<&str>,
+    resolve_dns: R,
+    hosts_path: &std::path::Path,
+) -> Result<Option<DnsApplyView>, String>
+where
+    R: FnOnce() -> Result<crate::commands::local_dns::SystemDns, String>,
+{
     let _write_lock = guard.lock().await;
     let _lane_lock = crate::commands::local_dns::lock_lane().await;
 
     let old = store::get_profile(paths, &profile.id).ok();
-    save_profile_with_paths(paths, profile.clone())?;
+    save_profile_with_paths(paths, profile.clone(), base_fingerprint)?;
 
     let latest = store::get_profile(paths, &profile.id).unwrap_or(profile);
     if !crate::commands::local_dns::needs_reapply_after_save(old.as_ref(), &latest)
@@ -207,7 +257,7 @@ mod tests {
         // `trusted_cas: []` because its in-memory `profiles` array was never refreshed after
         // the earlier trust action, per Fix 1's bug description.
         let edited_with_stale_empty_cas = sample_profile("cka", vec![]);
-        save_profile_with_paths(&paths, edited_with_stale_empty_cas).unwrap();
+        save_profile_with_paths(&paths, edited_with_stale_empty_cas, None).unwrap();
 
         let reloaded = store::get_profile(&paths, "cka").unwrap();
         assert_eq!(
@@ -226,7 +276,7 @@ mod tests {
         // Ok` guard in save_profile_with_paths must not fire, and the given (empty) trusted_cas
         // is what gets saved.
         assert!(store::get_profile(&paths, "fresh").is_err());
-        save_profile_with_paths(&paths, sample_profile("fresh", vec![])).unwrap();
+        save_profile_with_paths(&paths, sample_profile("fresh", vec![]), None).unwrap();
 
         let reloaded = store::get_profile(&paths, "fresh").unwrap();
         assert_eq!(reloaded.trusted_cas.len(), 0);

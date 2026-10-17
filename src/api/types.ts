@@ -51,6 +51,12 @@ export type Profile = {
   local_runtime?: LocalRuntimeSource | null;
 };
 
+export interface InvalidProfileView {
+  key: string;
+  reason: string;
+  fingerprint: string;
+}
+
 export type HostStageResult = { host: string; reachable: boolean; detail: string };
 
 export type BootstrapResult = { host: string; key_deployed: boolean; verified: boolean; detail: string };

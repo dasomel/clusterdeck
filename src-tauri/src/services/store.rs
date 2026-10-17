@@ -1,85 +1,28 @@
 #![allow(dead_code)]
 
-use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
-
-use crate::services::config::{
-    Bastion, BootstrapPolicy, Host, HostMapping, KubeconfigSource, LocalRuntimeSource, Profile,
-};
+use crate::services::config::Profile;
 use crate::services::paths::ClusterDeckPaths;
+use crate::services::profile_document::{patch, EntryState, ProfileDocument, CHANGED_ELSEWHERE};
 
-#[derive(Serialize, Deserialize, Default)]
-struct ProfilesFile {
-    #[serde(default)]
-    profiles: BTreeMap<String, ProfileBody>,
-}
-
-#[derive(Serialize, Deserialize)]
-struct ProfileBody {
-    name: String,
-    #[serde(default)]
-    hosts: Vec<Host>,
-    #[serde(default)]
-    bastion: Option<Bastion>,
-    #[serde(default)]
-    bootstrap: BootstrapPolicy,
-    #[serde(default)]
-    kubeconfig: Option<KubeconfigSource>,
-    /// Legacy bool, still written (true iff `host_mapping == Hosts`) so an older build that
-    /// reads this file keeps Hosts profiles working (plan R9). Only the fallback on read.
-    #[serde(default)]
-    manage_hosts_file: bool,
-    /// Wins over `manage_hosts_file` when present.
-    #[serde(default)]
-    host_mapping: Option<HostMapping>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    approved_dns_zones: Vec<String>,
-    #[serde(default)]
-    trusted_cas: Vec<crate::services::ca_trust::TrustedCa>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    gateway_address: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    local_runtime: Option<LocalRuntimeSource>,
-}
+pub use crate::services::profile_document::fingerprint;
 
 pub fn load_profiles(paths: &ClusterDeckPaths) -> Result<Vec<Profile>, String> {
+    let doc = ProfileDocument::load(paths)?;
     let file_path = paths.profiles_file();
-    if !file_path.exists() {
-        return Ok(Vec::new());
+    for e in doc.entries() {
+        if let EntryState::Invalid { reason } = e.state {
+            eprintln!(
+                "skipping invalid profile '{}' loaded from {}: {reason}",
+                e.key,
+                file_path.display()
+            );
+        }
     }
-    let content = std::fs::read_to_string(&file_path).map_err(|e| e.to_string())?;
-    let parsed: ProfilesFile = serde_yaml::from_str(&content).map_err(|e| e.to_string())?;
-    let profiles = parsed
-        .profiles
-        .into_iter()
-        .filter_map(|(id, body)| {
-            let profile = Profile {
-                id,
-                name: body.name,
-                hosts: body.hosts,
-                bastion: body.bastion,
-                bootstrap: body.bootstrap,
-                kubeconfig: body.kubeconfig,
-                host_mapping: HostMapping::migrate(body.host_mapping, body.manage_hosts_file),
-                approved_dns_zones: body.approved_dns_zones,
-                trusted_cas: body.trusted_cas,
-                gateway_address: body.gateway_address,
-                local_runtime: body.local_runtime,
-            };
-            match crate::services::validate::validate_profile(&profile) {
-                Ok(()) => Some(profile),
-                Err(e) => {
-                    eprintln!(
-                        "skipping invalid profile '{}' loaded from {}: {e}",
-                        profile.id,
-                        file_path.display()
-                    );
-                    None
-                }
-            }
-        })
-        .collect();
-    Ok(profiles)
+    Ok(doc.profiles())
+}
+
+pub fn load_document(paths: &ClusterDeckPaths) -> Result<ProfileDocument, String> {
+    ProfileDocument::load(paths)
 }
 
 static PROFILE_WRITE_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -100,131 +43,25 @@ impl ProfileWriteGuard {
     }
 }
 
-/// True when any profile mapping in `yaml` already has a `host_mapping` key. Unparseable
-/// content counts as "no" so it gets backed up rather than silently overwritten.
-fn has_host_mapping_key(yaml: &str) -> bool {
-    let Ok(value) = serde_yaml::from_str::<serde_yaml::Value>(yaml) else {
-        return false;
-    };
-    value
-        .get("profiles")
-        .and_then(|p| p.as_mapping())
-        .is_some_and(|m| m.values().any(|body| body.get("host_mapping").is_some()))
-}
-
-/// Rejects `zone` when it is reserved or overlaps (equal, parent or child) a zone approved
-/// for any profile other than `owner_id`/`also_allowed`. Overlap across profiles would let a
-/// parent-zone owner publish names under a child zone owned by someone else.
-fn check_zone_ownership(
-    profiles: &[Profile],
-    zone: &str,
-    allowed_owners: &[&str],
-) -> Result<(), String> {
-    use crate::services::local_dns::zone_file::is_name_in_zone;
-    if !crate::services::validate::is_allowed_private_zone(zone) {
-        return Err(format!("invalid or disallowed DNS zone: {zone}"));
-    }
-    if crate::services::validate::is_reserved_clusterdeck_zone(zone) {
-        return Err(format!(
-            "DNS zone {zone} is reserved for ClusterDeck node aliases (clusterdeck.local)"
-        ));
-    }
-    for p in profiles
-        .iter()
-        .filter(|p| !allowed_owners.contains(&p.id.as_str()))
-    {
-        if let Some(other) = p
-            .approved_dns_zones
-            .iter()
-            .find(|o| is_name_in_zone(zone, o) || is_name_in_zone(o, zone))
-        {
-            return Err(format!(
-                "DNS zone {zone} overlaps zone {other} approved for profile '{}'; switch ownership explicitly",
-                p.id
-            ));
-        }
-    }
-    Ok(())
-}
-
 pub fn save_profiles(paths: &ClusterDeckPaths, profiles: &[Profile]) -> Result<(), String> {
-    let file_path = paths.profiles_file();
-    let parent = file_path
-        .parent()
-        .ok_or_else(|| "invalid profiles file path: missing parent directory".to_string())?;
-    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-
-    let mut map = BTreeMap::new();
-    for p in profiles {
-        map.insert(
-            p.id.clone(),
-            ProfileBody {
-                name: p.name.clone(),
-                hosts: p.hosts.clone(),
-                bastion: p.bastion.clone(),
-                bootstrap: p.bootstrap.clone(),
-                kubeconfig: p.kubeconfig.clone(),
-                manage_hosts_file: p.host_mapping == HostMapping::Hosts,
-                host_mapping: Some(p.host_mapping),
-                approved_dns_zones: p.approved_dns_zones.clone(),
-                trusted_cas: p.trusted_cas.clone(),
-                gateway_address: p.gateway_address.clone(),
-                local_runtime: p.local_runtime.clone(),
-            },
-        );
-    }
-    let file = ProfilesFile { profiles: map };
-    let yaml = serde_yaml::to_string(&file).map_err(|e| e.to_string())?;
-
-    // Plan R9: keep a one-time copy of a pre-local-dns file so a downgrade or a bad migration
-    // is recoverable. A failed backup fails the save: never migrate without it.
-    let backup_path = parent.join("profiles.yaml.pre-local-dns.bak");
-    if !backup_path.exists() {
-        if let Ok(existing) = std::fs::read_to_string(&file_path) {
-            if !has_host_mapping_key(&existing) {
-                std::fs::write(&backup_path, &existing).map_err(|e| {
-                    format!(
-                        "could not back up {} to {} before migrating: {e}",
-                        file_path.display(),
-                        backup_path.display()
-                    )
-                })?;
-            }
+    crate::services::profile_document::mutate(paths, |doc| {
+        for p in profiles {
+            doc.merge_profile(p, &[])?;
         }
-    }
-
-    // Atomic write: write to a temporary file in the same directory, then rename to target path.
-    // Placing the tmp file in the same directory guarantees rename is atomic within the filesystem.
-    let rand_suffix = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let tmp_path = parent.join(format!(
-        ".profiles.yaml.tmp.{}.{}",
-        std::process::id(),
-        rand_suffix
-    ));
-
-    if let Err(err) = std::fs::write(&tmp_path, &yaml) {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(err.to_string());
-    }
-
-    if let Err(err) = std::fs::rename(&tmp_path, &file_path) {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(err.to_string());
-    }
-
-    Ok(())
+        Ok(true)
+    })
 }
 
 pub fn upsert_profile(paths: &ClusterDeckPaths, profile: Profile) -> Result<(), String> {
+    upsert_profile_editor(paths, profile, None)
+}
+
+pub fn upsert_profile_editor(
+    paths: &ClusterDeckPaths,
+    profile: Profile,
+    expected_fp: Option<&str>,
+) -> Result<(), String> {
     crate::services::validate::validate_profile(&profile)?;
-    // remote_path is checked here rather than in validate_profile: validate_profile also
-    // filters profiles loaded from disk (see load_profiles above), and an unsafe/legacy
-    // remote_path must never make an otherwise-valid saved profile silently disappear and then
-    // get deleted on the next save. Here, at the save boundary, a rejection is instead a
-    // user-facing error the caller can act on.
     if let Some(kubeconfig) = &profile.kubeconfig {
         if !crate::services::validate::is_safe_remote_path(&kubeconfig.remote_path) {
             return Err(format!(
@@ -233,17 +70,51 @@ pub fn upsert_profile(paths: &ClusterDeckPaths, profile: Profile) -> Result<(), 
             ));
         }
     }
-    let mut profiles = load_profiles(paths)?;
-    // Plan R11: a zone has a single owner. Moving it is an explicit `switch_dns_zone_owner`.
-    for zone in &profile.approved_dns_zones {
-        check_zone_ownership(&profiles, zone, &[profile.id.as_str()])?;
-    }
-    if let Some(pos) = profiles.iter().position(|p| p.id == profile.id) {
-        profiles[pos] = profile;
-    } else {
-        profiles.push(profile);
-    }
-    save_profiles(paths, &profiles)
+    crate::services::profile_document::mutate(paths, |doc| {
+        if let Some(expected) = expected_fp {
+            if let Some(raw) = doc.raw(&profile.id) {
+                let actual = crate::services::profile_document::fingerprint(&raw);
+                if actual != expected {
+                    return Err(CHANGED_ELSEWHERE.to_string());
+                }
+            }
+        }
+        doc.merge_profile(&profile, &[])?;
+        doc.verify_entry(&profile.id)?;
+        Ok(true)
+    })
+}
+
+pub fn patch_profile(
+    paths: &ClusterDeckPaths,
+    id: &str,
+    f: impl FnOnce(&mut serde_yaml::Mapping) -> Result<(), String>,
+) -> Result<(), String> {
+    crate::services::profile_document::mutate(paths, |doc| {
+        doc.patch_entry(id, f)?;
+        doc.verify_entry(id)?;
+        Ok(true)
+    })
+}
+
+pub fn delete_invalid(
+    paths: &ClusterDeckPaths,
+    key: &str,
+    expected_fp: &str,
+) -> Result<(), String> {
+    crate::services::profile_document::mutate(paths, |doc| {
+        let entry = doc
+            .entry(key)
+            .ok_or_else(|| format!("Invalid profile '{key}' not found"))?;
+        if !matches!(entry.state, EntryState::Invalid { .. }) {
+            return Err(format!("Profile '{key}' is valid; use delete_profile"));
+        }
+        let actual = crate::services::profile_document::fingerprint(&entry.raw);
+        if actual != expected_fp {
+            return Err(CHANGED_ELSEWHERE.to_string());
+        }
+        Ok(doc.remove(key))
+    })
 }
 
 /// Atomically moves `zone` from its current owner to `to_profile` (one `profiles.yaml` write).
@@ -253,33 +124,40 @@ pub fn switch_dns_zone_owner(
     zone: &str,
     to_profile: &str,
 ) -> Result<(), String> {
-    let mut profiles = load_profiles(paths)?;
-    // Check against the state after the move: the exact zone leaves its current owner, so
-    // only a different parent/child zone held by another profile blocks it.
-    let mut after = profiles.clone();
-    for p in &mut after {
-        p.approved_dns_zones.retain(|z| z != zone);
-    }
-    check_zone_ownership(&after, zone, &[to_profile])?;
-    if !profiles.iter().any(|p| p.id == to_profile) {
-        return Err(format!("Profile not found: {to_profile}"));
-    }
-    for p in &mut profiles {
-        if p.id == to_profile {
-            if !p.approved_dns_zones.iter().any(|z| z == zone) {
-                p.approved_dns_zones.push(zone.to_string());
-            }
-        } else {
-            p.approved_dns_zones.retain(|z| z != zone);
+    crate::services::profile_document::mutate(paths, |doc| {
+        let target = doc
+            .entry(to_profile)
+            .ok_or_else(|| format!("Profile not found: {to_profile}"))?;
+        if !matches!(target.state, EntryState::Valid(_)) {
+            return Err(format!("Profile not found: {to_profile}"));
         }
-    }
-    save_profiles(paths, &profiles)
+        let current_holders: Vec<String> = doc
+            .zone_claims()
+            .into_iter()
+            .filter(|c| c.zones.iter().any(|z| z == zone))
+            .map(|c| c.id)
+            .collect();
+        for holder in &current_holders {
+            if holder != to_profile {
+                doc.patch_entry(holder, |m| patch::remove_zone(m, zone))?;
+            }
+        }
+        crate::services::profile_document::check_zone_ownership(
+            &doc.zone_claims(),
+            zone,
+            &[to_profile],
+        )?;
+        doc.patch_entry(to_profile, |m| patch::add_zone(m, zone))?;
+        for holder in &current_holders {
+            doc.verify_entry(holder)?;
+        }
+        doc.verify_entry(to_profile)?;
+        Ok(true)
+    })
 }
 
 pub fn delete_profile(paths: &ClusterDeckPaths, profile_id: &str) -> Result<(), String> {
-    let mut profiles = load_profiles(paths)?;
-    profiles.retain(|p| p.id != profile_id);
-    save_profiles(paths, &profiles)
+    crate::services::profile_document::mutate(paths, |doc| Ok(doc.remove(profile_id)))
 }
 
 pub fn get_profile(paths: &ClusterDeckPaths, profile_id: &str) -> Result<Profile, String> {
@@ -293,7 +171,9 @@ pub fn get_profile(paths: &ClusterDeckPaths, profile_id: &str) -> Result<Profile
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::services::config::{AuthMode, BootstrapPolicy, Host, Profile};
+    use crate::services::config::{
+        AuthMode, BootstrapPolicy, Host, HostMapping, KubeconfigSource, LocalRuntimeSource, Profile,
+    };
 
     fn temp_paths(tag: &str) -> ClusterDeckPaths {
         let dir = std::env::temp_dir().join(format!(
@@ -996,3 +876,6 @@ profiles:
         );
     }
 }
+
+#[cfg(test)]
+mod lossless_tests;

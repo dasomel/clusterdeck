@@ -1,9 +1,10 @@
 import { createContext, useContext, useState, useEffect, useCallback, useMemo, type ReactNode } from 'react';
 import { api, type Profile } from '../api/tauri';
-import type { DnsApplyView } from '../api/types';
+import type { DnsApplyView, InvalidProfileView } from '../api/types';
 
 export type ProfilesContextType = {
   profiles: Profile[];
+  invalidProfiles: InvalidProfileView[];
   selectedId: string | null;
   selected: Profile | null;
   loadError: string | null;
@@ -12,6 +13,7 @@ export type ProfilesContextType = {
   reload: () => Promise<void>;
   select: (id: string | null) => void;
   remove: (profile: Profile) => Promise<DnsApplyView | null>;
+  removeInvalid: (key: string, fingerprint: string) => Promise<void>;
   bumpTrust: (profileId: string) => void;
 };
 
@@ -19,6 +21,7 @@ const ProfilesContext = createContext<ProfilesContextType | null>(null);
 
 export function ProfilesProvider({ children }: { children: ReactNode }) {
   const [profiles, setProfiles] = useState<Profile[]>([]);
+  const [invalidProfiles, setInvalidProfiles] = useState<InvalidProfileView[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -27,8 +30,12 @@ export function ProfilesProvider({ children }: { children: ReactNode }) {
   const reload = useCallback(async () => {
     setLoading(true);
     try {
-      const loaded = await api.listProfiles();
+      const [loaded, invalids] = await Promise.all([
+        api.listProfiles(),
+        api.listInvalidProfiles(),
+      ]);
       setProfiles(loaded);
+      setInvalidProfiles(invalids);
       setSelectedId((current) => {
         if (current && loaded.some((p) => p.id === current)) {
           return current;
@@ -65,6 +72,11 @@ export function ProfilesProvider({ children }: { children: ReactNode }) {
     return await api.deleteProfile(profile.id);
   }, []);
 
+  const removeInvalid = useCallback(async (key: string, fingerprint: string): Promise<void> => {
+    setInvalidProfiles((prev) => prev.filter((p) => p.key !== key));
+    await api.deleteInvalidProfile(key, fingerprint);
+  }, []);
+
   const bumpTrust = useCallback((profileId: string) => {
     setTrustVersion((prev) => ({
       ...prev,
@@ -81,6 +93,7 @@ export function ProfilesProvider({ children }: { children: ReactNode }) {
     <ProfilesContext.Provider
       value={{
         profiles,
+        invalidProfiles,
         selectedId,
         selected,
         loadError,
@@ -89,6 +102,7 @@ export function ProfilesProvider({ children }: { children: ReactNode }) {
         reload,
         select,
         remove,
+        removeInvalid,
         bumpTrust,
       }}
     >

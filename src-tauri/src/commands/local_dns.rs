@@ -361,6 +361,7 @@ fn suggested_zones(host: &str) -> Vec<String> {
 async fn disable(
     env: &ManagerEnv<'_>,
     hosts: Option<HostsUpdate<'_>>,
+    protect_resolver: bool,
 ) -> Result<DnsApplyView, String> {
     let mut view = DnsApplyView::default();
     if hosts.is_some() {
@@ -378,6 +379,7 @@ async fn disable(
                 approved_switches: &[],
                 hosts,
                 scope_profile: None,
+                protect_resolver,
             },
         )
         .await?;
@@ -387,7 +389,23 @@ async fn disable(
             return Ok(view);
         }
     }
-    let torn = manager::teardown(env).await?;
+    let teardown_env;
+    let env_ref = if protect_resolver {
+        teardown_env = ManagerEnv {
+            runner: env.runner,
+            paths: env.paths,
+            resolver_dir: env.resolver_dir,
+            current_exe: env.current_exe,
+            port: env.port,
+            status_timeout: env.status_timeout,
+            status_poll: env.status_poll,
+            protect_resolver: true,
+        };
+        &teardown_env
+    } else {
+        env
+    };
+    let torn = manager::teardown(env_ref).await?;
     view.prompted |= !torn.removed.is_empty() || torn.cancelled;
     view.cancelled |= torn.cancelled;
     Ok(view)
@@ -460,7 +478,10 @@ pub(crate) async fn reapply_locked<'a>(
     record: Option<EndpointRecordUpdate<'a>>,
     scope: Option<&str>,
 ) -> Result<(DnsApplyView, EndpointCache), String> {
-    let profiles: Vec<Profile> = store::load_profiles(paths)?
+    let doc = store::load_document(paths)?;
+    let protect_resolver = doc.protects_resolver();
+    let profiles: Vec<Profile> = doc
+        .profiles()
         .into_iter()
         .filter(|p| Some(p.id.as_str()) != exclude)
         .collect();
@@ -489,7 +510,7 @@ pub(crate) async fn reapply_locked<'a>(
         .iter()
         .any(|p| p.host_mapping == HostMapping::LocalDns)
     {
-        let view = disable(env, hosts).await?;
+        let view = disable(env, hosts, protect_resolver).await?;
         return Ok((view, cached));
     }
 
@@ -510,6 +531,7 @@ pub(crate) async fn reapply_locked<'a>(
             approved_switches: &switches,
             hosts,
             scope_profile: scope,
+            protect_resolver,
         },
     )
     .await?;
@@ -1170,12 +1192,9 @@ pub async fn approve_dns_zone(
     zone: String,
 ) -> Result<DnsApplyView, String> {
     mutate_then_apply(&guard, &profile_id, |paths, id| {
-        let mut profile = store::get_profile(paths, id)?;
-        if !profile.approved_dns_zones.contains(&zone) {
-            profile.approved_dns_zones.push(zone.clone());
-        }
-        // Validates the zone and rejects one another profile owns (that is a switch).
-        store::upsert_profile(paths, profile)
+        store::patch_profile(paths, id, |m| {
+            crate::services::profile_document::patch::add_zone(m, &zone)
+        })
     })
     .await
 }
@@ -1187,9 +1206,9 @@ pub async fn revoke_dns_zone(
     zone: String,
 ) -> Result<DnsApplyView, String> {
     mutate_then_apply(&guard, &profile_id, |paths, id| {
-        let mut profile = store::get_profile(paths, id)?;
-        profile.approved_dns_zones.retain(|z| z != &zone);
-        store::upsert_profile(paths, profile)
+        store::patch_profile(paths, id, |m| {
+            crate::services::profile_document::patch::remove_zone(m, &zone)
+        })
     })
     .await
 }
@@ -1215,8 +1234,14 @@ pub async fn local_dns_status() -> Result<LocalDnsStatus, String> {
 #[tauri::command]
 pub async fn local_dns_disable() -> Result<LocalDnsDisableResult, String> {
     let _lane_guard = lock_lane().await;
+    let paths = ClusterDeckPaths::resolve()?;
+    let doc = store::load_document(&paths).ok();
+    let protect_resolver = doc.as_ref().is_some_and(|d| d.protects_resolver());
+
     let dns = SystemDns::resolve()?;
-    let torn = manager::teardown(&dns.env()).await?;
+    let mut env = dns.env();
+    env.protect_resolver = protect_resolver;
+    let torn = manager::teardown(&env).await?;
     Ok(LocalDnsDisableResult {
         removed: torn.removed,
         cancelled: torn.cancelled,

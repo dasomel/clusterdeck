@@ -162,8 +162,9 @@ Because DNS records are loaded from user space (`~/.clusterdeck/dns/zones.json`)
   2. Adding or updating endpoints when pods or services change IP addresses.
   3. Modifying node aliases or bastion targets within an existing profile.
   4. Periodic cluster sync or rescan (**Scan Endpoints** / **Sync to local DNS**).
-- **Scoped Resolver Operations:**
-  When saving a profile, switching host mapping, syncing local DNS, or deleting a profile, `/etc/resolver` operations are strictly scoped to that modified profile. Pending, unapproved, or unapplied zone changes belonging to other profiles are never carried over or unintentionally applied during these operations.
+- **Scoped Resolver Operations & Resolver Protection:**
+  - When saving a profile, switching host mapping, syncing local DNS, or deleting a profile, `/etc/resolver` operations are strictly scoped to that modified profile. Pending, unapproved, or unapplied zone changes belonging to other profiles are never carried over or unintentionally applied during these operations.
+  - **Lossless Profile Store & Protection Mode:** ClusterDeck preserves unparsed or validation-failing profiles and unrecognized YAML keys in `profiles.yaml` across all saves, edits, and deletions. When invalid profiles exist or the profile file format is partially unparseable, ClusterDeck engages a resolver protection mode: global resolver teardown or sweeps of unreferenced zones are blocked to prevent wiping out resolver entries that might belong to invalid or temporarily unparseable profiles.
 
 ---
 
