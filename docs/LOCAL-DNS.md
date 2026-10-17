@@ -76,6 +76,12 @@ Discovered endpoints from Kubernetes (Ingress, APISIX, Gateway API) often use pr
   - The skipped-hosts warning banner summarizes unserved endpoints and reasons, but contains no action buttons.
 - **Activation:** Clicking **Approve <zone>** invokes `approve_dns_zone`, prompting once for administrator authorization to install `/etc/resolver/<zone>`. Once approved, all present and future endpoints under that zone resolve immediately.
 
+### Discovery failures and concurrent changes
+
+Discovery tracks Services, Ingress, APISIX, Istio, and Gateway API separately. A failed kind keeps its last known records. If Services fails, nonempty dependent resource lists are treated as failed even when their IP addresses cannot be resolved; genuinely empty lists still remove obsolete records. **Scan Endpoints** reports partial discovery errors alongside cache-write errors.
+
+In Hosts mode, existing records whose resource kind is unknown survive repeated partial failures and are cached. They may remain stale until a fully successful Hosts sync replaces them. Sync rechecks the saved profile under the same lock as profile changes: if the profile was deleted or its mapping changed during discovery, the stale operation stops before writing. With mapping **Off**, select **Hosts** or **Local DNS** before syncing.
+
 ### 3.3 Private-TLD Rule
 To prevent intercepting public Internet domains or tenant-controlled hostnames (e.g. an ingress with `github.com`), a zone must pass strict validation (`is_allowed_private_zone`):
 1. **Lowercase ASCII only.**

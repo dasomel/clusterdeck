@@ -285,8 +285,8 @@ export default function EndpointsTab({
               className="primary-button"
               style={{ width: 'auto', marginTop: 0, padding: '5px 12px', fontSize: '12px', gap: '5px' }}
               onClick={onSync}
-              disabled={syncingHosts}
-              title={isLocalDns ? 'Publish cluster endpoints and node aliases through local DNS (may require admin approval)' : 'Write cluster endpoints and profile hosts to /etc/hosts (requires admin approval)'}
+              disabled={syncingHosts || profile.host_mapping === 'off'}
+              title={profile.host_mapping === 'off' ? 'Select Hosts or Local DNS in profile settings before syncing' : isLocalDns ? 'Publish cluster endpoints and node aliases through local DNS (may require admin approval)' : 'Write cluster endpoints and profile hosts to /etc/hosts (requires admin approval)'}
             >
               {syncingHosts ? <RefreshCw size={12} className="spin" /> : <FileText size={12} />}
               {isLocalDns ? 'Sync to local DNS' : 'Sync to /etc/hosts'}

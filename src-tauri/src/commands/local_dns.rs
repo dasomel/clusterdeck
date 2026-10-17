@@ -698,6 +698,11 @@ async fn sync_local_dns_profile_impl(
     input_opt: Option<EndpointDiscoveryInput>,
     discovery_err: Option<&str>,
 ) -> Result<SyncHostsResult, String> {
+    let _lane_guard = lock_lane().await;
+    let profile = store::get_profile(paths, &profile.id)?;
+    if profile.host_mapping != HostMapping::LocalDns {
+        return Err("Host mapping changed or is off; refresh the profile before syncing".into());
+    }
     let id = profile.id.clone();
     let strip = move |existing: &str| compute_updated_hosts_content(existing, &id, None);
     let hosts = stale_block_present(hosts_path, &profile.id).then_some(HostsUpdate {
@@ -716,7 +721,6 @@ async fn sync_local_dns_profile_impl(
         .map(|inp| inp.failed_kinds.clone())
         .unwrap_or_default();
 
-    let _lane_guard = lock_lane().await;
     let (view, cached) = reapply_locked(paths, env, None, hosts, record).await?;
     let view = view.for_profile(&profile.id);
 

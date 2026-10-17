@@ -131,7 +131,7 @@ export function useEndpoints(
       }
       if (res.warning) {
         pushStatus('warning', 'Endpoint Discovery Warning', [
-          `Found ${eps.length} external cluster endpoint(s), but cache could not be updated: ${res.warning}`,
+          `Found ${eps.length} external cluster endpoint(s), discovery or cache update was incomplete: ${res.warning}`,
         ]);
       } else {
         pushStatus('success', 'Endpoints Discovered', [
@@ -255,7 +255,7 @@ export function useEndpoints(
         const recordCount = view.zone_records?.[zone] ?? 0;
         if (scanWarning) {
           pushStatus('warning', 'DNS Zone Approved with Warning', [
-            `${zone} approved, but endpoint cache was not updated during scan (${scanWarning}); press Scan or Sync.`,
+            `${zone} approved, but the last scan was incomplete (${scanWarning}); press Scan or Sync.`,
           ]);
         } else if (recordCount > 0) {
           pushStatus('success', 'DNS Zone Approved', [

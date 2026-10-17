@@ -545,3 +545,5 @@ async fn r4_item8_delete_hosts_profile_removes_cache_entry() {
         "other profiles keep their entry"
     );
 }
+
+mod postmerge;
