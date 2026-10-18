@@ -46,7 +46,7 @@ fn push_connection_options(args: &mut Vec<String>, host: &Host) {
 /// `/bin/sh -c`, so a profile value reaching it must be `%`-escaped and single-quoted --
 /// `is_safe_ssh_identifier` does not exclude shell metacharacters (`;`, `$`, spaces). `-i` still
 /// gets tilde expansion because ssh expands `~` in identity paths itself, not the shell.
-fn quote_proxy_command_word(s: &str) -> String {
+pub(crate) fn quote_proxy_command_word(s: &str) -> String {
     format!("'{}'", s.replace('%', "%%").replace('\'', r"'\''"))
 }
 

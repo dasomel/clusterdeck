@@ -1,7 +1,8 @@
 #![allow(dead_code)]
 
-use crate::services::config::Profile;
+use crate::services::config::{Bastion, Profile};
 use crate::services::paths::ClusterDeckPaths;
+use crate::services::ssh::quote_proxy_command_word;
 use crate::services::validate::{is_safe_profile_id, is_safe_ssh_identifier};
 
 use std::path::{Path, PathBuf};
@@ -34,6 +35,37 @@ fn validate_profile_identifiers(profile: &Profile) -> Result<(), String> {
     Ok(())
 }
 
+/// Bastion hop as an explicit `ProxyCommand` instead of `ProxyJump`. Terminal opens `ssh://` URLs
+/// through `login`, which starts ssh with argv[0] `-ssh`; OpenSSH 10 builds its implicit
+/// ProxyJump command from argv[0] (`exec -ssh -W ...`) and zsh then rejects it as
+/// `unknown exec flag -s`. An absolute `/usr/bin/ssh` is immune to that, and `-F /dev/null`
+/// stops the hop from re-reading this file. No BatchMode: this path is interactive, so a
+/// passphrase prompt for the bastion key must stay possible.
+fn bastion_proxy_command(b: &Bastion) -> String {
+    let mut words = vec![
+        "/usr/bin/ssh".to_string(),
+        "-F".to_string(),
+        "/dev/null".to_string(),
+        "-o".to_string(),
+        "StrictHostKeyChecking=accept-new".to_string(),
+        "-p".to_string(),
+        b.port.to_string(),
+    ];
+    if let Some(identity) = b.identity_file.as_deref().filter(|i| !i.is_empty()) {
+        words.extend(["-o".to_string(), "IdentitiesOnly=yes".to_string()]);
+        words.push("-i".to_string());
+        words.push(quote_proxy_command_word(identity));
+    }
+    words.push("-W".to_string());
+    words.push("'[%h]:%p'".to_string());
+    words.push("--".to_string());
+    words.push(quote_proxy_command_word(&format!(
+        "{}@{}",
+        b.user, b.address
+    )));
+    words.join(" ")
+}
+
 pub fn render_profile_config(profile: &Profile) -> String {
     let mut blocks = Vec::new();
 
@@ -59,8 +91,8 @@ pub fn render_profile_config(profile: &Profile) -> String {
         if let Some(identity) = &host.identity_file {
             lines.push(format!("  IdentityFile {identity}"));
         }
-        if profile.bastion.is_some() {
-            lines.push(format!("  ProxyJump {}-bastion", profile.id));
+        if let Some(bastion) = &profile.bastion {
+            lines.push(format!("  ProxyCommand {}", bastion_proxy_command(bastion)));
         }
         lines.push("  StrictHostKeyChecking accept-new".to_string());
         blocks.push(lines.join("\n"));
@@ -149,11 +181,14 @@ mod tests {
     }
 
     #[test]
-    fn render_includes_proxy_jump_for_target_hosts() {
+    fn render_includes_proxy_command_for_target_hosts() {
         let rendered = render_profile_config(&profile_with_bastion());
         assert!(rendered.contains("Host cka-bastion"));
         assert!(rendered.contains("Host cka-cka-m1"));
-        assert!(rendered.contains("ProxyJump cka-bastion"));
+        // Never ProxyJump: it breaks under Terminal's `login` argv[0] of `-ssh`.
+        assert!(!rendered.contains("ProxyJump"));
+        assert!(rendered.contains("ProxyCommand /usr/bin/ssh -F /dev/null"));
+        assert!(rendered.contains("-W '[%h]:%p'"));
         assert!(rendered.contains("HostName 10.0.0.10"));
     }
 
@@ -254,8 +289,9 @@ mod tests {
         let effective = String::from_utf8_lossy(&output.stdout).to_lowercase();
 
         assert!(
-            effective.contains("proxyjump cka-bastion"),
-            "expected proxyjump directive resolved from generated config, got: {effective}"
+            effective.contains("proxycommand /usr/bin/ssh -f /dev/null")
+                || effective.contains("proxycommand /usr/bin/ssh -F /dev/null"),
+            "expected proxycommand directive resolved from generated config, got: {effective}"
         );
         assert!(
             effective.contains("hostname 192.168.56.10"),
