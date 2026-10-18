@@ -21,6 +21,21 @@ pub fn run() {
                             );
                         }
                     }
+                    // Issue #111: after reaping (so preferred ports are free), bring back the
+                    // tunnels of profiles that had one when the app last exited.
+                    for (profile_id, outcome) in commands::connection::restore_tunnels(
+                        services::tunnel::global(),
+                        &runner,
+                        &paths,
+                    )
+                    .await
+                    {
+                        if let Err(e) = outcome {
+                            eprintln!(
+                                "[ClusterDeck] could not restore API tunnel for '{profile_id}': {e}"
+                            );
+                        }
+                    }
                 });
             }
             // D4: never blocks startup; prompts only if our resolver files must be removed.

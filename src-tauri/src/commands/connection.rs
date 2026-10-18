@@ -351,6 +351,37 @@ async fn ensure_verify_tunnel(
     crate::services::kubeconfig::retarget_tunnel_port(kubeconfig_path, port)
 }
 
+/// Issue #111: tunnels die with the app (ADR-0009), so after a restart every bastion profile
+/// that had one would sit at `connection refused` until it is individually verified. Re-opens
+/// each such profile's tunnel through the same guarded path Verify uses; a profile with no
+/// persisted target, no kubeconfig on disk, or no bastion is left alone. One profile's failure
+/// never stops the others.
+pub async fn restore_tunnels(
+    tunnels: &crate::services::tunnel::TunnelManager,
+    runner: &dyn CommandRunner,
+    paths: &ClusterDeckPaths,
+) -> Vec<(String, Result<bool, String>)> {
+    let Ok(profiles) = store::load_profiles(paths) else {
+        return Vec::new();
+    };
+    let mut results = Vec::new();
+    for profile in profiles {
+        let kubeconfig_path = paths.kubeconfig_file(&profile.id);
+        let had_tunnel = matches!(state::get_tunnel_target(paths, &profile.id), Ok(Some(_)));
+        if profile.bastion.is_none()
+            || profile.kubeconfig.is_none()
+            || !kubeconfig_path.exists()
+            || !had_tunnel
+        {
+            continue;
+        }
+        let outcome =
+            ensure_verify_tunnel(tunnels, runner, paths, &profile, &kubeconfig_path).await;
+        results.push((profile.id.clone(), outcome));
+    }
+    results
+}
+
 #[tauri::command]
 pub async fn verify_profile(profile_id: String) -> Result<VerificationResult, String> {
     let paths = ClusterDeckPaths::resolve()?;
@@ -1542,6 +1573,82 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.contains("API tunnel failed"), "{err}");
+        std::fs::remove_dir_all(&paths.base).ok();
+    }
+
+    fn tunnel_manager() -> crate::services::tunnel::TunnelManager {
+        crate::services::tunnel::TunnelManager::new(std::sync::Arc::new(
+            crate::services::tunnel::SystemPortProbe,
+        ))
+    }
+
+    #[tokio::test]
+    async fn restore_tunnels_skips_profiles_without_a_persisted_target() {
+        let paths = tunnel_test_paths("restore-no-target");
+        let mut profile = bastion_profile();
+        profile.id = "test".into();
+        store::upsert_profile(&paths, profile).unwrap();
+        write_test_kubeconfig(&paths, "      certificate-authority-data: ZmFrZS1jYQ==");
+
+        let results = restore_tunnels(&tunnel_manager(), &NeverCalledRunner, &paths).await;
+
+        assert!(results.is_empty());
+        std::fs::remove_dir_all(&paths.base).ok();
+    }
+
+    #[tokio::test]
+    async fn restore_tunnels_skips_profiles_without_a_kubeconfig_on_disk() {
+        let paths = tunnel_test_paths("restore-no-kubeconfig");
+        let mut profile = bastion_profile();
+        profile.id = "test".into();
+        store::upsert_profile(&paths, profile).unwrap();
+        state::save_tunnel_target(
+            &paths,
+            "test",
+            &crate::services::tunnel::TunnelTarget {
+                host: "127.0.0.1".to_string(),
+                port: 6443,
+            },
+        )
+        .unwrap();
+
+        let results = restore_tunnels(&tunnel_manager(), &NeverCalledRunner, &paths).await;
+
+        assert!(results.is_empty());
+        std::fs::remove_dir_all(&paths.base).ok();
+    }
+
+    #[tokio::test]
+    async fn restore_tunnels_attempts_a_profile_that_had_a_tunnel_and_reports_failure() {
+        let paths = tunnel_test_paths("restore-attempt");
+        let mut profile = bastion_profile();
+        profile.id = "test".into();
+        store::upsert_profile(&paths, profile).unwrap();
+        state::save_tunnel_target(
+            &paths,
+            "test",
+            &crate::services::tunnel::TunnelTarget {
+                host: "127.0.0.1".to_string(),
+                port: 6443,
+            },
+        )
+        .unwrap();
+        write_test_kubeconfig(&paths, "      certificate-authority-data: ZmFrZS1jYQ==");
+        // The default `spawn_background` is unsupported, so the attempt fails -- which proves
+        // it was made, and that the failure is reported instead of propagated.
+        let runner = AlwaysSucceedsRunner {
+            calls: AtomicUsize::new(0),
+        };
+
+        let results = restore_tunnels(&tunnel_manager(), &runner, &paths).await;
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, "test");
+        assert!(results[0]
+            .1
+            .as_ref()
+            .unwrap_err()
+            .contains("API tunnel failed"));
         std::fs::remove_dir_all(&paths.base).ok();
     }
 
