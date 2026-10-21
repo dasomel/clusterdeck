@@ -46,14 +46,17 @@ print("==================================================")
 // Step 1: Pure CFNetwork / CFHost resolution (exact DNS stack used by Safari/mDNSResponder)
 let startDns = Date()
 let host = CFHostCreateWithName(nil, hostName as CFString).takeRetainedValue()
-let success = CFHostStartInfoResolution(host, .addresses, nil)
+var cfError = CFStreamError()
+let success = CFHostStartInfoResolution(host, .addresses, &cfError)
 let elapsedDns = Date().timeIntervalSince(startDns)
 let elapsedDnsMs = String(format: "%.1f ms", elapsedDns * 1000)
 
-var resolvedIps: [String] = []
+var resolvedIps: [String] = []   // IPv4 only, used for the IP comparison
+var addressCount = 0             // every family, so AAAA-only hosts are not mistaken for NXDOMAIN
 if success {
     var resolved: DarwinBoolean = false
     if let addresses = CFHostGetAddressing(host, &resolved)?.takeUnretainedValue() as? [Data], resolved.boolValue {
+        addressCount = addresses.count
         resolvedIps = addresses.compactMap { data -> String? in
             data.withUnsafeBytes { rawBuffer -> String? in
                 guard let baseAddr = rawBuffer.baseAddress else { return nil }
@@ -71,24 +74,35 @@ if success {
     }
 }
 
-let stalled = elapsedDns > 4.5
-if resolvedIps.isEmpty {
-    if stalled {
-        print("❌ STALL DETECTED in \(elapsedDnsMs) (exceeded 4.5s threshold)")
-        exit(2)
-    }
-    if expectFailure {
+// A slow answer is a failure even when it is correct: that is the 30s-stall symptom.
+if elapsedDns > 4.5 {
+    print("❌ STALL DETECTED in \(elapsedDnsMs) (exceeded 4.5s threshold)")
+    exit(2)
+}
+
+if addressCount == 0 {
+    // Only a genuine name-not-found (NetDB EAI_NONAME) counts as a clean negative answer;
+    // other resolver errors (timeout, server failure) must not pass --expect-failure.
+    let nameNotFound = !success
+        && cfError.domain == CFIndex(kCFStreamErrorDomainNetDB)
+        && cfError.error == EAI_NONAME
+    if expectFailure && nameNotFound {
         print("✅ FAST NXDOMAIN in \(elapsedDnsMs), as expected")
         print("==================================================")
         exit(0)
     }
-    print("❌ Resolution FAILED in \(elapsedDnsMs): host not found")
+    print("❌ Resolution FAILED in \(elapsedDnsMs) (cf domain \(cfError.domain), error \(cfError.error))"
+        + (expectFailure ? ": not a confirmed name-not-found" : ": host not found"))
     exit(4)
 }
-print("✅ Apple Network Stack RESOLVED in \(elapsedDnsMs):")
-print("   IP Addresses: \(resolvedIps.joined(separator: ", "))")
+print("✅ Apple Network Stack RESOLVED in \(elapsedDnsMs): \(addressCount) address(es)")
+print("   IPv4 Addresses: \(resolvedIps.joined(separator: ", "))")
 if expectFailure {
     print("❌ Expected resolution failure but the host resolved")
+    exit(4)
+}
+if resolvedIps.isEmpty {
+    print("❌ No IPv4 address returned (IPv6-only answer)")
     exit(4)
 }
 if let expectedIp = expectedIp, !resolvedIps.contains(expectedIp) {

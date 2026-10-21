@@ -10,23 +10,30 @@ PORT=15353
 
 usage() {
   cat <<USAGE
-Usage: $(basename "$0") [--expect-failure <host>]... [<host>[=<expected_ipv4>]]...
+Usage: $(basename "$0") [--teardown] [--expect-failure <host>]... [<host>[=<expected_ipv4>]]...
 
 Read-only checks: LaunchAgent running, status.json, port $PORT ownership,
 ClusterDeck-managed /etc/resolver files, dig against 127.0.0.1:$PORT, then the
 Safari/Network.framework probe (scripts/verify-safari-resolution.swift) per host.
 
   <host>[=<ip>]            must resolve (to <ip> if given)
-  --expect-failure <host>  must fail fast with a clean NXDOMAIN (no stall)
+  --expect-failure <host>  responder must answer NXDOMAIN and the Safari stack must
+                           fail fast with a clean name-not-found (no stall)
+  --teardown               post "Remove from local DNS" mode: assert the agent is not
+                           loaded, port $PORT is unowned and no managed resolver files
+                           remain; every host is then checked with the Safari stack
+                           only (as --expect-failure) and dig is skipped
 
 Exits non-zero if any check FAILs.
 USAGE
 }
 
+TEARDOWN=0
 HOSTS=() # entries: "resolve|host|ip" or "fail|host|"
 while [ $# -gt 0 ]; do
   case "$1" in
     -h|--help) usage; exit 0 ;;
+    --teardown) TEARDOWN=1; shift ;;
     --expect-failure)
       [ $# -ge 2 ] || { usage >&2; exit 2; }
       HOSTS+=("fail|$2|"); shift 2 ;;
@@ -49,29 +56,39 @@ record() { # status label [detail]
 UID_NUM="$(id -u)"
 AGENT_PID=""
 
-# 1. LaunchAgent running
+# 1. LaunchAgent state
 if OUT="$(launchctl print "gui/$UID_NUM/$AGENT_LABEL" 2>&1)"; then
   AGENT_PID="$(printf '%s\n' "$OUT" | awk '/^[[:space:]]*pid = /{print $3; exit}')"
-  if [ -n "$AGENT_PID" ]; then
+  if [ "$TEARDOWN" -eq 1 ]; then
+    record FAIL "launchd agent $AGENT_LABEL still loaded after teardown"
+  elif [ -n "$AGENT_PID" ]; then
     record PASS "launchd agent $AGENT_LABEL running" "pid=$AGENT_PID"
   else
     record FAIL "launchd agent $AGENT_LABEL loaded but not running"
   fi
+elif [ "$TEARDOWN" -eq 1 ]; then
+  record PASS "launchd agent $AGENT_LABEL not loaded"
 else
   record FAIL "launchd agent $AGENT_LABEL not loaded in gui/$UID_NUM"
 fi
 
-# 2. status.json must agree with launchd and report no error
-if ! command -v jq >/dev/null 2>&1; then
+# 2. status.json must agree with launchd and report no error (not applicable after teardown)
+if [ "$TEARDOWN" -eq 1 ]; then
+  :
+elif ! command -v jq >/dev/null 2>&1; then
   record FAIL "status.json" "jq not installed"
 elif [ -f "$DNS_DIR/status.json" ]; then
-  S_PID="$(jq -r '.pid' "$DNS_DIR/status.json")"
-  S_GEN="$(jq -r '.generation' "$DNS_DIR/status.json")"
-  S_ERR="$(jq -r '.error' "$DNS_DIR/status.json")"
-  if [ -n "$AGENT_PID" ] && [ "$S_PID" = "$AGENT_PID" ] && [ "$S_ERR" = null ]; then
-    record PASS "status.json consistent" "pid=$S_PID generation=$S_GEN error=null"
+  # Conditionals keep a corrupt file from tripping `set -e` before the summary prints.
+  if S_PID="$(jq -er '.pid' "$DNS_DIR/status.json" 2>/dev/null)" \
+    && S_GEN="$(jq -er '.generation' "$DNS_DIR/status.json" 2>/dev/null)" \
+    && S_ERR="$(jq -r '.error' "$DNS_DIR/status.json" 2>/dev/null)"; then
+    if [ -n "$AGENT_PID" ] && [ "$S_PID" = "$AGENT_PID" ] && [ "$S_ERR" = null ]; then
+      record PASS "status.json consistent" "pid=$S_PID generation=$S_GEN error=null"
+    else
+      record FAIL "status.json mismatch" "pid=$S_PID (agent=${AGENT_PID:-none}) error=$S_ERR"
+    fi
   else
-    record FAIL "status.json mismatch" "pid=$S_PID (agent=${AGENT_PID:-none}) error=$S_ERR"
+    record FAIL "status.json unreadable or malformed" "$DNS_DIR/status.json"
   fi
 else
   record FAIL "status.json missing" "$DNS_DIR/status.json"
@@ -80,7 +97,13 @@ fi
 # 3. Port ownership: UDP and TCP LISTEN must both belong solely to the agent
 UDP_PIDS="$(lsof -nP -iUDP:$PORT -t 2>/dev/null | sort -u | tr '\n' ' ' || true)"
 TCP_PIDS="$(lsof -nP -iTCP:$PORT -sTCP:LISTEN -t 2>/dev/null | sort -u | tr '\n' ' ' || true)"
-if [ -n "$AGENT_PID" ] && [ "${UDP_PIDS% }" = "$AGENT_PID" ] && [ "${TCP_PIDS% }" = "$AGENT_PID" ]; then
+if [ "$TEARDOWN" -eq 1 ]; then
+  if [ -z "${UDP_PIDS% }" ] && [ -z "${TCP_PIDS% }" ]; then
+    record PASS "port $PORT unowned after teardown"
+  else
+    record FAIL "port $PORT still in use after teardown" "udp='${UDP_PIDS% }' tcp='${TCP_PIDS% }'"
+  fi
+elif [ -n "$AGENT_PID" ] && [ "${UDP_PIDS% }" = "$AGENT_PID" ] && [ "${TCP_PIDS% }" = "$AGENT_PID" ]; then
   record PASS "port $PORT owned by agent" "pid=$AGENT_PID (UDP+TCP)"
 else
   record FAIL "port $PORT ownership" "udp='${UDP_PIDS% }' tcp='${TCP_PIDS% }' expected='${AGENT_PID:-none}'"
@@ -95,7 +118,13 @@ for f in /etc/resolver/*; do
     echo "   managed resolver file: $(basename "$f")"
   fi
 done
-if [ "$MANAGED" -gt 0 ]; then
+if [ "$TEARDOWN" -eq 1 ]; then
+  if [ "$MANAGED" -eq 0 ]; then
+    record PASS "no managed /etc/resolver files after teardown"
+  else
+    record FAIL "managed /etc/resolver files remain after teardown" "count=$MANAGED"
+  fi
+elif [ "$MANAGED" -gt 0 ]; then
   record PASS "managed /etc/resolver files" "count=$MANAGED"
 else
   record FAIL "managed /etc/resolver files" "none found"
@@ -104,28 +133,42 @@ fi
 # 5. Per-host: direct dig against the responder, then the Safari-stack probe
 for entry in ${HOSTS[@]+"${HOSTS[@]}"}; do
   IFS='|' read -r MODE HOST IP <<<"$entry"
-  ANSWER="$(dig @127.0.0.1 -p $PORT "$HOST" A +short +time=2 +tries=1 2>&1 || true)"
-  ONELINE="$(printf '%s' "$ANSWER" | tr '\n' ' ')"
-  if [ "$MODE" = fail ]; then
-    if [ -z "$ANSWER" ]; then
-      record PASS "dig $HOST" "no answer, as expected"
-    else
-      record FAIL "dig $HOST" "expected no answer, got: $ONELINE"
-    fi
-    SW_ARGS=("$HOST" --expect-failure)
-  elif [ -n "$IP" ]; then
-    if printf '%s\n' "$ANSWER" | grep -qxF "$IP"; then
-      record PASS "dig $HOST" "$IP"
-    else
-      record FAIL "dig $HOST" "expected $IP, got: ${ONELINE:-<empty>}"
-    fi
-    SW_ARGS=("$HOST" --expect-ip "$IP")
+  if [ "$TEARDOWN" -eq 1 ]; then
+    MODE=fail
   else
-    if printf '%s\n' "$ANSWER" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+    # Full output, not +short: an empty +short also covers SERVFAIL/REFUSED/NODATA.
+    DIG_RC=0
+    DIG_OUT="$(dig @127.0.0.1 -p $PORT "$HOST" A +time=2 +tries=1 2>&1)" || DIG_RC=$?
+    DIG_STATUS="$(printf '%s\n' "$DIG_OUT" | sed -n 's/.*status: \([A-Z]*\),.*/\1/p' | head -n 1)"
+    ANSWER="$(printf '%s\n' "$DIG_OUT" | awk '$3 == "IN" && $4 == "A" {print $5}')"
+    ONELINE="$(printf '%s' "$ANSWER" | tr '\n' ' ')"
+    if [ "$DIG_RC" -ne 0 ] || [ -z "$DIG_STATUS" ]; then
+      record FAIL "dig $HOST" "dig failed (rc=$DIG_RC)"
+    elif [ "$MODE" = fail ]; then
+      if [ "$DIG_STATUS" = NXDOMAIN ]; then
+        record PASS "dig $HOST" "NXDOMAIN, as expected"
+      else
+        record FAIL "dig $HOST" "expected NXDOMAIN, got status=$DIG_STATUS ${ONELINE}"
+      fi
+    elif [ "$DIG_STATUS" != NOERROR ]; then
+      record FAIL "dig $HOST" "status=$DIG_STATUS"
+    elif [ -n "$IP" ]; then
+      if printf '%s\n' "$ANSWER" | grep -qxF "$IP"; then
+        record PASS "dig $HOST" "$IP"
+      else
+        record FAIL "dig $HOST" "expected $IP, got: ${ONELINE:-<empty>}"
+      fi
+    elif [ -n "$ANSWER" ]; then
       record PASS "dig $HOST" "$ONELINE"
     else
-      record FAIL "dig $HOST" "no A record: ${ONELINE:-<empty>}"
+      record FAIL "dig $HOST" "NOERROR but no A record"
     fi
+  fi
+  if [ "$MODE" = fail ]; then
+    SW_ARGS=("$HOST" --expect-failure)
+  elif [ -n "$IP" ]; then
+    SW_ARGS=("$HOST" --expect-ip "$IP")
+  else
     SW_ARGS=("$HOST")
   fi
   RC=0

@@ -320,11 +320,11 @@ Resolves through CFHost (the Apple resolver stack Safari uses), then probes with
 # Must resolve to the expected cluster IP (exit 3 on mismatch)
 swift scripts/verify-safari-resolution.swift api.lab.example.internal --expect-ip 192.0.2.10
 
-# Must fail fast with a clean NXDOMAIN, e.g. after teardown (exit 4 if it still resolves)
+# Must fail fast with a confirmed name-not-found (exit 4 if it resolves or fails for another reason)
 swift scripts/verify-safari-resolution.swift api.lab.example.internal --expect-failure
 ```
 
-Exit codes: `0` pass, `1` usage, `2` stall, `3` IP mismatch, `4` unexpected resolution result, `5` URLSession probe failed or timed out.
+Exit codes: `0` pass, `1` usage, `2` stall, `3` IP mismatch, `4` unexpected resolution result, `5` URLSession probe failed or timed out. A correct answer slower than 4.5 s also exits `2`. Under `--expect-failure`, only a genuine name-not-found passes; other resolver errors and IPv6-only answers exit `4`.
 
 ---
 
@@ -334,7 +334,7 @@ Exit codes: `0` pass, `1` usage, `2` stall, `3` IP mismatch, `4` unexpected reso
 
 ```bash
 scripts/test-real-mac-local-dns.sh api.lab.example.internal=192.0.2.10
-scripts/test-real-mac-local-dns.sh --expect-failure api.lab.example.internal   # after teardown
+scripts/test-real-mac-local-dns.sh --teardown api.lab.example.internal      # after "Remove from local DNS": agent, port and resolver files absent, Safari stack fails fast
 scripts/test-real-mac-local-dns.sh --help
 ```
 
