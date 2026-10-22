@@ -1472,6 +1472,43 @@ pub fn is_profile_present_in_user_config(profile_id: &str) -> bool {
     false
 }
 
+/// True when `user_config_path` already holds the profile's cluster entry (matched by name, as
+/// `merge_yaml_kubeconfigs` upserts) but with a different `server` than the stored per-profile
+/// kubeconfig. Issue #116: a retarget whose merge failed (or never ran) leaves exactly this
+/// state, and the next start picks the same port so the retarget itself reports "no change".
+/// Absent file/entry or any read/parse failure is `false`: nothing ClusterDeck owns to repair.
+pub fn user_config_server_is_stale(
+    user_config_path: &std::path::Path,
+    profile_kubeconfig_path: &std::path::Path,
+) -> bool {
+    let load = |path: &std::path::Path| -> Option<serde_yaml::Value> {
+        serde_yaml::from_str(&std::fs::read_to_string(path).ok()?).ok()
+    };
+    let Some(profile_val) = load(profile_kubeconfig_path) else {
+        return false;
+    };
+    let Some(profile_cluster) = profile_val["clusters"]
+        .as_sequence()
+        .and_then(|s| s.first())
+    else {
+        return false;
+    };
+    let (Some(name), Some(want)) = (
+        profile_cluster["name"].as_str(),
+        profile_cluster["cluster"]["server"].as_str(),
+    ) else {
+        return false;
+    };
+    let Some(user_val) = load(user_config_path) else {
+        return false;
+    };
+    user_val["clusters"]
+        .as_sequence()
+        .and_then(|items| items.iter().find(|c| c["name"].as_str() == Some(name)))
+        .and_then(|c| c["cluster"]["server"].as_str())
+        .is_some_and(|have| have != want)
+}
+
 pub async fn merge_profile_kubeconfig_to_file(
     paths: &ClusterDeckPaths,
     profile_id: &str,
