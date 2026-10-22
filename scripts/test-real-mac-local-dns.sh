@@ -56,8 +56,16 @@ record() { # status label [detail]
 UID_NUM="$(id -u)"
 AGENT_PID=""
 
-# 1. LaunchAgent state
-if OUT="$(launchctl print "gui/$UID_NUM/$AGENT_LABEL" 2>&1)"; then
+# 0. Required tools. Absence must be a FAIL, never mistaken for "nothing there" (esp. --teardown).
+for tool in launchctl lsof head grep awk sed sort tr; do
+  command -v "$tool" >/dev/null 2>&1 || record FAIL "required command '$tool' not found"
+done
+
+# 1. LaunchAgent state. Only launchd's explicit "Could not find service" counts as absent;
+# any other failure (exec error, permission) is an error, not evidence of removal.
+LC_RC=0
+OUT="$(launchctl print "gui/$UID_NUM/$AGENT_LABEL" 2>&1)" || LC_RC=$?
+if [ "$LC_RC" -eq 0 ]; then
   AGENT_PID="$(printf '%s\n' "$OUT" | awk '/^[[:space:]]*pid = /{print $3; exit}')"
   if [ "$TEARDOWN" -eq 1 ]; then
     record FAIL "launchd agent $AGENT_LABEL still loaded after teardown"
@@ -66,10 +74,14 @@ if OUT="$(launchctl print "gui/$UID_NUM/$AGENT_LABEL" 2>&1)"; then
   else
     record FAIL "launchd agent $AGENT_LABEL loaded but not running"
   fi
-elif [ "$TEARDOWN" -eq 1 ]; then
-  record PASS "launchd agent $AGENT_LABEL not loaded"
+elif printf '%s\n' "$OUT" | grep -q 'Could not find service'; then
+  if [ "$TEARDOWN" -eq 1 ]; then
+    record PASS "launchd agent $AGENT_LABEL not loaded"
+  else
+    record FAIL "launchd agent $AGENT_LABEL not loaded in gui/$UID_NUM"
+  fi
 else
-  record FAIL "launchd agent $AGENT_LABEL not loaded in gui/$UID_NUM"
+  record FAIL "launchctl print failed" "rc=$LC_RC: $(printf '%s' "$OUT" | head -c 200 | tr '\n' ' ')"
 fi
 
 # 2. status.json must agree with launchd and report no error (not applicable after teardown)
@@ -95,9 +107,24 @@ else
 fi
 
 # 3. Port ownership: UDP and TCP LISTEN must both belong solely to the agent
-UDP_PIDS="$(lsof -nP -iUDP:$PORT -t 2>/dev/null | sort -u | tr '\n' ' ' || true)"
-TCP_PIDS="$(lsof -nP -iTCP:$PORT -sTCP:LISTEN -t 2>/dev/null | sort -u | tr '\n' ' ' || true)"
-if [ "$TEARDOWN" -eq 1 ]; then
+# lsof exits 1 with no output when nothing matches; any other outcome is an error.
+LSOF_ERR=""
+lsof_pids() { # args: <result var> <lsof selector>... ; stores space-separated PIDs
+  local var="$1" out rc=0 pids=""
+  shift
+  out="$(lsof -nP "$@" -t 2>&1)" || rc=$?
+  if [ "$rc" -eq 0 ] || { [ "$rc" -eq 1 ] && [ -z "$out" ]; }; then
+    pids="$(printf '%s\n' "$out" | grep -E '^[0-9]+$' | sort -u | tr '\n' ' ' || true)"
+  else
+    LSOF_ERR="lsof rc=$rc"
+  fi
+  printf -v "$var" '%s' "$pids"
+}
+lsof_pids UDP_PIDS -iUDP:$PORT
+lsof_pids TCP_PIDS -iTCP:$PORT -sTCP:LISTEN
+if [ -n "$LSOF_ERR" ]; then
+  record FAIL "port $PORT ownership could not be determined" "$LSOF_ERR"
+elif [ "$TEARDOWN" -eq 1 ]; then
   if [ -z "${UDP_PIDS% }" ] && [ -z "${TCP_PIDS% }" ]; then
     record PASS "port $PORT unowned after teardown"
   else
@@ -111,14 +138,21 @@ fi
 
 # 4. ClusterDeck-managed resolver files (regular files only, marker on line 1)
 MANAGED=0
+RESOLVER_ERRORS=0
 for f in /etc/resolver/*; do
   { [ -f "$f" ] && [ ! -L "$f" ]; } || continue
-  if head -n 1 "$f" | grep -q '^# managed by ClusterDeck (profile: '; then
+  # An unreadable file might be ClusterDeck's; never count it as absent.
+  if ! FIRST_LINE="$(head -n 1 "$f" 2>/dev/null)"; then
+    RESOLVER_ERRORS=$((RESOLVER_ERRORS + 1))
+    echo "   unreadable resolver file: $(basename "$f")"
+  elif [[ "$FIRST_LINE" == "# managed by ClusterDeck (profile: "* ]]; then
     MANAGED=$((MANAGED + 1))
     echo "   managed resolver file: $(basename "$f")"
   fi
 done
-if [ "$TEARDOWN" -eq 1 ]; then
+if [ "$RESOLVER_ERRORS" -gt 0 ]; then
+  record FAIL "/etc/resolver files could not be read" "unreadable=$RESOLVER_ERRORS"
+elif [ "$TEARDOWN" -eq 1 ]; then
   if [ "$MANAGED" -eq 0 ]; then
     record PASS "no managed /etc/resolver files after teardown"
   else
