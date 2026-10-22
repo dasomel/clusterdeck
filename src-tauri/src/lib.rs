@@ -12,7 +12,9 @@ pub fn run() {
             if let Ok(paths) = services::paths::ClusterDeckPaths::resolve() {
                 tauri::async_runtime::spawn(async move {
                     let runner = services::process::SystemRunner;
-                    let reaped = services::tunnel::reap_orphans(&runner, &paths).await;
+                    let reaped =
+                        services::tunnel::reap_orphans(&runner, &paths, services::tunnel::global())
+                            .await;
                     for r in reaped {
                         if let services::tunnel::ReapOutcome::Killed { pid } = r.outcome {
                             eprintln!(

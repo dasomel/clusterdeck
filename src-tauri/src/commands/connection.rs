@@ -355,29 +355,53 @@ async fn ensure_verify_tunnel(
 /// that had one would sit at `connection refused` until it is individually verified. Re-opens
 /// each such profile's tunnel through the same guarded path Verify uses; a profile with no
 /// persisted target, no kubeconfig on disk, or no bastion is left alone. One profile's failure
-/// never stops the others.
+/// never stops the others. When the tunnel came back on a different port the merged
+/// `~/.kube/config` is refreshed, as `verify_profile` does -- a later Verify would see the
+/// kubeconfig already retargeted and skip the merge.
 pub async fn restore_tunnels(
     tunnels: &crate::services::tunnel::TunnelManager,
     runner: &dyn CommandRunner,
     paths: &ClusterDeckPaths,
 ) -> Vec<(String, Result<bool, String>)> {
-    let Ok(profiles) = store::load_profiles(paths) else {
-        return Vec::new();
+    // A missing profiles.yaml loads as empty; an Err is a real read/parse failure.
+    let profiles = match store::load_profiles(paths) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("[ClusterDeck] tunnel restore skipped: cannot load profiles: {e}");
+            return Vec::new();
+        }
     };
     let mut results = Vec::new();
     for profile in profiles {
+        if tunnels.is_shutting_down() {
+            break;
+        }
         let kubeconfig_path = paths.kubeconfig_file(&profile.id);
-        let had_tunnel = matches!(state::get_tunnel_target(paths, &profile.id), Ok(Some(_)));
-        if profile.bastion.is_none()
-            || profile.kubeconfig.is_none()
-            || !kubeconfig_path.exists()
-            || !had_tunnel
-        {
+        if profile.bastion.is_none() || profile.kubeconfig.is_none() || !kubeconfig_path.exists() {
             continue;
+        }
+        // A missing state.json or entry is "no tunnel"; an unreadable one is logged, not hidden.
+        match state::get_tunnel_target(paths, &profile.id) {
+            Ok(Some(_)) => {}
+            Ok(None) => continue,
+            Err(e) => {
+                eprintln!(
+                    "[ClusterDeck] tunnel restore skipped for '{}': cannot read state: {e}",
+                    profile.id
+                );
+                continue;
+            }
         }
         let outcome =
             ensure_verify_tunnel(tunnels, runner, paths, &profile, &kubeconfig_path).await;
-        results.push((profile.id.clone(), outcome));
+        // Merge per profile, not after the loop: the kubeconfig is already retargeted, so if the
+        // app quits mid-restore a later run sees `Ok(false)` and would never merge this one.
+        if matches!(outcome, Ok(true)) {
+            if let Some(e) = auto_merge_if_present(runner, paths, &profile).await {
+                eprintln!("profile '{}': {e}", profile.id);
+            }
+        }
+        results.push((profile.id, outcome));
     }
     results
 }
@@ -1649,6 +1673,147 @@ mod tests {
             .as_ref()
             .unwrap_err()
             .contains("API tunnel failed"));
+        std::fs::remove_dir_all(&paths.base).ok();
+    }
+
+    struct AllOpenProbe;
+
+    #[async_trait]
+    impl crate::services::tunnel::PortProbe for AllOpenProbe {
+        fn is_bindable(&self, _port: u16) -> bool {
+            true
+        }
+        async fn is_open(&self, _port: u16) -> bool {
+            true
+        }
+    }
+
+    struct AliveProcess;
+
+    #[async_trait]
+    impl crate::services::process::BackgroundProcess for AliveProcess {
+        fn try_exit_status(&mut self) -> Option<i32> {
+            None
+        }
+        fn pid(&self) -> Option<u32> {
+            Some(4242)
+        }
+        async fn kill(&mut self) {}
+        async fn stderr_tail(&mut self) -> String {
+            String::new()
+        }
+    }
+
+    /// Every ssh spawn succeeds and stays alive; `lsof` is unavailable (readiness then rests on
+    /// the probe alone); other commands succeed with empty output.
+    struct SpawnOkRunner {
+        spawns: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl CommandRunner for SpawnOkRunner {
+        async fn run(&self, bin: &str, _args: &[String]) -> Result<CommandOutput, String> {
+            if bin == "lsof" {
+                return Err("'lsof' executable not found".to_string());
+            }
+            Ok(CommandOutput {
+                stdout: String::new(),
+                stderr: String::new(),
+                success: true,
+            })
+        }
+        async fn spawn_background(
+            &self,
+            _bin: &str,
+            _args: &[String],
+        ) -> Result<Box<dyn crate::services::process::BackgroundProcess>, String> {
+            self.spawns.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(AliveProcess))
+        }
+    }
+
+    fn open_manager() -> crate::services::tunnel::TunnelManager {
+        crate::services::tunnel::TunnelManager::new(std::sync::Arc::new(AllOpenProbe))
+    }
+
+    /// A restorable bastion profile: stored, with a persisted tunnel target and a pinned-TLS
+    /// kubeconfig whose server port is `server_port`.
+    fn seed_restorable(paths: &ClusterDeckPaths, id: &str, server_port: u16, tls: &str) {
+        let mut profile = bastion_profile();
+        profile.id = id.into();
+        store::upsert_profile(paths, profile).unwrap();
+        state::save_tunnel_target(
+            paths,
+            id,
+            &crate::services::tunnel::TunnelTarget {
+                host: "127.0.0.1".to_string(),
+                port: 6443,
+            },
+        )
+        .unwrap();
+        paths.ensure_dirs().unwrap();
+        std::fs::write(
+            paths.kubeconfig_file(id),
+            format!(
+                "clusters:\n  - name: {id}\n    cluster:\n      server: https://127.0.0.1:{server_port}\n{tls}\ncontexts:\n  - name: {id}\n    context:\n      cluster: {id}\n      user: {id}\nusers:\n  - name: {id}\n    user:\n      token: t\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    const PINNED_TLS: &str = "      certificate-authority-data: ZmFrZS1jYQ==";
+
+    #[tokio::test]
+    async fn restore_tunnels_reports_retarget_then_no_change() {
+        let paths = tunnel_test_paths("restore-retarget");
+        // Port 1 is outside the tunnel port range, so the first restore must retarget.
+        seed_restorable(&paths, "cdtest-ret", 1, PINNED_TLS);
+        let runner = SpawnOkRunner {
+            spawns: AtomicUsize::new(0),
+        };
+
+        let first = restore_tunnels(&open_manager(), &runner, &paths).await;
+        assert!(matches!(first[0].1, Ok(true)), "{:?}", first[0].1);
+
+        // Same profile id picks the same preferred port, so nothing changes the second time.
+        let second = restore_tunnels(&open_manager(), &runner, &paths).await;
+        assert!(matches!(second[0].1, Ok(false)), "{:?}", second[0].1);
+        std::fs::remove_dir_all(&paths.base).ok();
+    }
+
+    #[tokio::test]
+    async fn restore_tunnels_continues_after_a_profile_fails() {
+        let paths = tunnel_test_paths("restore-multi");
+        // "cdtest-aaa" has no pinned TLS, so the guarded path refuses it; "cdtest-bbb" must still be tried.
+        seed_restorable(&paths, "cdtest-aaa", 1, "");
+        seed_restorable(&paths, "cdtest-bbb", 1, PINNED_TLS);
+        let runner = SpawnOkRunner {
+            spawns: AtomicUsize::new(0),
+        };
+
+        let results = restore_tunnels(&open_manager(), &runner, &paths).await;
+
+        assert_eq!(results.len(), 2);
+        let by_id: std::collections::HashMap<_, _> =
+            results.iter().map(|(id, r)| (id.as_str(), r)).collect();
+        assert!(by_id["cdtest-aaa"].is_err());
+        assert!(matches!(by_id["cdtest-bbb"], Ok(true)));
+        assert_eq!(runner.spawns.load(Ordering::SeqCst), 1);
+        std::fs::remove_dir_all(&paths.base).ok();
+    }
+
+    #[tokio::test]
+    async fn restore_tunnels_skips_a_profile_without_a_bastion() {
+        let paths = tunnel_test_paths("restore-no-bastion");
+        seed_restorable(&paths, "cdtest-ret", 1, PINNED_TLS);
+        let mut profile = bastion_profile();
+        profile.id = "cdtest-ret".into();
+        profile.bastion = None;
+        store::upsert_profile(&paths, profile).unwrap();
+
+        let results = restore_tunnels(&open_manager(), &NeverCalledRunner, &paths).await;
+
+        assert!(results.is_empty());
         std::fs::remove_dir_all(&paths.base).ok();
     }
 
