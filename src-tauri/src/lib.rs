@@ -12,12 +12,29 @@ pub fn run() {
             if let Ok(paths) = services::paths::ClusterDeckPaths::resolve() {
                 tauri::async_runtime::spawn(async move {
                     let runner = services::process::SystemRunner;
-                    let reaped = services::tunnel::reap_orphans(&runner, &paths).await;
+                    let reaped =
+                        services::tunnel::reap_orphans(&runner, &paths, services::tunnel::global())
+                            .await;
                     for r in reaped {
                         if let services::tunnel::ReapOutcome::Killed { pid } = r.outcome {
                             eprintln!(
                                 "[ClusterDeck] reaped orphaned SSH tunnel (PID {}, profile '{}')",
                                 pid, r.profile_id
+                            );
+                        }
+                    }
+                    // Issue #111: after reaping (so preferred ports are free), bring back the
+                    // tunnels of profiles that had one when the app last exited.
+                    for (profile_id, outcome) in commands::connection::restore_tunnels(
+                        services::tunnel::global(),
+                        &runner,
+                        &paths,
+                    )
+                    .await
+                    {
+                        if let Err(e) = outcome {
+                            eprintln!(
+                                "[ClusterDeck] could not restore API tunnel for '{profile_id}': {e}"
                             );
                         }
                     }

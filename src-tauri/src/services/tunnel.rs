@@ -21,6 +21,7 @@ const PORT_RANGE_START: u16 = 16443;
 const PORT_RANGE_LEN: u16 = 1000;
 const READY_POLL: Duration = Duration::from_millis(200);
 const READY_TIMEOUT: Duration = Duration::from_secs(10);
+const SHUTTING_DOWN: &str = "ClusterDeck is shutting down";
 
 /// API server host/port as seen from the control plane (the `-L` destination).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -150,12 +151,24 @@ type Slot = Arc<Mutex<Option<TunnelEntry>>>;
 
 pub struct TunnelManager {
     slots: Mutex<HashMap<String, Slot>>,
-    /// Pids of ssh children still in their readiness wait. Deliberately outside the slot lock:
-    /// `stop_all` must be able to kill them while `ensure_tunnel` holds that lock.
-    in_flight: std::sync::Mutex<HashMap<String, u32>>,
+    /// Shutdown flag and child pids behind ONE std mutex (never held across an await), so that
+    /// "registering a freshly spawned child" and "stop_all collecting the pids" are atomic with
+    /// respect to each other: a child is either seen by `stop_all` or refused and killed by its
+    /// own spawner. Deliberately outside the slot lock: `stop_all` must be able to kill children
+    /// while `ensure_tunnel` holds that lock.
+    lifecycle: std::sync::Mutex<Lifecycle>,
     probe: Arc<dyn PortProbe>,
     ready_poll: Duration,
     ready_timeout: Duration,
+}
+
+#[derive(Default)]
+struct Lifecycle {
+    /// Set first thing by `stop_all`: a restore or Verify racing the app exit must not leave an
+    /// ssh behind, since `stop_all` also deletes the records the next start would reap it by.
+    shutting_down: bool,
+    /// Pid of each profile's current ssh child, from spawn until it is stopped or replaced.
+    pids: HashMap<String, u32>,
 }
 
 /// Why one spawn attempt failed. `bind_failure` marks a local-port conflict that is worth one
@@ -215,7 +228,7 @@ impl TunnelManager {
     pub fn new(probe: Arc<dyn PortProbe>) -> Self {
         Self {
             slots: Mutex::new(HashMap::new()),
-            in_flight: std::sync::Mutex::new(HashMap::new()),
+            lifecycle: std::sync::Mutex::new(Lifecycle::default()),
             probe,
             ready_poll: READY_POLL,
             ready_timeout: READY_TIMEOUT,
@@ -263,6 +276,9 @@ impl TunnelManager {
 
         let slot = self.slot(&profile.id).await;
         let mut entry = slot.lock().await;
+        if self.is_shutting_down() {
+            return Err(SHUTTING_DOWN.to_string());
+        }
         if let Some(mut old) = entry.take() {
             if old.target == target
                 && old.process.try_exit_status().is_none()
@@ -273,6 +289,7 @@ impl TunnelManager {
                 return Ok(port);
             }
             old.process.kill().await;
+            self.forget_pid(&profile.id);
             let _ = remove_tunnel_record(paths, &profile.id);
         }
 
@@ -282,6 +299,9 @@ impl TunnelManager {
 
         let mut excluded: Vec<u16> = Vec::new();
         for attempt in 0..2 {
+            if self.is_shutting_down() {
+                return Err(SHUTTING_DOWN.to_string());
+            }
             let port = choose_port(&profile.id, self.probe.as_ref(), &excluded)?;
             let argv = tunnel_argv(&ssh_conf, port, &target, &alias)?;
             let record = TunnelRecord {
@@ -299,7 +319,11 @@ impl TunnelManager {
             let started = self
                 .start_once(runner, paths, &profile.id, &argv, port, record)
                 .await;
-            self.in_flight.lock().unwrap().remove(&profile.id);
+            // On success the pid stays registered: the slot is still locked by us, so only the
+            // pid lets a concurrent `stop_all` reach this child.
+            if started.is_err() {
+                self.forget_pid(&profile.id);
+            }
             match started {
                 Ok(process) => {
                     // Best effort: the tunnel works without it; only a later verify after an
@@ -343,11 +367,25 @@ impl TunnelManager {
         let mut process = runner.spawn_background("ssh", argv).await.map_err(other)?;
 
         let pid = process.pid();
+        // Register under the same lock `stop_all` flips the flag with: if shutdown already
+        // began, nobody will ever collect this child, so kill it here.
+        let refused = {
+            let mut lc = self.lifecycle.lock().unwrap();
+            if lc.shutting_down {
+                true
+            } else {
+                if let Some(pid) = pid {
+                    lc.pids.insert(profile_id.to_string(), pid);
+                }
+                false
+            }
+        };
+        if refused {
+            process.kill().await;
+            let _ = remove_tunnel_record(paths, profile_id);
+            return Err(other(SHUTTING_DOWN.to_string()));
+        }
         if let Some(pid) = pid {
-            self.in_flight
-                .lock()
-                .unwrap()
-                .insert(profile_id.to_string(), pid);
             let mut rec = record;
             rec.pid = pid;
             let _ = write_tunnel_record(paths, &rec);
@@ -400,6 +438,14 @@ impl TunnelManager {
         }
     }
 
+    pub fn is_shutting_down(&self) -> bool {
+        self.lifecycle.lock().unwrap().shutting_down
+    }
+
+    fn forget_pid(&self, profile_id: &str) {
+        self.lifecycle.lock().unwrap().pids.remove(profile_id);
+    }
+
     /// The live tunnel's target for `profile_id`, if any. A slot busy with an in-flight
     /// `ensure_tunnel` has no live tunnel yet.
     pub async fn live_target(&self, profile_id: &str) -> Option<TunnelTarget> {
@@ -429,6 +475,7 @@ impl TunnelManager {
                 entry.process.kill().await;
             }
         }
+        self.forget_pid(profile_id);
         if let Ok(paths) = ClusterDeckPaths::resolve() {
             let _ = remove_tunnel_record(&paths, profile_id);
         }
@@ -457,18 +504,29 @@ impl TunnelManager {
     }
 
     async fn stop_all_internal(&self, runner: &dyn CommandRunner) {
-        let slots: Vec<Slot> = self.slots.lock().await.values().cloned().collect();
-        for slot in slots {
+        self.lifecycle.lock().unwrap().shutting_down = true;
+        let slots: Vec<(String, Slot)> = self
+            .slots
+            .lock()
+            .await
+            .iter()
+            .map(|(id, slot)| (id.clone(), slot.clone()))
+            .collect();
+        for (id, slot) in slots {
             if let Ok(mut guard) = slot.try_lock() {
                 if let Some(mut entry) = guard.take() {
                     entry.process.kill().await;
+                    self.forget_pid(&id);
                 }
             }
         }
+        // What is left belongs to slots busy in `ensure_tunnel` (or has no entry); an idle
+        // slot's pid was just dropped so a stale, possibly recycled pid is never signalled.
         let pids: Vec<u32> = self
-            .in_flight
+            .lifecycle
             .lock()
             .unwrap()
+            .pids
             .drain()
             .map(|(_, p)| p)
             .collect();
@@ -676,7 +734,14 @@ pub async fn reap_profile_orphan(
     Some(reap_single_orphan(runner, paths, &record).await)
 }
 
-pub async fn reap_orphans(runner: &dyn CommandRunner, paths: &ClusterDeckPaths) -> Vec<ReapResult> {
+/// Reaps records left by a previous run. Records of profiles `tunnels` already owns are
+/// skipped: the startup reaper runs concurrently with user actions, and a tunnel just created
+/// by Connect/Verify is not an orphan.
+pub async fn reap_orphans(
+    runner: &dyn CommandRunner,
+    paths: &ClusterDeckPaths,
+    tunnels: &TunnelManager,
+) -> Vec<ReapResult> {
     let records = match list_tunnel_records(paths) {
         Ok(r) => r,
         Err(e) => {
@@ -687,13 +752,39 @@ pub async fn reap_orphans(runner: &dyn CommandRunner, paths: &ClusterDeckPaths) 
 
     let mut results = Vec::new();
     for record in records {
-        let outcome = reap_single_orphan(runner, paths, &record).await;
+        let Some(outcome) = reap_if_unchanged(runner, paths, tunnels, &record).await else {
+            continue;
+        };
         results.push(ReapResult {
             profile_id: record.profile_id.clone(),
             outcome,
         });
     }
     results
+}
+
+/// Reaps `record` only if, with the profile's slot held, it is still the record on disk and
+/// this process owns no tunnel for the profile. The slot stays locked across the `ps`/`kill`
+/// awaits, so a Connect cannot replace the record (and have the new one deleted) midway; a busy
+/// or occupied slot means a user action owns the profile and the record is not an orphan.
+async fn reap_if_unchanged(
+    runner: &dyn CommandRunner,
+    paths: &ClusterDeckPaths,
+    tunnels: &TunnelManager,
+    record: &TunnelRecord,
+) -> Option<ReapOutcome> {
+    let slot = tunnels.slot(&record.profile_id).await;
+    let guard = slot.try_lock().ok()?;
+    if guard.is_some() {
+        return None;
+    }
+    match read_tunnel_record(paths, &record.profile_id) {
+        Ok(Some(current)) if current == *record => {}
+        _ => return None,
+    }
+    let outcome = reap_single_orphan(runner, paths, record).await;
+    drop(guard);
+    Some(outcome)
 }
 
 #[cfg(test)]
@@ -1202,6 +1293,146 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn ensure_tunnel_is_refused_after_stop_all() {
+        let runner = FakeRunner::new(vec![Script::alive()]);
+        let manager = TunnelManager::new(FakeProbe::new(true));
+        let paths = temp_paths("after-stop-all");
+        manager.stop_all_with_paths(&runner, &paths).await;
+
+        let err = manager
+            .ensure_tunnel(&runner, &paths, &profile(), "127.0.0.1", 6443)
+            .await
+            .unwrap_err();
+
+        assert!(err.contains("shutting down"), "{err}");
+        assert_eq!(runner.spawns.load(Ordering::SeqCst), 0);
+        std::fs::remove_dir_all(&paths.base).ok();
+    }
+
+    /// Spawns like `FakeRunner`, but runs `stop_all` right after the child exists and before
+    /// `start_once` registers its pid: the interleaving that used to leak the child.
+    struct StopAllDuringSpawn<'a> {
+        inner: FakeRunner,
+        manager: &'a TunnelManager,
+        killed: Arc<AtomicBool>,
+    }
+
+    struct KillFlagProcess(Arc<AtomicBool>);
+
+    #[async_trait]
+    impl BackgroundProcess for KillFlagProcess {
+        fn pid(&self) -> Option<u32> {
+            Some(4242)
+        }
+        fn try_exit_status(&mut self) -> Option<i32> {
+            self.0.load(Ordering::SeqCst).then_some(-1)
+        }
+        async fn kill(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+        async fn stderr_tail(&mut self) -> String {
+            String::new()
+        }
+    }
+
+    #[async_trait]
+    impl CommandRunner for StopAllDuringSpawn<'_> {
+        async fn run(&self, bin: &str, args: &[String]) -> Result<CommandOutput, String> {
+            self.inner.run(bin, args).await
+        }
+        async fn spawn_background(
+            &self,
+            _bin: &str,
+            _args: &[String],
+        ) -> Result<Box<dyn BackgroundProcess>, String> {
+            self.manager.stop_all(&self.inner).await;
+            Ok(Box::new(KillFlagProcess(self.killed.clone())))
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stop_all_between_spawn_and_registration_kills_the_child() {
+        let manager = TunnelManager::new(FakeProbe::new(true));
+        let killed = Arc::new(AtomicBool::new(false));
+        let runner = StopAllDuringSpawn {
+            inner: FakeRunner::new(vec![Script::alive()]),
+            manager: &manager,
+            killed: killed.clone(),
+        };
+        let paths = temp_paths("stop-during-spawn");
+
+        let err = manager
+            .ensure_tunnel(&runner, &paths, &profile(), "127.0.0.1", 6443)
+            .await
+            .unwrap_err();
+
+        assert!(err.contains("shutting down"), "{err}");
+        assert!(killed.load(Ordering::SeqCst), "child must be killed");
+        assert!(manager.lifecycle.lock().unwrap().pids.is_empty());
+        assert!(read_tunnel_record(&paths, "lab").unwrap().is_none());
+        std::fs::remove_dir_all(&paths.base).ok();
+    }
+
+    #[tokio::test]
+    async fn reaper_does_not_touch_a_record_replaced_after_listing() {
+        let paths = temp_paths("reap-replaced");
+        let prof = profile();
+        let make = |pid: u32| TunnelRecord {
+            profile_id: prof.id.clone(),
+            pid,
+            port: preferred_port(&prof.id),
+            target: TunnelTarget {
+                host: "10.0.0.10".into(),
+                port: 6443,
+            },
+            ssh_conf: paths.ssh_conf(&prof.id),
+            alias: "lab-cp1".into(),
+            started_at_epoch_s: 1700000000,
+        };
+        let stale = make(1111);
+        write_tunnel_record(&paths, &stale).unwrap();
+        // A Connect replaces the record after the reaper listed `stale`.
+        let fresh = make(2222);
+        write_tunnel_record(&paths, &fresh).unwrap();
+        let runner = FakeRunner::new(vec![]);
+        let manager = TunnelManager::new(FakeProbe::new(true));
+
+        let outcome = reap_if_unchanged(&runner, &paths, &manager, &stale).await;
+
+        assert!(outcome.is_none());
+        assert!(runner.killed.lock().unwrap().is_empty());
+        assert_eq!(read_tunnel_record(&paths, "lab").unwrap(), Some(fresh));
+
+        // A slot busy in `ensure_tunnel` is also off limits.
+        let slot = manager.slot("lab").await;
+        let _busy = slot.lock().await;
+        let current = read_tunnel_record(&paths, "lab").unwrap().unwrap();
+        assert!(reap_if_unchanged(&runner, &paths, &manager, &current)
+            .await
+            .is_none());
+        std::fs::remove_dir_all(&paths.base).ok();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reap_orphans_skips_a_tunnel_the_manager_owns() {
+        let runner = FakeRunner::new(vec![Script::alive()]);
+        let manager = TunnelManager::new(FakeProbe::new(true));
+        let paths = temp_paths("reap-managed");
+        manager
+            .ensure_tunnel(&runner, &paths, &profile(), "127.0.0.1", 6443)
+            .await
+            .unwrap();
+        assert!(read_tunnel_record(&paths, "lab").unwrap().is_some());
+
+        let reaped = reap_orphans(&runner, &paths, &manager).await;
+
+        assert!(reaped.is_empty());
+        assert!(runner.killed.lock().unwrap().is_empty());
+        assert!(read_tunnel_record(&paths, "lab").unwrap().is_some());
+        std::fs::remove_dir_all(&paths.base).ok();
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn foreign_lsof_owner_is_never_adopted() {
         let runner = FakeRunner::new(vec![Script::alive()]).with_lsof("9999\n");
         let manager = TunnelManager::new(FakeProbe::new(true));
@@ -1292,7 +1523,7 @@ mod tests {
         );
         let runner = FakeRunner::new(vec![]).with_ps(pid, &cmdline, true);
 
-        let reaped = reap_orphans(&runner, &paths).await;
+        let reaped = reap_orphans(&runner, &paths, &TunnelManager::new(FakeProbe::new(true))).await;
         assert_eq!(reaped.len(), 1);
         assert_eq!(reaped[0].profile_id, "lab");
         assert_eq!(reaped[0].outcome, ReapOutcome::Killed { pid });
@@ -1327,7 +1558,7 @@ mod tests {
             "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome --type=renderer";
         let runner = FakeRunner::new(vec![]).with_ps(pid, innocent_cmdline, true);
 
-        let reaped = reap_orphans(&runner, &paths).await;
+        let reaped = reap_orphans(&runner, &paths, &TunnelManager::new(FakeProbe::new(true))).await;
         assert_eq!(reaped.len(), 1);
         assert_eq!(reaped[0].profile_id, "lab");
         assert!(matches!(
@@ -1363,7 +1594,7 @@ mod tests {
         // ps exits with error/not found
         let runner = FakeRunner::new(vec![]).with_ps(pid, "", false);
 
-        let reaped = reap_orphans(&runner, &paths).await;
+        let reaped = reap_orphans(&runner, &paths, &TunnelManager::new(FakeProbe::new(true))).await;
         assert_eq!(reaped.len(), 1);
         assert_eq!(reaped[0].profile_id, "lab");
         assert_eq!(reaped[0].outcome, ReapOutcome::AlreadyDead { pid });
@@ -1455,7 +1686,7 @@ mod tests {
         let runner = FakeRunner::new(vec![]).with_ps(pid, &cmdline, true);
 
         // Next app startup reaps the crashed child
-        let reaped = reap_orphans(&runner, &paths).await;
+        let reaped = reap_orphans(&runner, &paths, &TunnelManager::new(FakeProbe::new(true))).await;
         assert_eq!(reaped.len(), 1);
         assert_eq!(reaped[0].outcome, ReapOutcome::Killed { pid });
         assert_eq!(*runner.killed.lock().unwrap(), vec![format!("-9 {pid}")]);

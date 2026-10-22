@@ -24,9 +24,9 @@ For a profile with a `bastion`, `connect_profile` fetches the kubeconfig over SS
 - The tunnel lives only while ClusterDeck runs. A context merged into `~/.kube/config` for a bastion profile therefore points at `127.0.0.1:<L>` and works only while the app is running.
 - One long-lived `ssh` per bastion profile; ports 16443-17442 are reserved for this purpose.
 - The local port can change (the preferred port may be taken after a restart). Verify then retargets the profile kubeconfig and, only if the profile is already merged into `~/.kube/config`, re-merges it automatically.
-- A tunnel is revived only by Connect or Verify; nothing restarts it in the background if ssh dies.
+- On startup the app restores the tunnel of every bastion profile that had one (persisted target, kubeconfig on disk), re-merging `~/.kube/config` if the port changed (Issue #111). Otherwise a tunnel is revived only by Connect or Verify; nothing restarts it in the background if ssh dies mid-session.
 - A tunnel that fails to start during Connect also clears the persisted target, because the kubeconfig is then written with the direct endpoint; Verify cannot self-heal it, and the next successful Connect re-establishes it.
-- Known limitation: after a crash or force-quit the `ssh -N` child can be orphaned and keep its port. There is no pidfile reaping yet; the next start picks another port, and the orphan must be killed manually.
+- After a crash or force-quit the `ssh -N` child can be orphaned. Each tunnel is recorded in `~/.clusterdeck/tunnels/<profile>.json`; on startup, before restoring, orphans are reaped only when the recorded pid's command line still matches that tunnel (a recycled pid is spared) and the running app does not already own a tunnel for that profile. Quitting normally stops all tunnels and refuses new ones from that point. Remaining limit: an orphan whose record is missing (or deleted) is not found and keeps its port until killed manually; the next start then picks another port.
 
 ## Alternatives considered
 
