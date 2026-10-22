@@ -2,13 +2,42 @@
 import Foundation
 import CFNetwork
 
+// Exit codes: 0 pass | 1 usage | 2 resolver stall | 3 wrong IP | 4 unexpected
+// resolution result | 5 URLSession probe failed or timed out
+let usage = """
+Usage: swift verify-safari-resolution.swift <hostname> [--expect-ip <ipv4>] [--expect-failure]
+  --expect-ip <ipv4>  PASS only if the hostname resolves and <ipv4> is among the answers
+  --expect-failure    PASS only if resolution fails fast (clean NXDOMAIN, no stall)
+Without either option, the hostname must resolve to at least one IPv4 address.
+"""
+
+var hostName: String?
+var expectedIp: String?
+var expectFailure = false
+var argIndex = 1
 let arguments = CommandLine.arguments
-guard arguments.count >= 2 else {
-    print("Usage: swift verify-safari-resolution.swift <hostname>")
+while argIndex < arguments.count {
+    switch arguments[argIndex] {
+    case "--expect-ip":
+        argIndex += 1
+        guard argIndex < arguments.count else { print(usage); exit(1) }
+        expectedIp = arguments[argIndex]
+    case "--expect-failure":
+        expectFailure = true
+    case "-h", "--help":
+        print(usage)
+        exit(0)
+    default:
+        guard hostName == nil, !arguments[argIndex].hasPrefix("--") else { print(usage); exit(1) }
+        hostName = arguments[argIndex]
+    }
+    argIndex += 1
+}
+guard let hostName = hostName, !(expectFailure && expectedIp != nil) else {
+    print(usage)
     exit(1)
 }
 
-let hostName = arguments[1]
 print("==================================================")
 print("🌐 Testing Safari / Apple Network Framework Stack")
 print("Target: \(hostName)")
@@ -17,14 +46,17 @@ print("==================================================")
 // Step 1: Pure CFNetwork / CFHost resolution (exact DNS stack used by Safari/mDNSResponder)
 let startDns = Date()
 let host = CFHostCreateWithName(nil, hostName as CFString).takeRetainedValue()
-let success = CFHostStartInfoResolution(host, .addresses, nil)
+var cfError = CFStreamError()
+let success = CFHostStartInfoResolution(host, .addresses, &cfError)
 let elapsedDns = Date().timeIntervalSince(startDns)
 let elapsedDnsMs = String(format: "%.1f ms", elapsedDns * 1000)
 
-var resolvedIps: [String] = []
+var resolvedIps: [String] = []   // IPv4 only, used for the IP comparison
+var addressCount = 0             // every family, so AAAA-only hosts are not mistaken for NXDOMAIN
 if success {
     var resolved: DarwinBoolean = false
     if let addresses = CFHostGetAddressing(host, &resolved)?.takeUnretainedValue() as? [Data], resolved.boolValue {
+        addressCount = addresses.count
         resolvedIps = addresses.compactMap { data -> String? in
             data.withUnsafeBytes { rawBuffer -> String? in
                 guard let baseAddr = rawBuffer.baseAddress else { return nil }
@@ -42,44 +74,69 @@ if success {
     }
 }
 
-if !resolvedIps.isEmpty {
-    print("✅ Apple Network Stack RESOLVED in \(elapsedDnsMs):")
-    print("   IP Addresses: \(resolvedIps.joined(separator: ", "))")
-} else {
-    if elapsedDns > 4.5 && !hostName.hasSuffix(".local") {
-        print("❌ D-DEAD STALL DETECTED in \(elapsedDnsMs) (Exceeded 4.5s threshold!)")
-        exit(2)
-    } else if elapsedDns > 4.5 && hostName.hasSuffix(".local") {
-        print("ℹ️ NXDOMAIN for .local in \(elapsedDnsMs) (Apple mDNS multicast probe fallback)")
-    } else {
-        print("ℹ️ FAST NXDOMAIN in \(elapsedDnsMs): Host not found (Clean negative answer)")
-    }
+// A slow answer is a failure even when it is correct: that is the 30s-stall symptom.
+if elapsedDns > 4.5 {
+    print("❌ STALL DETECTED in \(elapsedDnsMs) (exceeded 4.5s threshold)")
+    exit(2)
 }
 
-// Step 2: URLSession quick probe (if IP was resolved)
-if !resolvedIps.isEmpty {
-    let url = URL(string: "http://\(hostName)")!
-    let config = URLSessionConfiguration.ephemeral
-    config.timeoutIntervalForRequest = 2.0
-    config.timeoutIntervalForResource = 2.0
-    let session = URLSession(configuration: config)
-    
-    let sem = DispatchSemaphore(value: 0)
-    let startHttp = Date()
-    session.dataTask(with: url) { _, resp, err in
-        let elapsedHttp = Date().timeIntervalSince(startHttp)
-        let elapsedHttpMs = String(format: "%.1f ms", elapsedHttp * 1000)
-        if let http = resp as? HTTPURLResponse {
-            print("✅ Safari URLSession HTTP Response: \(http.statusCode) in \(elapsedHttpMs)")
-        } else if let err = err as? NSError {
-            if err.code == -1004 { // Could not connect to server (port closed)
-                print("✅ Safari URLSession TCP Connected/Refused in \(elapsedHttpMs) (Target IP reached)")
-            } else {
-                print("ℹ️ Safari URLSession Result in \(elapsedHttpMs): [\(err.domain) \(err.code)] \(err.localizedDescription)")
-            }
-        }
-        sem.signal()
-    }.resume()
-    _ = sem.wait(timeout: .now() + 2.5)
+if addressCount == 0 {
+    // Only a genuine name-not-found (NetDB EAI_NONAME) counts as a clean negative answer;
+    // other resolver errors (timeout, server failure) must not pass --expect-failure.
+    let nameNotFound = !success
+        && cfError.domain == CFIndex(kCFStreamErrorDomainNetDB)
+        && cfError.error == EAI_NONAME
+    if expectFailure && nameNotFound {
+        print("✅ FAST NXDOMAIN in \(elapsedDnsMs), as expected")
+        print("==================================================")
+        exit(0)
+    }
+    print("❌ Resolution FAILED in \(elapsedDnsMs) (cf domain \(cfError.domain), error \(cfError.error))"
+        + (expectFailure ? ": not a confirmed name-not-found" : ": host not found"))
+    exit(4)
+}
+print("✅ Apple Network Stack RESOLVED in \(elapsedDnsMs): \(addressCount) address(es)")
+print("   IPv4 Addresses: \(resolvedIps.joined(separator: ", "))")
+if expectFailure {
+    print("❌ Expected resolution failure but the host resolved")
+    exit(4)
+}
+if resolvedIps.isEmpty {
+    print("❌ No IPv4 address returned (IPv6-only answer)")
+    exit(4)
+}
+if let expectedIp = expectedIp, !resolvedIps.contains(expectedIp) {
+    print("❌ IP MISMATCH: expected \(expectedIp), got \(resolvedIps.joined(separator: ", "))")
+    exit(3)
+}
+
+// Step 2: URLSession probe. A bare TCP refusal still proves the resolved IP was reachable.
+let url = URL(string: "http://\(hostName)")!
+let config = URLSessionConfiguration.ephemeral
+config.timeoutIntervalForRequest = 2.0
+config.timeoutIntervalForResource = 2.0
+let session = URLSession(configuration: config)
+
+final class ProbeResult: @unchecked Sendable { var ok = false }
+let probe = ProbeResult()
+let sem = DispatchSemaphore(value: 0)
+let startHttp = Date()
+session.dataTask(with: url) { _, resp, err in
+    let elapsedHttpMs = String(format: "%.1f ms", Date().timeIntervalSince(startHttp) * 1000)
+    if let http = resp as? HTTPURLResponse {
+        print("✅ Safari URLSession HTTP Response: \(http.statusCode) in \(elapsedHttpMs)")
+        probe.ok = true
+    } else if let err = err as NSError?, err.code == NSURLErrorCannotConnectToHost {
+        print("✅ Safari URLSession TCP refused in \(elapsedHttpMs) (target IP reached)")
+        probe.ok = true
+    } else if let err = err as NSError? {
+        print("❌ Safari URLSession failed in \(elapsedHttpMs): [\(err.domain) \(err.code)] \(err.localizedDescription)")
+    }
+    sem.signal()
+}.resume()
+if sem.wait(timeout: .now() + 2.5) == .timedOut {
+    print("❌ Safari URLSession probe timed out")
+    exit(5)
 }
 print("==================================================")
+exit(probe.ok ? 0 : 5)

@@ -313,192 +313,29 @@ Verify that for an active `LocalDns` profile, connecting to the cluster (`Connec
 #### Objective
 Ensure Safari / Network.framework functions correctly and never experiences the 30-second lookup stall under each of the 6 test scenarios above.
 
-#### Verification Script: `verify-safari-resolution.swift`
-Run the following script directly in terminal:
+#### Verification Script: `scripts/verify-safari-resolution.swift`
+Resolves through CFHost (the Apple resolver stack Safari uses), then probes with `URLSession`. It exits non-zero on a wrong IP, an unexpected resolution result, a resolver stall (> 4.5 s) or a failed/timed-out probe.
 
-```swift
-#!/usr/bin/env swift
-import Foundation
+```bash
+# Must resolve to the expected cluster IP (exit 3 on mismatch)
+swift scripts/verify-safari-resolution.swift api.lab.example.internal --expect-ip 192.0.2.10
 
-let arguments = CommandLine.arguments
-guard arguments.count >= 2 else {
-    print("Usage: swift verify-safari-resolution.swift <hostname> [expected_ip]")
-    exit(1)
-}
-
-let hostName = arguments[1]
-print("==================================================")
-print("🌐 Testing Safari / Apple Network Framework Stack")
-print("Target: \(hostName)")
-print("==================================================")
-
-// Step 1: Pure CFNetwork / CFHost resolution (exact DNS stack used by Safari/mDNSResponder)
-let startDns = Date()
-let host = CFHostCreateWithName(nil, hostName as CFString).takeRetainedValue()
-let success = CFHostStartInfoResolution(host, .addresses, nil)
-let elapsedDns = Date().timeIntervalSince(startDns)
-let elapsedDnsMs = String(format: "%.1f ms", elapsedDns * 1000)
-
-var resolvedIps: [String] = []
-if success {
-    var resolved: DarwinBoolean = false
-    if let addresses = CFHostGetAddressing(host, &resolved)?.takeUnretainedValue() as? [Data], resolved.boolValue {
-        resolvedIps = addresses.compactMap { data -> String? in
-            data.withUnsafeBytes { rawBuffer -> String? in
-                guard let baseAddr = rawBuffer.baseAddress else { return nil }
-                let family = baseAddr.assumingMemoryBound(to: sockaddr.self).pointee.sa_family
-                if family == sa_family_t(AF_INET) {
-                    let addrIn = baseAddr.assumingMemoryBound(to: sockaddr_in.self).pointee
-                    var ipBuf = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
-                    var sinAddr = addrIn.sin_addr
-                    inet_ntop(AF_INET, &sinAddr, &ipBuf, socklen_t(INET_ADDRSTRLEN))
-                    return String(cString: ipBuf)
-                }
-                return nil
-            }
-        }
-    }
-}
-
-if !resolvedIps.isEmpty {
-    print("✅ Apple Network Stack RESOLVED in \(elapsedDnsMs):")
-    print("   IP Addresses: \(resolvedIps.joined(separator: ", "))")
-} else {
-    if elapsedDns > 4.5 && !hostName.hasSuffix(".local") {
-        print("❌ D-DEAD STALL DETECTED in \(elapsedDnsMs) (Exceeded 4.5s threshold!)")
-        exit(2)
-    } else if elapsedDns > 4.5 && hostName.hasSuffix(".local") {
-        print("ℹ️ NXDOMAIN for .local in \(elapsedDnsMs) (Apple mDNS multicast probe fallback)")
-    } else {
-        print("ℹ️ FAST NXDOMAIN in \(elapsedDnsMs): Host not found (Clean negative answer)")
-    }
-}
-
-// Step 2: URLSession quick probe (if IP was resolved)
-if !resolvedIps.isEmpty {
-    let url = URL(string: "http://\(hostName)")!
-    let config = URLSessionConfiguration.ephemeral
-    config.timeoutIntervalForRequest = 2.0
-    config.timeoutIntervalForResource = 2.0
-    let session = URLSession(configuration: config)
-    
-    let sem = DispatchSemaphore(value: 0)
-    let startHttp = Date()
-    session.dataTask(with: url) { _, resp, err in
-        let elapsedHttp = Date().timeIntervalSince(startHttp)
-        let elapsedHttpMs = String(format: "%.1f ms", elapsedHttp * 1000)
-        if let http = resp as? HTTPURLResponse {
-            print("✅ Safari URLSession HTTP Response: \(http.statusCode) in \(elapsedHttpMs)")
-        } else if let err = err as? NSError {
-            if err.code == -1004 { // Could not connect to server (port closed)
-                print("✅ Safari URLSession TCP Connected/Refused in \(elapsedHttpMs) (Target IP reached)")
-            } else {
-                print("ℹ️ Safari URLSession Result in \(elapsedHttpMs): [\(err.domain) \(err.code)] \(err.localizedDescription)")
-            }
-        }
-        sem.signal()
-    }.resume()
-    _ = sem.wait(timeout: .now() + 2.5)
-}
-print("==================================================")
+# Must fail fast with a confirmed name-not-found (exit 4 if it resolves or fails for another reason)
+swift scripts/verify-safari-resolution.swift api.lab.example.internal --expect-failure
 ```
+
+Exit codes: `0` pass, `1` usage, `2` stall, `3` IP mismatch, `4` unexpected resolution result, `5` URLSession probe failed or timed out. A correct answer slower than 4.5 s also exits `2`. Under `--expect-failure`, only a genuine name-not-found passes; other resolver errors and IPv6-only answers exit `4`.
 
 ---
 
 ## 5. Automated Verification Test Suite
 
-Below is the consolidated automated test runner (`scripts/test-real-mac-local-dns.sh`) that automates status checking, process inspection, and Safari resolution verification.
+`scripts/test-real-mac-local-dns.sh` runs the read-only checks in one pass and never modifies system state: LaunchAgent running, `status.json` agrees with launchd and has no error, UDP/TCP port 15353 owned solely by the agent, ClusterDeck-managed `/etc/resolver` files present, `dig @127.0.0.1 -p 15353` per host, and the Safari-stack probe above per host. It prints a per-check PASS/FAIL summary and exits non-zero if any check fails. It requires `jq`.
 
 ```bash
-#!/usr/bin/env bash
-set -euo pipefail
-
-BOLD="\033[1m"
-GREEN="\033[32m"
-RED="\033[31m"
-YELLOW="\033[33m"
-RESET="\033[0m"
-
-log_pass() { echo -e "${GREEN}✓ PASS:${RESET} $1"; }
-log_fail() { echo -e "${RED}✗ FAIL:${RESET} $1"; exit 1; }
-log_info() { echo -e "${BOLD}▶ $1${RESET}"; }
-
-DNS_DIR="$HOME/.clusterdeck/dns"
-AGENT_LABEL="com.clusterdeck.dns"
-PORT=15353
-
-echo "=========================================================="
-echo " ClusterDeck ADR-0011 Real-Mac QA Verification Runner"
-echo "=========================================================="
-
-# 1. Check LaunchAgent status
-log_info "1. Verifying LaunchAgent state..."
-if launchctl print "gui/$(id -u)/$AGENT_LABEL" >/dev/null 2>&1; then
-  AGENT_PID=$(launchctl print "gui/$(id -u)/$AGENT_LABEL" | awk -F'= ' '/pid =/{print $2}')
-  log_pass "LaunchAgent $AGENT_LABEL loaded with PID: $AGENT_PID"
-else
-  log_fail "LaunchAgent $AGENT_LABEL is not loaded in gui/$(id -u)"
-fi
-
-# 2. Check status.json
-log_info "2. Verifying status.json..."
-if [ -f "$DNS_DIR/status.json" ]; then
-  STATUS_PID=$(jq -r .pid "$DNS_DIR/status.json")
-  STATUS_GEN=$(jq -r .generation "$DNS_DIR/status.json")
-  STATUS_ERR=$(jq -r .error "$DNS_DIR/status.json")
-  
-  if [ "$STATUS_PID" == "$AGENT_PID" ] && [ "$STATUS_ERR" == "null" ]; then
-    log_pass "status.json valid: PID=$STATUS_PID, Gen=$STATUS_GEN, Error=null"
-  else
-    log_fail "status.json mismatch: PID=$STATUS_PID (expected $AGENT_PID), Error=$STATUS_ERR"
-  fi
-else
-  log_fail "Missing $DNS_DIR/status.json"
-fi
-
-# 3. Check Port 15353 Ownership
-log_info "3. Verifying socket listeners on port $PORT..."
-UDP_PID=$(lsof -nP -iUDP:$PORT -t 2>/dev/null || echo "")
-TCP_PID=$(lsof -nP -iTCP:$PORT -sTCP:LISTEN -t 2>/dev/null || echo "")
-
-if [ "$UDP_PID" == "$AGENT_PID" ] && [ "$TCP_PID" == "$AGENT_PID" ]; then
-  log_pass "Port $PORT strictly owned by PID $AGENT_PID (UDP and TCP LISTEN match)"
-else
-  log_fail "Socket ownership violation: UDP PID='$UDP_PID', TCP PID='$TCP_PID', Expected='$AGENT_PID'"
-fi
-
-# 4. Check Resolver Files
-log_info "4. Inspecting /etc/resolver entries..."
-RESOLVER_COUNT=0
-for f in /etc/resolver/*; do
-  [ -e "$f" ] || continue
-  if [ -f "$f" ] && [ ! -L "$f" ]; then
-    if head -n 1 "$f" | grep -q "^# managed by ClusterDeck (profile: "; then
-      RESOLVER_COUNT=$((RESOLVER_COUNT + 1))
-      ZONE=$(basename "$f")
-      echo "   Found managed resolver file: $ZONE"
-    fi
-  fi
-done
-log_pass "Found $RESOLVER_COUNT ClusterDeck-managed resolver file(s)"
-
-# 5. Direct DNS Query Test
-if [ "$RESOLVER_COUNT" -gt 0 ]; then
-  SAMPLE_ZONE=$(for f in /etc/resolver/*; do head -n 1 "$f" 2>/dev/null | grep -q "managed by ClusterDeck" && basename "$f" && break; done)
-  log_info "5. Testing Direct Authoritative Query on $SAMPLE_ZONE..."
-  DIG_OUT=$(dig @127.0.0.1 -p $PORT "test.$SAMPLE_ZONE" +time=1 +tries=1)
-  if echo "$DIG_OUT" | grep -q "status: NXDOMAIN"; then
-    log_pass "Direct DNS answered authoritative NXDOMAIN for test.$SAMPLE_ZONE"
-  elif echo "$DIG_OUT" | grep -q "status: NOERROR"; then
-    log_pass "Direct DNS answered NOERROR for test.$SAMPLE_ZONE"
-  else
-    log_fail "Direct DNS returned unexpected response:\n$DIG_OUT"
-  fi
-fi
-
-echo "=========================================================="
-echo -e "${GREEN}${BOLD}All Automated Core Checks Passed!${RESET}"
-echo "=========================================================="
+scripts/test-real-mac-local-dns.sh api.lab.example.internal=192.0.2.10
+scripts/test-real-mac-local-dns.sh --teardown api.lab.example.internal      # after "Remove from local DNS": agent, port and resolver files absent, Safari stack fails fast
+scripts/test-real-mac-local-dns.sh --help
 ```
 
 ---
