@@ -10,6 +10,7 @@ use crate::services::process::{BackgroundProcess, CommandLimits, CommandRunner};
 use crate::services::ssh_config::ssh_alias;
 use crate::services::validate::is_safe_ssh_identifier;
 use async_trait::async_trait;
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -139,10 +140,21 @@ fn tunnel_argv(
     Ok(argv)
 }
 
+/// D1 (#116): the owned child handle, shared between the slot's `TunnelEntry` and the lifecycle
+/// registry. `stop_all` kills through this handle instead of a numeric pid: a pid snapshot can be
+/// recycled by the OS once the owning task reaps the child, a handle can only ever address its
+/// own child. The lock is held only for short calls (status, kill, stderr), never across a
+/// probe/lsof/sleep, so a kill is never starved by a readiness wait.
+type SharedProcess = Arc<Mutex<Box<dyn BackgroundProcess>>>;
+
+/// D2 (#116): overall budget for `stop_all`'s kills. It runs under `RunEvent::Exit`'s
+/// `block_on`, so one wedged kill must not stall quitting.
+const STOP_ALL_DEADLINE: Duration = Duration::from_secs(1);
+
 struct TunnelEntry {
     port: u16,
     target: TunnelTarget,
-    process: Box<dyn BackgroundProcess>,
+    process: SharedProcess,
 }
 
 /// One slot per profile. The slot's own lock is what an in-flight `ensure_tunnel` holds across
@@ -151,11 +163,14 @@ type Slot = Arc<Mutex<Option<TunnelEntry>>>;
 
 pub struct TunnelManager {
     slots: Mutex<HashMap<String, Slot>>,
-    /// Shutdown flag and child pids behind ONE std mutex (never held across an await), so that
-    /// "registering a freshly spawned child" and "stop_all collecting the pids" are atomic with
-    /// respect to each other: a child is either seen by `stop_all` or refused and killed by its
-    /// own spawner. Deliberately outside the slot lock: `stop_all` must be able to kill children
-    /// while `ensure_tunnel` holds that lock.
+    /// Shutdown flag and child handles behind ONE std mutex (never held across an await), so that
+    /// "registering a freshly spawned child" and "stop_all snapshotting the handles" are atomic
+    /// with respect to each other: a child is either seen by `stop_all` or refused and killed by
+    /// its own spawner. Deliberately outside the slot lock: `stop_all` must be able to kill
+    /// children while `ensure_tunnel` holds that lock.
+    ///
+    /// Lock order (#116): slots-map lock is released right after cloning a slot; then only
+    /// slot -> process or slot -> lifecycle. Process and lifecycle locks are never nested.
     lifecycle: std::sync::Mutex<Lifecycle>,
     probe: Arc<dyn PortProbe>,
     ready_poll: Duration,
@@ -167,8 +182,8 @@ struct Lifecycle {
     /// Set first thing by `stop_all`: a restore or Verify racing the app exit must not leave an
     /// ssh behind, since `stop_all` also deletes the records the next start would reap it by.
     shutting_down: bool,
-    /// Pid of each profile's current ssh child, from spawn until it is stopped or replaced.
-    pids: HashMap<String, u32>,
+    /// Handle of each profile's current ssh child, from spawn until it is stopped or replaced.
+    processes: HashMap<String, SharedProcess>,
 }
 
 /// Why one spawn attempt failed. `bind_failure` marks a local-port conflict that is worth one
@@ -279,17 +294,15 @@ impl TunnelManager {
         if self.is_shutting_down() {
             return Err(SHUTTING_DOWN.to_string());
         }
-        if let Some(mut old) = entry.take() {
-            if old.target == target
-                && old.process.try_exit_status().is_none()
-                && self.probe.is_open(old.port).await
-            {
+        if let Some(old) = entry.take() {
+            let alive = old.process.lock().await.try_exit_status().is_none();
+            if old.target == target && alive && self.probe.is_open(old.port).await {
                 let port = old.port;
                 *entry = Some(old);
                 return Ok(port);
             }
-            old.process.kill().await;
-            self.forget_pid(&profile.id);
+            old.process.lock().await.kill().await;
+            self.forget_process(&profile.id);
             let _ = remove_tunnel_record(paths, &profile.id);
         }
 
@@ -319,10 +332,10 @@ impl TunnelManager {
             let started = self
                 .start_once(runner, paths, &profile.id, &argv, port, record)
                 .await;
-            // On success the pid stays registered: the slot is still locked by us, so only the
-            // pid lets a concurrent `stop_all` reach this child.
+            // On success the handle stays registered: the slot is still locked by us, so only
+            // the registry lets a concurrent `stop_all` reach this child.
             if started.is_err() {
-                self.forget_pid(&profile.id);
+                self.forget_process(&profile.id);
             }
             match started {
                 Ok(process) => {
@@ -359,29 +372,32 @@ impl TunnelManager {
         argv: &[String],
         port: u16,
         record: TunnelRecord,
-    ) -> Result<Box<dyn BackgroundProcess>, StartError> {
+    ) -> Result<SharedProcess, StartError> {
         let other = |message: String| StartError {
             message,
             bind_failure: false,
         };
-        let mut process = runner.spawn_background("ssh", argv).await.map_err(other)?;
+        let process: SharedProcess = Arc::new(Mutex::new(
+            runner.spawn_background("ssh", argv).await.map_err(other)?,
+        ));
 
-        let pid = process.pid();
-        // Register under the same lock `stop_all` flips the flag with: if shutdown already
-        // began, nobody will ever collect this child, so kill it here.
+        // The pid is only for the persisted record and the lsof ownership check; it is never
+        // used to signal the child (D1).
+        let pid = process.lock().await.pid();
+        // Register the handle under the same lock `stop_all` flips the flag and snapshots with
+        // (D2): if shutdown already began, nobody will ever collect this child, so kill it here
+        // through its own handle. Registered even without a pid, so it is always reachable.
         let refused = {
             let mut lc = self.lifecycle.lock().unwrap();
             if lc.shutting_down {
                 true
             } else {
-                if let Some(pid) = pid {
-                    lc.pids.insert(profile_id.to_string(), pid);
-                }
+                lc.processes.insert(profile_id.to_string(), process.clone());
                 false
             }
         };
         if refused {
-            process.kill().await;
+            process.lock().await.kill().await;
             let _ = remove_tunnel_record(paths, profile_id);
             return Err(other(SHUTTING_DOWN.to_string()));
         }
@@ -394,9 +410,10 @@ impl TunnelManager {
         let started = tokio::time::Instant::now();
         let mut consecutive = 0u8;
         loop {
-            if let Some(code) = process.try_exit_status() {
+            let status = process.lock().await.try_exit_status();
+            if let Some(code) = status {
                 let _ = remove_tunnel_record(paths, profile_id);
-                return Err(Self::exited(process.as_mut(), code).await);
+                return Err(Self::exited(&process, code).await);
             }
             if self.probe.is_open(port).await {
                 consecutive += 1;
@@ -414,7 +431,7 @@ impl TunnelManager {
                 consecutive = 0;
             }
             if started.elapsed() >= self.ready_timeout {
-                process.kill().await;
+                process.lock().await.kill().await;
                 let _ = remove_tunnel_record(paths, profile_id);
                 return Err(other(format!(
                     "ssh tunnel not ready after {}s",
@@ -423,15 +440,16 @@ impl TunnelManager {
             }
             tokio::time::sleep(self.ready_poll).await;
         }
-        if let Some(code) = process.try_exit_status() {
+        let status = process.lock().await.try_exit_status();
+        if let Some(code) = status {
             let _ = remove_tunnel_record(paths, profile_id);
-            return Err(Self::exited(process.as_mut(), code).await);
+            return Err(Self::exited(&process, code).await);
         }
         Ok(process)
     }
 
-    async fn exited(process: &mut dyn BackgroundProcess, code: i32) -> StartError {
-        let stderr = process.stderr_tail().await;
+    async fn exited(process: &SharedProcess, code: i32) -> StartError {
+        let stderr = process.lock().await.stderr_tail().await;
         StartError {
             bind_failure: is_bind_failure(&stderr),
             message: format!("ssh tunnel exited with status {code}: {stderr}"),
@@ -442,8 +460,8 @@ impl TunnelManager {
         self.lifecycle.lock().unwrap().shutting_down
     }
 
-    fn forget_pid(&self, profile_id: &str) {
-        self.lifecycle.lock().unwrap().pids.remove(profile_id);
+    fn forget_process(&self, profile_id: &str) {
+        self.lifecycle.lock().unwrap().processes.remove(profile_id);
     }
 
     /// The live tunnel's target for `profile_id`, if any. A slot busy with an in-flight
@@ -452,8 +470,9 @@ impl TunnelManager {
         let slot = self.slots.lock().await.get(profile_id)?.clone();
         let mut guard = slot.try_lock().ok()?;
         let entry = guard.as_mut()?;
-        entry
-            .process
+        // Locked process = a kill or status check is in flight: not a usable tunnel.
+        let mut process = entry.process.try_lock().ok()?;
+        process
             .try_exit_status()
             .is_none()
             .then(|| entry.target.clone())
@@ -469,72 +488,89 @@ impl TunnelManager {
 
     /// Waits for this profile's in-flight `ensure_tunnel` (if any), then kills its tunnel.
     pub async fn stop_tunnel(&self, profile_id: &str) {
-        let slot = self.slots.lock().await.get(profile_id).cloned();
-        if let Some(slot) = slot {
-            if let Some(mut entry) = slot.lock().await.take() {
-                entry.process.kill().await;
-            }
+        // D3 (#116): the slot guard stays held through kill, deregistration and record deletion.
+        // Releasing it earlier lets a concurrent `ensure_tunnel` register a fresh child that the
+        // late deregistration would then erase, hiding it from `stop_all`.
+        let slot = self.slot(profile_id).await;
+        let mut guard = slot.lock().await;
+        if let Some(entry) = guard.take() {
+            entry.process.lock().await.kill().await;
         }
-        self.forget_pid(profile_id);
+        self.forget_process(profile_id);
         if let Ok(paths) = ClusterDeckPaths::resolve() {
             let _ = remove_tunnel_record(&paths, profile_id);
         }
+        drop(guard);
     }
 
-    /// Kills every stored tunnel without waiting on in-flight `ensure_tunnel` calls (`try_lock`):
-    /// this runs from `RunEvent::Exit` under `block_on`, and quitting must not hang for the
-    /// readiness timeout. The in-flight attempts' ssh children are SIGKILLed by pid instead
-    /// (through the runner; there is no libc dependency), because their tasks are never dropped
-    /// before the process exits, so `kill_on_drop` cannot be relied on.
+    /// Kills every registered tunnel child without waiting on any slot (so an in-flight
+    /// `ensure_tunnel` cannot stall it): this runs from `RunEvent::Exit` under `block_on`, and
+    /// quitting must not hang for the readiness timeout. Children are killed through their owned
+    /// handles (D1/D2), never by numeric pid. The runner parameter is kept for the call-site
+    /// signature only.
     pub async fn stop_all(&self, runner: &dyn CommandRunner) {
         if let Ok(paths) = ClusterDeckPaths::resolve() {
             self.stop_all_with_paths(runner, &paths).await;
         } else {
-            self.stop_all_internal(runner).await;
+            self.stop_all_internal().await;
         }
     }
 
-    pub async fn stop_all_with_paths(&self, runner: &dyn CommandRunner, paths: &ClusterDeckPaths) {
-        self.stop_all_internal(runner).await;
+    pub async fn stop_all_with_paths(&self, _runner: &dyn CommandRunner, paths: &ClusterDeckPaths) {
+        let unconfirmed = self.stop_all_internal().await;
         if let Ok(records) = list_tunnel_records(paths) {
             for record in records {
-                let _ = remove_tunnel_record(paths, &record.profile_id);
-            }
-        }
-    }
-
-    async fn stop_all_internal(&self, runner: &dyn CommandRunner) {
-        self.lifecycle.lock().unwrap().shutting_down = true;
-        let slots: Vec<(String, Slot)> = self
-            .slots
-            .lock()
-            .await
-            .iter()
-            .map(|(id, slot)| (id.clone(), slot.clone()))
-            .collect();
-        for (id, slot) in slots {
-            if let Ok(mut guard) = slot.try_lock() {
-                if let Some(mut entry) = guard.take() {
-                    entry.process.kill().await;
-                    self.forget_pid(&id);
+                // A kill that did not finish within the deadline may have left the child alive:
+                // keep its record so the next start's orphan reaper can still find it.
+                if !unconfirmed.contains(&record.profile_id) {
+                    let _ = remove_tunnel_record(paths, &record.profile_id);
                 }
             }
         }
-        // What is left belongs to slots busy in `ensure_tunnel` (or has no entry); an idle
-        // slot's pid was just dropped so a stale, possibly recycled pid is never signalled.
-        let pids: Vec<u32> = self
-            .lifecycle
-            .lock()
-            .unwrap()
-            .pids
-            .drain()
-            .map(|(_, p)| p)
+    }
+
+    /// Returns the profile ids whose kill was not confirmed within `STOP_ALL_DEADLINE`.
+    async fn stop_all_internal(&self) -> Vec<String> {
+        // D2: flag and snapshot are one atomic step w.r.t. `start_once`'s registration, so every
+        // child is either in this snapshot or refused (and killed) by its spawner.
+        let handles: Vec<(String, SharedProcess)> = {
+            let mut lc = self.lifecycle.lock().unwrap();
+            lc.shutting_down = true;
+            lc.processes
+                .iter()
+                .map(|(id, p)| (id.clone(), p.clone()))
+                .collect()
+        };
+        let mut kills: futures::stream::FuturesUnordered<_> = handles
+            .iter()
+            .map(|(id, process)| async move {
+                process.lock().await.kill().await;
+                id.clone()
+            })
             .collect();
-        for pid in pids {
-            let _ = runner
-                .run("kill", &["-9".to_string(), pid.to_string()])
-                .await;
+        let deadline = tokio::time::Instant::now() + STOP_ALL_DEADLINE;
+        let mut confirmed: Vec<String> = Vec::new();
+        // One slow kill must not keep the others from running or delay the exit past the budget.
+        while let Ok(Some(id)) = tokio::time::timeout_at(deadline, kills.next()).await {
+            confirmed.push(id);
         }
+        drop(kills);
+        let mut lc = self.lifecycle.lock().unwrap();
+        for (id, process) in &handles {
+            if confirmed.contains(id)
+                && lc
+                    .processes
+                    .get(id)
+                    .is_some_and(|p| Arc::ptr_eq(p, process))
+            {
+                lc.processes.remove(id);
+            }
+        }
+        handles
+            .into_iter()
+            .map(|(id, _)| id)
+            .filter(|id| !confirmed.contains(id))
+            .collect()
     }
 }
 
@@ -833,6 +869,10 @@ mod tests {
         code: i32,
         stderr: String,
         pid: Option<u32>,
+        /// `kill` takes this long (tokio clock) before the child counts as dead.
+        kill_delay: Option<Duration>,
+        /// `kill` signals `kill_started`, then parks until `kill_gate` is notified.
+        kill_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
     }
 
     impl Script {
@@ -842,6 +882,8 @@ mod tests {
                 code: 0,
                 stderr: String::new(),
                 pid: Some(4242),
+                kill_delay: None,
+                kill_gate: None,
             }
         }
         fn exits(after: usize, code: i32, stderr: &str) -> Self {
@@ -850,13 +892,19 @@ mod tests {
                 code,
                 stderr: stderr.to_string(),
                 pid: Some(4242),
+                kill_delay: None,
+                kill_gate: None,
             }
         }
     }
 
+    /// `id` is the 1-based spawn index, independent of the (deliberately reusable) pid, so a
+    /// test can tell which instance was signalled even when two share pid 4242.
     struct FakeProcess {
         script: Script,
         polls: usize,
+        id: usize,
+        kills: Arc<StdMutex<Vec<usize>>>,
     }
 
     #[async_trait]
@@ -872,6 +920,14 @@ mod tests {
             None
         }
         async fn kill(&mut self) {
+            if let Some((started, gate)) = self.script.kill_gate.clone() {
+                started.notify_one();
+                gate.notified().await;
+            }
+            if let Some(delay) = self.script.kill_delay {
+                tokio::time::sleep(delay).await;
+            }
+            self.kills.lock().unwrap().push(self.id);
             self.script.exit_after = Some(0);
             self.script.code = -1;
         }
@@ -888,6 +944,8 @@ mod tests {
         /// Stdout of `lsof`; `None` makes lsof unavailable.
         lsof: Option<String>,
         killed: StdMutex<Vec<String>>,
+        /// Instance ids (see `FakeProcess::id`) whose `kill` completed, in order.
+        kills: Arc<StdMutex<Vec<usize>>>,
         ps_map: StdMutex<HashMap<u32, CommandOutput>>,
     }
 
@@ -899,6 +957,7 @@ mod tests {
                 scripts,
                 lsof: None,
                 killed: StdMutex::new(Vec::new()),
+                kills: Arc::new(StdMutex::new(Vec::new())),
                 ps_map: StdMutex::new(HashMap::new()),
             }
         }
@@ -970,7 +1029,12 @@ mod tests {
             let n = self.spawns.fetch_add(1, Ordering::SeqCst);
             self.argv.lock().unwrap().push(args.to_vec());
             let script = self.scripts[n.min(self.scripts.len() - 1)].clone();
-            Ok(Box::new(FakeProcess { script, polls: 0 }))
+            Ok(Box::new(FakeProcess {
+                script,
+                polls: 0,
+                id: n + 1,
+                kills: self.kills.clone(),
+            }))
         }
     }
 
@@ -1288,7 +1352,11 @@ mod tests {
             res = stuck => panic!("stuck profile finished first: {res:?}"),
             () = quit => {}
         }
-        assert_eq!(*runner.killed.lock().unwrap(), vec!["-9 4242".to_string()]);
+        assert_eq!(*runner.kills.lock().unwrap(), vec![1]);
+        assert!(
+            runner.killed.lock().unwrap().is_empty(),
+            "never by numeric pid"
+        );
         std::fs::remove_dir_all(&paths.base).ok();
     }
 
@@ -1306,6 +1374,113 @@ mod tests {
 
         assert!(err.contains("shutting down"), "{err}");
         assert_eq!(runner.spawns.load(Ordering::SeqCst), 0);
+        std::fs::remove_dir_all(&paths.base).ok();
+    }
+
+    /// D1: pid 4242 is reused by a second instance after the first was stopped. `stop_all` must
+    /// signal each handle at most once and never go through a numeric `kill -9 <pid>`.
+    #[tokio::test(start_paused = true)]
+    async fn stop_all_never_signals_a_reused_pid() {
+        let manager = TunnelManager::new(FakeProbe::new(true));
+        let runner = FakeRunner::new(vec![Script::alive()]);
+        let paths = temp_paths("pid-reuse");
+        let lab = profile();
+        let mut other = profile();
+        other.id = "other".to_string();
+
+        manager
+            .ensure_tunnel(&runner, &paths, &lab, "127.0.0.1", 6443)
+            .await
+            .unwrap();
+        manager.stop_tunnel("lab").await;
+        assert_eq!(*runner.kills.lock().unwrap(), vec![1]);
+        // Same pid 4242, different instance.
+        manager
+            .ensure_tunnel(&runner, &paths, &other, "127.0.0.1", 6443)
+            .await
+            .unwrap();
+        manager.stop_all_with_paths(&runner, &paths).await;
+
+        assert_eq!(*runner.kills.lock().unwrap(), vec![1, 2]);
+        assert!(runner.killed.lock().unwrap().is_empty());
+        assert!(manager.lifecycle.lock().unwrap().processes.is_empty());
+        std::fs::remove_dir_all(&paths.base).ok();
+    }
+
+    /// D3: `stop_tunnel` is parked inside its kill (slot guard held). A concurrent
+    /// `ensure_tunnel` must not spawn until the stop fully finished, and the child it then
+    /// spawns must stay registered, so a `stop_all` during its readiness wait still kills it.
+    #[tokio::test(start_paused = true)]
+    async fn stop_tunnel_holds_the_slot_so_a_concurrent_ensure_stays_registered() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let mut first = Script::alive();
+        first.kill_gate = Some((started.clone(), gate.clone()));
+        let probe = FakeProbe::new(true);
+        let manager = TunnelManager::new(probe.clone());
+        let runner = FakeRunner::new(vec![first, Script::alive()]);
+        let paths = temp_paths("stop-vs-ensure");
+        let lab = profile();
+        manager
+            .ensure_tunnel(&runner, &paths, &lab, "127.0.0.1", 6443)
+            .await
+            .unwrap();
+        // The second child never becomes ready, so its ensure sits in the readiness wait.
+        probe.closed.lock().unwrap().insert(preferred_port("lab"));
+
+        let stop = manager.stop_tunnel("lab");
+        let ensure = manager.ensure_tunnel(&runner, &paths, &lab, "127.0.0.1", 6443);
+        let driver = async {
+            started.notified().await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            assert_eq!(runner.spawns.load(Ordering::SeqCst), 1, "ensure must wait");
+            gate.notify_one();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            assert_eq!(runner.spawns.load(Ordering::SeqCst), 2);
+            assert!(manager
+                .lifecycle
+                .lock()
+                .unwrap()
+                .processes
+                .contains_key("lab"));
+            manager.stop_all(&runner).await;
+        };
+        let (_, res, ()) = tokio::join!(stop, ensure, driver);
+
+        // The killed child is seen exiting before the shutdown flag is re-checked.
+        assert!(res.is_err());
+        assert_eq!(*runner.kills.lock().unwrap(), vec![1, 2]);
+        std::fs::remove_dir_all(&paths.base).ok();
+    }
+
+    /// D2: a wedged kill neither prevents the other children from being killed nor stretches
+    /// `stop_all` past the deadline, and its record is kept for the next start's reaper.
+    #[tokio::test(start_paused = true)]
+    async fn stop_all_returns_within_the_deadline_despite_a_slow_kill() {
+        let manager = TunnelManager::new(FakeProbe::new(true));
+        let mut slow = Script::alive();
+        slow.kill_delay = Some(Duration::from_secs(60));
+        let runner = FakeRunner::new(vec![Script::alive(), slow]);
+        let paths = temp_paths("slow-kill");
+        let lab = profile();
+        let mut other = profile();
+        other.id = "other".to_string();
+        manager
+            .ensure_tunnel(&runner, &paths, &lab, "127.0.0.1", 6443)
+            .await
+            .unwrap();
+        manager
+            .ensure_tunnel(&runner, &paths, &other, "127.0.0.1", 6443)
+            .await
+            .unwrap();
+
+        let t0 = tokio::time::Instant::now();
+        manager.stop_all_with_paths(&runner, &paths).await;
+
+        assert!(t0.elapsed() <= STOP_ALL_DEADLINE + Duration::from_millis(50));
+        assert_eq!(*runner.kills.lock().unwrap(), vec![1]);
+        assert!(read_tunnel_record(&paths, "lab").unwrap().is_none());
+        assert!(read_tunnel_record(&paths, "other").unwrap().is_some());
         std::fs::remove_dir_all(&paths.base).ok();
     }
 
@@ -1368,7 +1543,7 @@ mod tests {
 
         assert!(err.contains("shutting down"), "{err}");
         assert!(killed.load(Ordering::SeqCst), "child must be killed");
-        assert!(manager.lifecycle.lock().unwrap().pids.is_empty());
+        assert!(manager.lifecycle.lock().unwrap().processes.is_empty());
         assert!(read_tunnel_record(&paths, "lab").unwrap().is_none());
         std::fs::remove_dir_all(&paths.base).ok();
     }

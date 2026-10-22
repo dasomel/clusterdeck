@@ -1426,11 +1426,25 @@ pub async fn ensure_profile_kubeconfig(
     Ok(dest_path)
 }
 
+/// Whether a merge into the user's kubeconfig switches its `current-context` to the profile.
+/// User-initiated merges select it; background syncs (startup restore, verify) must not change
+/// what the user has selected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CurrentContext {
+    Select,
+    Preserve,
+}
+
+/// Serializes in-app read-modify-write of the user kubeconfig so concurrent profile merges
+/// cannot lose each other's writes. External writers are not detected.
+static USER_CONFIG_WRITE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 pub async fn merge_profile_kubeconfig_to_user_config(
     runner: &dyn CommandRunner,
     paths: &ClusterDeckPaths,
     profile: &Profile,
     backup_first: bool,
+    context: CurrentContext,
 ) -> Result<MergeKubeconfigResult, String> {
     ensure_profile_kubeconfig(runner, paths, profile).await?;
     let user_config_path = resolve_user_kubeconfig_path()?;
@@ -1441,6 +1455,7 @@ pub async fn merge_profile_kubeconfig_to_user_config(
         &user_config_path,
         Some(&bak_dir),
         backup_first,
+        context,
     )
     .await
 }
@@ -1472,12 +1487,58 @@ pub fn is_profile_present_in_user_config(profile_id: &str) -> bool {
     false
 }
 
+/// True when `user_config_path` already holds the profile's cluster entry (matched by name, as
+/// `merge_yaml_kubeconfigs` upserts) but with a different `server` than the stored per-profile
+/// kubeconfig. Issue #116: a retarget whose merge failed (or never ran) leaves exactly this
+/// state, and the next start picks the same port so the retarget itself reports "no change".
+/// Absent file/entry is `Ok(false)` (nothing ClusterDeck owns to repair); a read or parse
+/// failure is `Err` (path and OS/parse reason only, never file content).
+pub fn user_config_server_is_stale(
+    user_config_path: &std::path::Path,
+    profile_kubeconfig_path: &std::path::Path,
+) -> Result<bool, String> {
+    fn load(path: &std::path::Path) -> Result<Option<serde_yaml::Value>, String> {
+        let raw = match std::fs::read_to_string(path) {
+            Ok(r) => r,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
+        };
+        serde_yaml::from_str(&raw)
+            .map(Some)
+            .map_err(|e| format!("cannot parse {}: {e}", path.display()))
+    }
+    let Some(profile_val) = load(profile_kubeconfig_path)? else {
+        return Ok(false);
+    };
+    let Some(profile_cluster) = profile_val["clusters"]
+        .as_sequence()
+        .and_then(|s| s.first())
+    else {
+        return Ok(false);
+    };
+    let (Some(name), Some(want)) = (
+        profile_cluster["name"].as_str(),
+        profile_cluster["cluster"]["server"].as_str(),
+    ) else {
+        return Ok(false);
+    };
+    let Some(user_val) = load(user_config_path)? else {
+        return Ok(false);
+    };
+    Ok(user_val["clusters"]
+        .as_sequence()
+        .and_then(|items| items.iter().find(|c| c["name"].as_str() == Some(name)))
+        .and_then(|c| c["cluster"]["server"].as_str())
+        .is_some_and(|have| have != want))
+}
+
 pub async fn merge_profile_kubeconfig_to_file(
     paths: &ClusterDeckPaths,
     profile_id: &str,
     user_config_path: &std::path::Path,
     bak_dir: Option<&std::path::Path>,
     backup_first: bool,
+    context: CurrentContext,
 ) -> Result<MergeKubeconfigResult, String> {
     if !crate::services::validate::is_safe_profile_id(profile_id) {
         return Err("invalid profile id".to_string());
@@ -1499,6 +1560,7 @@ pub async fn merge_profile_kubeconfig_to_file(
         format!("Profile kubeconfig is not ready to merge: {reason}. Run Connect / Sync first")
     })?;
 
+    let _write_guard = USER_CONFIG_WRITE.lock().await;
     let mut backup_result = None;
     if backup_first && user_config_path.exists() {
         if let Some(bak_d) = bak_dir {
@@ -1534,7 +1596,11 @@ pub async fn merge_profile_kubeconfig_to_file(
     // is reported instead of being clobbered.
     let existing_raw = std::fs::read_to_string(user_config_path)
         .map_err(|e| format!("Failed to read existing kubeconfig: {e}"))?;
-    let final_yaml = merge_yaml_kubeconfigs(&existing_raw, &profile_raw, Some(profile_id))?;
+    let final_yaml = merge_yaml_kubeconfigs(
+        &existing_raw,
+        &profile_raw,
+        (context == CurrentContext::Select).then_some(profile_id),
+    )?;
 
     write_kubeconfig_file_atomic(user_config_path, &final_yaml)?;
 
@@ -2781,9 +2847,16 @@ users:
         let placeholder = generate_default_kubeconfig(&profile).unwrap();
         std::fs::write(paths.kubeconfig_file(&profile.id), placeholder).unwrap();
         let user_config = temp_dir.join("user-config");
-        let err = merge_profile_kubeconfig_to_file(&paths, &profile.id, &user_config, None, false)
-            .await
-            .unwrap_err();
+        let err = merge_profile_kubeconfig_to_file(
+            &paths,
+            &profile.id,
+            &user_config,
+            None,
+            false,
+            CurrentContext::Select,
+        )
+        .await
+        .unwrap_err();
         assert!(err.contains("no authentication configuration"));
         assert!(!user_config.exists());
         std::fs::remove_dir_all(&temp_dir).ok();
@@ -2811,6 +2884,7 @@ users:
             &user_kc_file,
             Some(&bak_dir),
             true,
+            CurrentContext::Select,
         )
         .await
         .unwrap();
@@ -2826,6 +2900,7 @@ users:
             &user_kc_file,
             Some(&bak_dir),
             true,
+            CurrentContext::Select,
         )
         .await
         .unwrap();
@@ -2917,6 +2992,7 @@ users:
             &user_kc_file,
             Some(&bak_dir),
             true,
+            CurrentContext::Select,
         )
         .await
         .unwrap();
@@ -3028,6 +3104,7 @@ users:
             &user_kc_file,
             Some(&bak_dir),
             true,
+            CurrentContext::Select,
         )
         .await
         .expect_err("non-mapping existing kubeconfig must be rejected");
