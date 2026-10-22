@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::services::config::{AuthMode, Profile};
 use crate::services::k8s_endpoints::DiscoveredEndpoint;
-use crate::services::kubeconfig::KubeconfigSummary;
+use crate::services::kubeconfig::{CurrentContext, KubeconfigSummary};
 use crate::services::paths::ClusterDeckPaths;
 use crate::services::process::{CommandRunner, SystemRunner};
 use crate::services::ssh::{self, BootstrapResult};
@@ -300,12 +300,13 @@ async fn auto_merge_if_present(
     runner: &dyn CommandRunner,
     paths: &ClusterDeckPaths,
     profile: &Profile,
+    context: CurrentContext,
 ) -> Option<String> {
     if !crate::services::kubeconfig::is_profile_present_in_user_config(&profile.id) {
         return None;
     }
     crate::services::kubeconfig::merge_profile_kubeconfig_to_user_config(
-        runner, paths, profile, false,
+        runner, paths, profile, false, context,
     )
     .await
     .err()
@@ -329,11 +330,13 @@ async fn reconcile_user_kubeconfig_at(
     user_path: &Path,
     bak_dir: &Path,
 ) -> Option<String> {
-    if !crate::services::kubeconfig::user_config_server_is_stale(
+    match crate::services::kubeconfig::user_config_server_is_stale(
         user_path,
         &paths.kubeconfig_file(&profile.id),
     ) {
-        return None;
+        Ok(true) => {}
+        Ok(false) => return None,
+        Err(e) => return Some(format!("cannot check ~/.kube/config: {e}")),
     }
     crate::services::kubeconfig::merge_profile_kubeconfig_to_file(
         paths,
@@ -341,6 +344,7 @@ async fn reconcile_user_kubeconfig_at(
         user_path,
         Some(bak_dir),
         false,
+        CurrentContext::Preserve,
     )
     .await
     .err()
@@ -432,7 +436,9 @@ pub async fn restore_tunnels(
         // Merge per profile, not after the loop: the kubeconfig is already retargeted, so if the
         // app quits mid-restore a later run sees `Ok(false)` and would never merge this one.
         let merge_err = match outcome {
-            Ok(true) => auto_merge_if_present(runner, paths, &profile).await,
+            Ok(true) => {
+                auto_merge_if_present(runner, paths, &profile, CurrentContext::Preserve).await
+            }
             // #116: an earlier retarget's merge may have failed; compare instead of trusting it.
             Ok(false) => reconcile_user_kubeconfig(paths, &profile).await,
             Err(_) => None,
@@ -468,7 +474,9 @@ pub async fn verify_profile(profile_id: String) -> Result<VerificationResult, St
         .await
         {
             Ok(true) => {
-                if let Some(e) = auto_merge_if_present(&runner, &paths, &profile).await {
+                if let Some(e) =
+                    auto_merge_if_present(&runner, &paths, &profile, CurrentContext::Preserve).await
+                {
                     eprintln!("profile '{profile_id}': {e}");
                 }
             }
@@ -713,7 +721,9 @@ pub async fn connect_profile(
 
     // If this profile was previously merged into ~/.kube/config, auto-sync fresh credentials
     if verification.kubernetes && kubeconfig_exists {
-        if let Some(e) = auto_merge_if_present(&runner, &paths, &profile).await {
+        if let Some(e) =
+            auto_merge_if_present(&runner, &paths, &profile, CurrentContext::Select).await
+        {
             errors.push(e);
         }
     }
@@ -1187,6 +1197,7 @@ pub async fn merge_kubeconfig_to_system(
         &paths,
         &profile,
         backup_first.unwrap_or(true),
+        CurrentContext::Select,
     )
     .await?;
 
@@ -1876,6 +1887,42 @@ mod tests {
         let err = reconcile_user_kubeconfig_at(&paths, &profile, &user, &bak).await;
         assert!(err.is_none(), "{err:?}");
         assert_eq!(server_in(&user, "cdtest-rec"), "https://127.0.0.1:2222");
+        std::fs::remove_dir_all(&paths.base).ok();
+    }
+
+    #[tokio::test]
+    async fn reconcile_keeps_the_users_selected_context() {
+        let stale = reconcile_kubeconfig("cdtest-rec", "https://127.0.0.1:1111")
+            .replace("current-context: cdtest-rec", "current-context: cdtest-b");
+        let (paths, user, bak) = reconcile_fixture("rec-ctx", 2222, Some(stale));
+        let mut profile = bastion_profile();
+        profile.id = "cdtest-rec".into();
+
+        assert!(reconcile_user_kubeconfig_at(&paths, &profile, &user, &bak)
+            .await
+            .is_none());
+        assert_eq!(server_in(&user, "cdtest-rec"), "https://127.0.0.1:2222");
+        let v: serde_yaml::Value =
+            serde_yaml::from_str(&std::fs::read_to_string(&user).unwrap()).unwrap();
+        assert_eq!(v["current-context"].as_str(), Some("cdtest-b"));
+        std::fs::remove_dir_all(&paths.base).ok();
+    }
+
+    #[tokio::test]
+    async fn reconcile_reports_a_corrupt_user_config_without_writing() {
+        let (paths, user, bak) =
+            reconcile_fixture("rec-corrupt", 2222, Some("clusters: [unclosed".into()));
+        let mut profile = bastion_profile();
+        profile.id = "cdtest-rec".into();
+
+        let err = reconcile_user_kubeconfig_at(&paths, &profile, &user, &bak)
+            .await
+            .expect("corrupt user config must be reported");
+        assert!(err.contains("cannot parse"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(&user).unwrap(),
+            "clusters: [unclosed"
+        );
         std::fs::remove_dir_all(&paths.base).ok();
     }
 
