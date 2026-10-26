@@ -34,3 +34,15 @@ Tests used real processes and macOS APIs. No infrastructure names, addresses, sc
 - Safari page loading after those scenarios.
 
 The active resolver was not stopped or its zones removed to exercise destructive scenarios. No issue checkboxes were changed and no commit/push was made. The debug UI and Vite server remain available while awaiting the accessibility action; the active responder now uses the current-source binary after the verified startup refresh.
+
+## Follow-up run, 2026-10-27
+
+Target: installed `/Applications/ClusterDeck.app` 0.5.0, which matches the source version. The agent binary's SHA-256 equals the installed app executable, so the binary refreshed after the app update (item 2, observed state; the refresh itself was not watched). The Orca accessibility blocker from 2026-10-18 is gone, and UI reads and clicks work.
+
+- **Read-only check** (`scripts/test-real-mac-local-dns.sh`, one record and one in-zone nonexistent name per zone): agent, `status.json`, port 15353 ownership, 4 managed resolver files and all `dig` checks PASS. For `.internal` zones the Safari-stack checks PASS, both the positive name (HTTP 200) and fast name-not-found.
+- **Item 6 (Connect refresh), PASS.** Clicked Connect / Sync on a LocalDns profile. Generation went 19 → 20 and `zones.json` was rewritten. The responder reloaded with no error and the same PID. The resolver-file hashes did not change. A 90 s process watch saw no `osascript`, `SecurityAgent` or `authorizationhost` process, so there was no admin prompt. The Safari-stack re-check afterwards matched the run before.
+- **New finding: #119.** Negative lookups in `.clusterdeck.local` zones stall for about 5 s on both `getaddrinfo` and Network.framework because of the mDNS fallback (`domain: local`, `timeout: 5`). Positive names resolve in under 10 ms. Because of this, `--expect-failure` and `--teardown` fail for `.local` zones until #119 is decided.
+- **Probe limitation.** The Safari-stack probe's HTTP step times out (`-1001`) against SSH-only hosts even though DNS resolved in under 10 ms. Choose probe hosts that serve HTTP(S), or read the "RESOLVED" line. This is service reachability, not DNS.
+- **Minor UI observation.** After Connect, the Endpoints tab still showed `gen 18`; `status.json` was at 19 before and 20 after. The label is not refreshed. This is not filed.
+
+Still not run, by user decision because they are destructive or need interactive admin action: item 1 (logout/login), item 3 (port squatter, D-DEAD), item 4 (cancelled admin prompt), item 5 (last-profile teardown), and the Safari checks after those.
