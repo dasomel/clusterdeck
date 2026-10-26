@@ -9,9 +9,60 @@ permissions:
   contents: write
 
 jobs:
-  build-and-release:
-    name: Build macOS .dmg and create draft release
+  # One draft release up front: two matrix jobs racing to create it by tagName can
+  # produce duplicate drafts, so both upload to this release id instead.
+  create-release:
+    name: Create draft release
+    runs-on: ubuntu-latest
+    outputs:
+      release_id: ${{ steps.create.outputs.release_id }}
+
+    steps:
+      - name: Create draft release
+        id: create
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          BODY: |
+            See CHANGELOG.md for details, including known limitations.
+
+            **Downloads:** `aarch64` is for Apple Silicon Macs, `x64` for Intel Macs.
+
+            **Unsigned build (ad-hoc identity):** there is no Apple Developer ID certificate for
+            this project yet, so macOS will show an "unidentified developer" warning on first
+            launch -- right-click the app and choose Open to run it anyway.
+
+            **What ClusterDeck changes on your Mac:** it asks for macOS permission before
+            touching anything outside `~/.clusterdeck/`, and only ever writes inside a clearly
+            marked block it owns.
+            - Trusting a cluster's CA adds it to your **login keychain** (never System), scoped
+              to the SSL/TLS policy only -- you'll see a macOS authorization prompt each time.
+            - `/etc/hosts` is only touched if you opt in per profile, inside one marked block per
+              profile, via an admin-privileged prompt.
+            - Local DNS (opt in per profile) writes marked `/etc/resolver/<zone>` files via an
+              admin-privileged prompt and runs a loopback-only responder as the user LaunchAgent
+              `com.clusterdeck.dns`.
+            - `~/.ssh/config` gets one `Include ~/.clusterdeck/ssh/*.conf` line; your own config
+              is never edited directly.
+
+            See the README's "What ClusterDeck Changes on Your Mac" section for how to remove
+            everything it's added.
+        run: |
+          id=$(gh api "repos/${GITHUB_REPOSITORY}/releases" \
+            -f tag_name="$TAG" -f name="ClusterDeck $TAG" -f body="$BODY" \
+            -F draft=true -F prerelease=false --jq .id)
+          echo "release_id=$id" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build macOS .dmg (${{ matrix.target }})
+    needs: create-release
+    # Both targets build on Apple Silicon; x86_64 is a cross-compile, which Rust and
+    # tauri support natively on macOS. It is not launched on Intel hardware in CI.
     runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [aarch64-apple-darwin, x86_64-apple-darwin]
 
     steps:
       - name: Checkout
@@ -29,16 +80,19 @@ jobs:
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable (as of 2026-09-22)
+        with:
+          targets: ${{ matrix.target }}
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: src-tauri
+          key: ${{ matrix.target }}
 
       - name: Install frontend dependencies
         run: pnpm install --no-frozen-lockfile
 
-      - name: Build and release
+      - name: Build and upload
         uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -47,26 +101,5 @@ jobs:
           # remove the standard unsigned-app warning -- there is no Apple Developer ID
           # certificate configured for this project. Document this for end users until one is.
         with:
-          tagName: ${{ github.ref_name }}
-          releaseName: 'ClusterDeck ${{ github.ref_name }}'
-          releaseBody: |
-            See CHANGELOG.md for details.
-
-            **Unsigned build (ad-hoc identity):** there is no Apple Developer ID certificate for
-            this project yet, so macOS will show an "unidentified developer" warning on first
-            launch -- right-click the app and choose Open to run it anyway.
-
-            **What ClusterDeck changes on your Mac:** it asks for macOS permission before
-            touching anything outside `~/.clusterdeck/`, and only ever writes inside a clearly
-            marked block it owns.
-            - Trusting a cluster's CA adds it to your **login keychain** (never System), scoped
-              to the SSL/TLS policy only -- you'll see a macOS authorization prompt each time.
-            - `/etc/hosts` is only touched if you opt in per profile, inside one marked block per
-              profile, via an admin-privileged prompt.
-            - `~/.ssh/config` gets one `Include ~/.clusterdeck/ssh/*.conf` line; your own config
-              is never edited directly.
-
-            See the README's "What ClusterDeck Changes on Your Mac" section for how to remove
-            everything it's added.
-          releaseDraft: true
-          prerelease: false
+          releaseId: ${{ needs.create-release.outputs.release_id }}
+          args: --target ${{ matrix.target }}
