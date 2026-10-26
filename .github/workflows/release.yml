@@ -47,8 +47,12 @@ jobs:
 
             See the README's "What ClusterDeck Changes on Your Mac" section for how to remove
             everything it's added.
+        # Reuse an existing draft for this tag so "Re-run all jobs" does not leave a
+        # second, orphaned draft behind.
         run: |
-          id=$(gh api "repos/${GITHUB_REPOSITORY}/releases" \
+          id=$(gh api "repos/${GITHUB_REPOSITORY}/releases" --paginate \
+            --jq ".[] | select(.draft and .tag_name == \"$TAG\") | .id" | head -n 1)
+          [ -n "$id" ] || id=$(gh api "repos/${GITHUB_REPOSITORY}/releases" \
             -f tag_name="$TAG" -f name="ClusterDeck $TAG" -f body="$BODY" \
             -F draft=true -F prerelease=false --jq .id)
           echo "release_id=$id" >> "$GITHUB_OUTPUT"
