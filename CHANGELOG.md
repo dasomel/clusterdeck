@@ -6,7 +6,7 @@ The format follows the principles of Keep a Changelog and uses semantic versioni
 
 ## [Unreleased]
 
-## [0.5.0] - Unreleased
+## [0.5.0] - 2026-10-27
 
 - Add built-in local DNS to resolve cluster hostnames in Safari and URLSession without editing `/etc/hosts`: previously, macOS WebKit, Safari, and `URLSession` ignored `/etc/hosts` mappings on certain macOS configurations, leaving ingress hostnames unreachable in the browser. Profiles can now opt in via `host_mapping: local_dns` (replacing `manage_hosts_file: bool` with automatic migration and a `profiles.yaml.pre-local-dns.bak` backup). An authoritative, non-recursive loopback DNS responder (`127.0.0.1:15353`) managed by a user LaunchAgent (`com.clusterdeck.dns`) serves records from `~/.clusterdeck/dns/zones.json` for approved private zones (requiring at least three labels and a private TLD) and node aliases (`<dns-label>.clusterdeck.local`) via macOS `/etc/resolver/<zone>` files ([ADR-0011](docs/adr/0011-built-in-local-dns.md), [docs/LOCAL-DNS.md](docs/LOCAL-DNS.md), #87, #89, #90, #92, #96)
 - Enforce marker ownership, make-before-break updates, an ownership gate, and root privilege separation for local DNS and hosts management: resolver files are strictly marker-owned (`# managed by ClusterDeck (profile: <id>)`) so unmanaged or foreign files are never modified, and cross-profile zone takeovers require explicit approval; changes run in a single privileged script with make-before-break ordering (resolver writes and additive hosts changes before any removal) so a failure at any step still leaves a working mapping, and each resolver file is written atomically as root (`mktemp` inside `/etc/resolver` → `chmod 0644` → symlink/owner check → `mv -f`); resolver files are only written or retained while an ownership gate verifies that the LaunchAgent PID matches `lsof` loopback listeners, preventing 30-second `getaddrinfo` lookup stalls when the responder is inactive; and the root-run `/etc/hosts` and `/etc/resolver` write scripts no longer copy user-writable staged files directly, verifying sha256 checksums in root-owned temporary files in `/private/etc` and validating that staged paths are shell-quoted to close confused-deputy risks (#88, #91)
@@ -21,6 +21,22 @@ The format follows the principles of Keep a Changelog and uses semantic versioni
 - Add one-click "Set up cluster" action from observed multi-node environments, auto-saving a new profile via `store::upsert_profile` (superseding ADR-0005 D1 for this flow) and safely refreshing host address/port without overwriting custom profile settings
 - Enforce bounded provider process execution via `CommandRunner::run_bounded` (10s timeout, 2 MiB stream caps, `LC_ALL=C`, stdin null, `kill_on_drop(true)`) and strict path-segment validation before any local file read
 - Support built-in synthetic Demo mode (3-node Vagrant/VMware cluster) without running host commands; retire external InfraDeck repository and omit the standalone CLI binary to keep the Rust library API clean
+- Keep local DNS records when endpoint discovery succeeds only partially (classified per kind, so a Services 403 no longer wipes ingress records); serialize save+apply and Sync; persist scans and unattributed records; stop re-prompting for a zone the user cancelled on Connect; warn on a partial Scan (#99, #101, #102, #103)
+- Scope `/etc/resolver` changes to the profile being saved, synced or deleted, so another profile's pending or cancelled zone changes are never written along with it (#100, #104)
+- Preserve invalid profiles and unknown fields in `profiles.yaml` across saves, deletes and ownership switches instead of silently dropping them (#59, #105)
+- Reap orphaned SSH API tunnels on startup with a PID-recycling guard, then restore the API tunnels of previously connected bastion profiles in the background; stop tunnels through owned process handles, keep the port slot until cleanup finishes, keep `current-context` on background kubeconfig merges, serialize kubeconfig writes, and reconcile the `~/.kube/config` server port after a restore (#97, #106, #111, #112, #116, #118)
+- Generate an explicit `ProxyCommand` instead of `ProxyJump` in profile SSH configs: Terminal's SSH button runs ssh with argv[0] `-ssh`, which OpenSSH 10.3 copies into the implicit ProxyJump command and breaks every bastion host (#110)
+- Add real-Mac local DNS verification scripts that exit non-zero on any mismatch, stall or lookup error (`scripts/test-real-mac-local-dns.sh`, `scripts/verify-safari-resolution.swift`, #95, #117)
+- Document compatibility guarantees, the downgrade policy and code signing (#97, #107); bump the Tauri 2.12 stack (#108)
+- Build release artifacts for both Apple Silicon (`aarch64`) and Intel (`x86_64`) Macs
+
+### Known limitations
+
+- Negative lookups in `<profile>.clusterdeck.local` zones take about 5 s: macOS waits for multicast DNS after the responder's NXDOMAIN. Existing names resolve immediately, and zones outside `.local` are unaffected (#119)
+- Some local DNS lifecycle paths are covered by unit tests but not yet verified on a real Mac: the agent surviving logout/login, port-squatter cleanup (D-DEAD), cancelling the administrator prompt, and removing the last local DNS profile (#95)
+- The Endpoints tab does not refresh the responder generation label after Connect
+- The Intel build is compiled on an Apple Silicon CI runner and has not been launched on Intel hardware
+- Builds are ad-hoc signed and not notarized, so macOS shows an "unidentified developer" warning on first launch
 
 ## [0.4.1] - 2026-09-29
 
