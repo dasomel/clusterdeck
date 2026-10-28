@@ -149,7 +149,8 @@ async fn r4_item1_local_dns_record_edit_save_does_not_prompt_for_other_profiles_
         "saving A prompted for profile B's cancelled zone"
     );
     assert!(
-        records_of(&f, "cka.clusterdeck.local").contains(&"m2.cka.clusterdeck.local".to_string()),
+        records_of(&f, "cka.clusterdeck.internal")
+            .contains(&"m2.cka.clusterdeck.internal".to_string()),
         "A's own records must still be refreshed: {:?}",
         f.served()
     );

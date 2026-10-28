@@ -45,6 +45,7 @@ ClusterDeck의 모든 런타임 상태 파일은 오직 `~/.clusterdeck/` 아래
   - `/etc/hosts`: `# >>> ClusterDeck BEGIN (profile: <id>) >>>` / `END` 블록 사용.
 - ClusterDeck이 관리하지 않는 외부 설정 라인이나 제3자 resolver 파일은 절대로 변경하거나 삭제하지 않습니다.
 - 무효 프로필이나 파일 손상이 감지될 때는 resolver 보호 모드(`protect_resolver`)가 활성화되어 전역 정리나 미참조 존 자동 삭제를 차단합니다.
+- **노드 별칭 도메인 변경 (Unreleased, BREAKING, #119):** 노드 별칭과 프로필별 별칭 존이 `*.clusterdeck.local`에서 `*.clusterdeck.internal`로 이동했습니다. macOS에서 mDNS `.local` 아래의 부정(NXDOMAIN) 조회가 약 5초 지연되기 때문입니다. 다음 Sync/적용 시 ClusterDeck은 자신이 소유한(마커 확인) 기존 `/etc/resolver/<label>.clusterdeck.local` 파일을 제거하고 hosts 블록의 레거시 `.clusterdeck.local` 줄을 삭제하며, 이때 관리자 승인 프롬프트가 한 번 필요합니다. 이전 이름을 쓰는 북마크, SSH 설정, 스크립트는 직접 수정해야 합니다. `clusterdeck.local`은 계속 예약되어 존으로 승인할 수 없습니다. 이 변경 이전 버전으로 다운그레이드하면 `.local` 존과 별칭이 다시 생성됩니다.
 
 ---
 

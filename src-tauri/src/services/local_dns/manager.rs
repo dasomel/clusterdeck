@@ -15,7 +15,9 @@ use crate::services::resolver_files::{
     build_privileged_script_with, parse_marker, plan_changes_for_port, sha256_hex, Conflict,
     ConflictKind, ResolverPlan, ScriptOptions,
 };
-use crate::services::validate::is_allowed_private_zone;
+use crate::services::validate::{
+    is_allowed_private_zone, LEGACY_NODE_ALIAS_DOMAIN, NODE_ALIAS_DOMAIN,
+};
 
 pub const STATUS_WAIT: Duration = Duration::from_secs(5);
 pub const STATUS_POLL: Duration = Duration::from_millis(100);
@@ -461,6 +463,21 @@ fn unreadable_candidates(listing: &Listing) -> Vec<&str> {
         .collect()
 }
 
+/// D-119: the one removal that stays allowed in protection mode. True only for
+/// `<label>.<legacy domain>` (single DNS label) whose owner is, in the same apply, asked to
+/// serve `<label>.<current domain>`: that proves a valid, loaded profile has migrated. The
+/// legacy domain is reserved, so no user-approved zone can match this shape.
+fn is_migrated_legacy_alias(zone: &str, owner: &str, desired: &[(String, String)]) -> bool {
+    let Some(label) = zone.strip_suffix(&format!(".{LEGACY_NODE_ALIAS_DOMAIN}")) else {
+        return false;
+    };
+    if label.is_empty() || label.contains('.') {
+        return false;
+    }
+    let successor = format!("{label}.{NODE_ALIAS_DOMAIN}");
+    desired.iter().any(|(z, o)| *z == successor && o == owner)
+}
+
 pub async fn apply(env: &ManagerEnv<'_>, req: ApplyRequest<'_>) -> Result<ApplyResult, String> {
     let _guard = MANAGER_MUTEX.lock().await;
 
@@ -499,7 +516,11 @@ pub async fn apply(env: &ManagerEnv<'_>, req: ApplyRequest<'_>) -> Result<ApplyR
     }
 
     if req.protect_resolver || env.protect_resolver {
-        plan.remove.clear();
+        // D-119: protection mode holds every removal EXCEPT a legacy alias file whose owner has
+        // provably migrated (see `is_migrated_legacy_alias`); otherwise a stale invalid profile
+        // would keep the `.local` zones installed and served forever.
+        plan.remove
+            .retain(|(zone, owner)| is_migrated_legacy_alias(zone, owner, &desired));
     }
 
     let conflicted: HashSet<&str> = plan.conflicts.iter().map(|c| c.zone.as_str()).collect();
@@ -1287,6 +1308,88 @@ mod tests {
             res.generation
         );
         assert!(!f.resolver.join("old.example.internal").exists());
+    }
+
+    #[test]
+    fn migrated_legacy_alias_predicate_is_narrow() {
+        let desired = vec![("lab.clusterdeck.internal".to_string(), "lab".to_string())];
+        assert!(is_migrated_legacy_alias(
+            "lab.clusterdeck.local",
+            "lab",
+            &desired
+        ));
+        // different owner, multi-label, non-legacy, no successor: all held
+        assert!(!is_migrated_legacy_alias(
+            "lab.clusterdeck.local",
+            "other",
+            &desired
+        ));
+        assert!(!is_migrated_legacy_alias(
+            "x.lab.clusterdeck.local",
+            "lab",
+            &desired
+        ));
+        assert!(!is_migrated_legacy_alias(
+            "old.example.internal",
+            "lab",
+            &desired
+        ));
+        assert!(!is_migrated_legacy_alias(
+            "gone.clusterdeck.local",
+            "lab",
+            &desired
+        ));
+        assert!(!is_migrated_legacy_alias(
+            ".clusterdeck.local",
+            "lab",
+            &desired
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn protect_mode_still_migrates_legacy_alias_but_holds_other_removals() {
+        let f = started();
+        f.put_marker_file("lab.clusterdeck.local", "lab");
+        f.put_marker_file("old.example.internal", "lab");
+        f.writes(&[("lab.clusterdeck.internal", "lab")]);
+        write_zones(
+            &f.paths.zones,
+            &zones(
+                3,
+                &[
+                    ("lab.clusterdeck.local", "lab"),
+                    ("old.example.internal", "lab"),
+                ],
+            ),
+        )
+        .unwrap();
+
+        let mut r = req(zones(0, &[("lab.clusterdeck.internal", "lab")]));
+        r.protect_resolver = true;
+        apply(&f.env(), r).await.unwrap();
+
+        let script = f.scripts.lock().unwrap().last().cloned().unwrap();
+        let rm_legacy = format!(
+            "/bin/rm -f '{}/lab.clusterdeck.local'",
+            f.resolver.display()
+        );
+        assert!(script.contains(&rm_legacy), "{script}");
+        assert!(!script.contains("old.example.internal'"), "{script}");
+        assert!(!f.resolver.join("lab.clusterdeck.local").exists());
+        assert!(f.resolver.join("old.example.internal").exists());
+        let served = f.served_zones();
+        assert!(
+            !served.contains(&"lab.clusterdeck.local".to_string()),
+            "{served:?}"
+        );
+        assert!(
+            served.contains(&"lab.clusterdeck.internal".to_string()),
+            "{served:?}"
+        );
+        assert!(
+            served.contains(&"old.example.internal".to_string()),
+            "{served:?}"
+        );
     }
 
     #[tokio::test(start_paused = true)]

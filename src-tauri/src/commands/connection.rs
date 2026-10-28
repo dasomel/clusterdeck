@@ -928,7 +928,6 @@ pub fn merge_discovered_endpoints(
         if let Some(lines) =
             crate::services::hosts_file::get_profile_hosts_block(&hosts_content, profile_id)
         {
-            let node_suffix = format!(".{profile_id}.clusterdeck.local");
             for line in lines {
                 let parts: Vec<&str> = line.split_whitespace().collect();
                 if parts.len() < 2 {
@@ -940,7 +939,7 @@ pub fn merge_discovered_endpoints(
                     None => true,
                 };
                 if keep
-                    && !host.ends_with(&node_suffix)
+                    && !crate::services::validate::is_node_alias_host(host, profile_id)
                     && crate::services::validate::is_safe_host_domain(host)
                     && crate::services::validate::is_safe_ip_address(ip)
                     && !merged.iter().any(|ep| ep.host == host)
@@ -2217,6 +2216,11 @@ mod tests {
             "hosts content missing new service endpoint: {hosts_content}"
         );
         assert_eq!(res.endpoints_count, 2);
+        // D3: the legacy `.clusterdeck.local` node alias must not be carried over as an endpoint.
+        assert!(
+            !hosts_content.contains("cp1.hosts-test.clusterdeck.local"),
+            "legacy alias survived: {hosts_content}"
+        );
 
         std::fs::remove_dir_all(&paths.base).ok();
     }

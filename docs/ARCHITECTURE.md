@@ -180,7 +180,7 @@ For profiles that opt in via `manage_hosts_file: true`, ClusterDeck also maps ea
 bastion to a stable, namespaced hostname in `/etc/hosts`:
 
 ```text
-<host-or-bastion-name>.<profile-id>.clusterdeck.local
+<host-or-bastion-name>.<profile-id>.clusterdeck.internal
 ```
 
 The namespacing by profile id avoids collisions when two profiles happen to name a host the
@@ -189,7 +189,7 @@ and never touches any other line in the file:
 
 ```text
 # >>> ClusterDeck BEGIN (profile: <profile-id>) >>>
-<address> <name>.<profile-id>.clusterdeck.local
+<address> <name>.<profile-id>.clusterdeck.internal
 # <<< ClusterDeck END (profile: <profile-id>) <<<
 ```
 

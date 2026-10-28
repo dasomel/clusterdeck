@@ -55,16 +55,16 @@ ClusterDeck 프로필은 `host_mapping` 설정 키를 통해 세 가지 이름 �
 
 ClusterDeck에서 **존(Zone)**은 루프백 응답기가 authoritative(권한 있는) 방식으로 직접 응답하는 전용 도메인 접미사(suffix)입니다.
 
-### 3.1 노드 별칭 존 (`<label>.clusterdeck.local`)
+### 3.1 노드 별칭 존 (`<label>.clusterdeck.internal`)
 `host_mapping: local_dns`가 활성화된 각 프로필은 다음과 같은 별칭 존을 자동으로 할당받습니다:
 ```text
-<label>.clusterdeck.local
+<label>.clusterdeck.internal
 ```
-여기서 `<label>`은 프로필 ID로부터 유도됩니다(소문자 변환, 언더스코어를 하이픈으로 대체, 최대 63자 제한; 예: 프로필 `lab`은 `lab.clusterdeck.local`).
+여기서 `<label>`은 프로필 ID로부터 유도됩니다(소문자 변환, 언더스코어를 하이픈으로 대체, 최대 63자 제한; 예: 프로필 `lab`은 `lab.clusterdeck.internal`).
 
-- 노드 별칭은 `<node-name>.<label>.clusterdeck.local` 형태를 가집니다(예: `m1.lab.clusterdeck.local` → `192.0.2.10`).
-- 베스천(Bastion)이 설정된 경우 `<bastion-name>.<label>.clusterdeck.local` 형태를 가집니다.
-- ClusterDeck이 `.clusterdeck.local` 네임스페이스를 완전히 소유하고 있으므로, 이 존은 **별도의 사용자 승인 없이 자동으로 제공**됩니다.
+- 노드 별칭은 `<node-name>.<label>.clusterdeck.internal` 형태를 가집니다(예: `m1.lab.clusterdeck.internal` → `192.0.2.10`).
+- 베스천(Bastion)이 설정된 경우 `<bastion-name>.<label>.clusterdeck.internal` 형태를 가집니다.
+- ClusterDeck이 `.clusterdeck.internal` 네임스페이스를 완전히 소유하고 있으므로, 이 존은 **별도의 사용자 승인 없이 자동으로 제공**됩니다.
 
 ### 3.2 Ingress 존 승인
 Kubernetes에서 발견된 엔드포인트(Ingress, APISIX, Gateway API)는 전용 프라이빗 도메인(예: `api.lab.example.internal`)을 사용하는 경우가 많습니다.
@@ -90,7 +90,7 @@ Hosts 모드에서는 출처를 모르는 기존 레코드도 캐시에 저장�
    - `.internal`
    - `.test`
    - `.example`
-   - `.local` (단, `clusterdeck.local` 및 `*.clusterdeck.local`은 노드 별칭용 예약 도메인임)
+   - `.local` (단, `clusterdeck.internal`, `clusterdeck.local`(레거시) 및 그 하위 도메인은 노드 별칭용 예약 도메인임)
    - `.home.arpa`
    - `.localhost`
    - `.invalid`
@@ -123,7 +123,7 @@ ClusterDeck은 시스템에 불필요한 데몬을 상주시키지 않으며, �
 
 /etc/
 └── resolver/
-    ├── lab.clusterdeck.local          # 노드 별칭용 resolver 파일
+    ├── lab.clusterdeck.internal          # 노드 별칭용 resolver 파일
     └── lab.example.internal           # 승인된 ingress 존용 resolver 파일
 ```
 
@@ -180,7 +180,7 @@ ClusterDeck 데스크톱 앱의 **Endpoints** 탭에서는 로컬 DNS의 동작 
   - `Responder running (pid <pid>) · gen <gen>` (녹색/ok) — 응답기가 정상 실행 중이며 프로세스 ID 및 로드된 세대(generation) 번호를 제공함 (예: `Responder running (pid 12345) · gen 3`).
   - `Local DNS responder not running` (주황색/warn) — 응답기 에이전트가 언로드되었거나 정지됨 또는 초기화되지 않음.
 - **에러 배너:** `status.json`에 런타임 에러(`dnsStatus.last_error`, 포트 충돌, 유효하지 않은 존 포맷 등)가 기록되면 붉은색 상태 배너가 표시됩니다.
-- **존 목록 테이블:** 설정된 모든 존(`<label>.clusterdeck.local` 및 승인된 존)을 다음 정보와 함께 표시합니다:
+- **존 목록 테이블:** 설정된 모든 존(`<label>.clusterdeck.internal` 및 승인된 존)을 다음 정보와 함께 표시합니다:
   - 상태 태그(`<Tag>`): `served`, `not served`, `responder not running`, `owned by <owner>`, `conflict (<kind>)`, 또는 `unknown`.
   - 등록된 레코드 수 (예: `2 record(s)`).
 - **추천 존(Suggested zones) 스트립:**

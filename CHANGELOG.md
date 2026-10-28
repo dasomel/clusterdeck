@@ -6,6 +6,10 @@ The format follows the principles of Keep a Changelog and uses semantic versioni
 
 ## [Unreleased]
 
+### Changed — BREAKING
+
+- Move node aliases and per-profile local DNS zones from `*.clusterdeck.local` to `*.clusterdeck.internal`: macOS stalls about 5 s on every negative lookup under mDNS `.local` (measured 5003-5043 ms vs 1-2 ms under `.internal`; adding an SOA to the NXDOMAIN had no effect). Node aliases in the hosts block and the alias zone are renamed with no dual emission; ClusterDeck removes its own old `/etc/resolver/*.clusterdeck.local` files and legacy hosts lines on the next apply (one admin prompt), `clusterdeck.local` stays reserved, and external uses of the old names must be updated (#119, [ADR-0011](docs/adr/0011-built-in-local-dns.md) D6 amendment)
+
 ## [0.5.0] - 2026-10-27
 
 - Add built-in local DNS to resolve cluster hostnames in Safari and URLSession without editing `/etc/hosts`: previously, macOS WebKit, Safari, and `URLSession` ignored `/etc/hosts` mappings on certain macOS configurations, leaving ingress hostnames unreachable in the browser. Profiles can now opt in via `host_mapping: local_dns` (replacing `manage_hosts_file: bool` with automatic migration and a `profiles.yaml.pre-local-dns.bak` backup). An authoritative, non-recursive loopback DNS responder (`127.0.0.1:15353`) managed by a user LaunchAgent (`com.clusterdeck.dns`) serves records from `~/.clusterdeck/dns/zones.json` for approved private zones (requiring at least three labels and a private TLD) and node aliases (`<dns-label>.clusterdeck.local`) via macOS `/etc/resolver/<zone>` files ([ADR-0011](docs/adr/0011-built-in-local-dns.md), [docs/LOCAL-DNS.md](docs/LOCAL-DNS.md), #87, #89, #90, #92, #96)

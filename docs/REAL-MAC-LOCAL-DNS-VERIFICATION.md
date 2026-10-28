@@ -68,7 +68,7 @@ Verify that `com.clusterdeck.dns` automatically starts upon user GUI login (`Run
 
 #### Pre-conditions
 - ClusterDeck installed with at least one profile set to `host_mapping: local_dns`.
-- Profile synced: `/etc/resolver/<profile>.clusterdeck.local` exists.
+- Profile synced: `/etc/resolver/<profile>.clusterdeck.internal` exists.
 - Agent running: `launchctl print gui/$(id -u)/com.clusterdeck.dns | grep "state = running"`.
 
 #### Execution Steps
@@ -94,7 +94,7 @@ Verify that `com.clusterdeck.dns` automatically starts upon user GUI login (`Run
 - [ ] `launchctl print` reports `state = running` with a valid numeric `pid`.
 - [ ] `~/.clusterdeck/dns/status.json` has `error: null` and `pid` matches `launchctl print`.
 - [ ] `generation` in `status.json` is `>= BEFORE_GEN`.
-- [ ] `dig @127.0.0.1 -p 15353 bastion.<profile>.clusterdeck.local +short` returns the expected IP.
+- [ ] `dig @127.0.0.1 -p 15353 bastion.<profile>.clusterdeck.internal +short` returns the expected IP.
 - [ ] **Checklist 7 (Safari):** Safari / `URLSession` resolves cluster hostnames within 0.1s.
 
 ---
@@ -149,7 +149,7 @@ Verify that if another process occupies `127.0.0.1:15353`, ClusterDeck's pre-fli
 
 #### Pre-conditions
 - Profile `lab` active with `host_mapping: local_dns`.
-- `/etc/resolver/lab.clusterdeck.local` exists.
+- `/etc/resolver/lab.clusterdeck.internal` exists.
 
 #### Execution Steps
 1. Unload the legitimate ClusterDeck agent to release port 15353:
@@ -181,7 +181,7 @@ Verify that if another process occupies `127.0.0.1:15353`, ClusterDeck's pre-fli
   `local DNS responder unavailable; resolver entries removed (port 15353 is not owned by the ClusterDeck DNS agent)` (or port not owned).
 - [ ] All ClusterDeck-managed `/etc/resolver/<zone>` files are deleted.
 - [ ] Non-ClusterDeck files in `/etc/resolver/` (if any) are strictly untouched.
-- [ ] **Checklist 7 (Safari):** Querying `bastion.lab.clusterdeck.local` in Safari / `URLSession` returns `NSURLErrorCannotFindHost (-1003)` in **< 0.05 seconds** (proves that the dangling resolver file was removed, preventing the 30-second stall!).
+- [ ] **Checklist 7 (Safari):** Querying `bastion.lab.clusterdeck.internal` in Safari / `URLSession` returns `NSURLErrorCannotFindHost (-1003)` in **< 0.05 seconds** (proves that the dangling resolver file was removed, preventing the 30-second stall!).
 
 ---
 
@@ -191,7 +191,7 @@ Verify that if another process occupies `127.0.0.1:15353`, ClusterDeck's pre-fli
 Verify that when an administrator prompt is displayed (e.g. approving a new zone) and the user clicks **Cancel** (or presses Escape), ClusterDeck leaves the disk untouched, reconciles `zones.json` to reflect only what is actually on disk, and reports a clear warning.
 
 #### Pre-conditions
-- Profile `lab` has `lab.clusterdeck.local` already published and active on disk.
+- Profile `lab` has `lab.clusterdeck.internal` already published and active on disk.
 - Candidate ingress zone `lab.example.internal` is suggested in the Endpoints tab.
 
 #### Execution Steps
@@ -213,11 +213,11 @@ Verify that when an administrator prompt is displayed (e.g. approving a new zone
 #### Verification Criteria
 - [ ] UI shows notification/banner: `Admin approval was cancelled; local DNS was not changed`.
 - [ ] `/etc/resolver/lab.example.internal` was **NOT** created on disk.
-- [ ] `/etc/resolver/lab.clusterdeck.local` remains intact.
-- [ ] `~/.clusterdeck/dns/zones.json` contains ONLY `lab.clusterdeck.local` (the cancelled zone is discarded).
+- [ ] `/etc/resolver/lab.clusterdeck.internal` remains intact.
+- [ ] `~/.clusterdeck/dns/zones.json` contains ONLY `lab.clusterdeck.internal` (the cancelled zone is discarded).
 - [ ] Generation in `status.json` and `zones.json` advances cleanly without corruption.
 - [ ] **Checklist 7 (Safari):**
-  - `bastion.lab.clusterdeck.local` continues to resolve normally.
+  - `bastion.lab.clusterdeck.internal` continues to resolve normally.
   - `api.lab.example.internal` returns immediate `NSURLErrorCannotFindHost (-1003)`.
 
 ---
@@ -233,7 +233,7 @@ Verify that clicking **Remove from local DNS** on the last profile configured fo
 
 #### Pre-conditions
 - Exactly one profile exists with `host_mapping: local_dns` (e.g. `profile-a`).
-- Resolver files exist: `/etc/resolver/profile-a.clusterdeck.local`.
+- Resolver files exist: `/etc/resolver/profile-a.clusterdeck.internal`.
 - LaunchAgent `com.clusterdeck.dns` is running.
 
 #### Execution Steps
@@ -242,7 +242,7 @@ Verify that clicking **Remove from local DNS** on the last profile configured fo
 3. Verify filesystem and process state:
    ```bash
    # 1. Check /etc/resolver
-   ls -la /etc/resolver/profile-a.clusterdeck.local
+   ls -la /etc/resolver/profile-a.clusterdeck.internal
    
    # 2. Check LaunchAgent status
    launchctl print gui/$(id -u)/com.clusterdeck.dns 2>&1
@@ -258,7 +258,7 @@ Verify that clicking **Remove from local DNS** on the last profile configured fo
    ```
 
 #### Verification Criteria
-- [ ] `/etc/resolver/profile-a.clusterdeck.local` is deleted.
+- [ ] `/etc/resolver/profile-a.clusterdeck.internal` is deleted.
 - [ ] `launchctl print` returns `Could not find service "com.clusterdeck.dns" in domain for gui/...` (or exit code 113).
 - [ ] `~/Library/LaunchAgents/com.clusterdeck.dns.plist` is deleted.
 - [ ] `~/.clusterdeck/bin/clusterdeck-dns` is deleted.

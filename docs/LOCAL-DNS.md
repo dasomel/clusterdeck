@@ -55,16 +55,16 @@ ClusterDeck profiles support three name resolution modes via the `host_mapping` 
 
 A **zone** in ClusterDeck is an authoritative domain suffix managed by the loopback responder.
 
-### 3.1 Node-Alias Zone (`<label>.clusterdeck.local`)
+### 3.1 Node-Alias Zone (`<label>.clusterdeck.internal`)
 Each profile with `host_mapping: local_dns` automatically receives an alias zone:
 ```text
-<label>.clusterdeck.local
+<label>.clusterdeck.internal
 ```
-where `<label>` is derived from the profile ID (lowercased, underscores replaced with hyphens, up to 63 characters, e.g. profile `lab` becomes `lab.clusterdeck.local`).
+where `<label>` is derived from the profile ID (lowercased, underscores replaced with hyphens, up to 63 characters, e.g. profile `lab` becomes `lab.clusterdeck.internal`).
 
-- Node aliases take the form `<node-name>.<label>.clusterdeck.local` (e.g. `m1.lab.clusterdeck.local` pointing to `192.0.2.10`).
-- If configured, bastion hosts take the form `<bastion-name>.<label>.clusterdeck.local`.
-- This zone requires **no manual approval** because ClusterDeck reservedly owns the `.clusterdeck.local` namespace.
+- Node aliases take the form `<node-name>.<label>.clusterdeck.internal` (e.g. `m1.lab.clusterdeck.internal` pointing to `192.0.2.10`).
+- If configured, bastion hosts take the form `<bastion-name>.<label>.clusterdeck.internal`.
+- This zone requires **no manual approval** because ClusterDeck reservedly owns the `.clusterdeck.internal` namespace.
 
 ### 3.2 Approving an Ingress Zone
 Discovered endpoints from Kubernetes (Ingress, APISIX, Gateway API) often use private custom domains (e.g. `api.lab.example.internal`).
@@ -90,7 +90,7 @@ To prevent intercepting public Internet domains or tenant-controlled hostnames (
    - `.internal`
    - `.test`
    - `.example`
-   - `.local` (note: `clusterdeck.local` and `*.clusterdeck.local` are reserved)
+   - `.local` (note: `clusterdeck.internal`, `clusterdeck.local` (legacy) and everything under them are reserved)
    - `.home.arpa`
    - `.localhost`
    - `.invalid`
@@ -123,7 +123,7 @@ ClusterDeck installs lightweight, isolated components on your Mac. All backgroun
 
 /etc/
 └── resolver/
-    ├── lab.clusterdeck.local          # Resolver entry for node aliases
+    ├── lab.clusterdeck.internal          # Resolver entry for node aliases
     └── lab.example.internal           # Resolver entry for approved ingress zone
 ```
 
@@ -180,7 +180,7 @@ In the ClusterDeck desktop app, the **Endpoints** tab provides live visibility i
   - `Responder running (pid <pid>) · gen <gen>` (green/ok) — The agent is healthy and serving generation `<gen>` (e.g. `Responder running (pid 12345) · gen 3`).
   - `Local DNS responder not running` (orange/warn) — Agent is unloaded, stopped, or not yet started.
 - **Error Banner:** Displays red alert text if `status.json` reports a runtime error (`dnsStatus.last_error`, e.g. port conflict or invalid zones format).
-- **Zone Table:** Lists configured zones (`<label>.clusterdeck.local` and all `approved_dns_zones`) with:
+- **Zone Table:** Lists configured zones (`<label>.clusterdeck.internal` and all `approved_dns_zones`) with:
   - State tag (`<Tag>`): `served`, `not served`, `responder not running`, `owned by <owner>`, `conflict (<kind>)`, or `unknown`.
   - Active record count (e.g. `2 record(s)`).
 - **Suggested Zones Strip:**

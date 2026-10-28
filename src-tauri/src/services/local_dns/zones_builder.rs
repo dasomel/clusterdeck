@@ -14,7 +14,7 @@ use crate::services::local_dns::zone_file::{
 };
 use crate::services::validate::{
     is_allowed_private_zone, is_reserved_clusterdeck_zone, is_safe_gateway_address,
-    is_safe_host_domain, profile_dns_label,
+    is_safe_host_domain, profile_dns_label, NODE_ALIAS_DOMAIN,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -86,7 +86,7 @@ pub fn build_zones(
             let mut ids: Vec<String> = group.iter().map(|p| p.id.clone()).collect();
             ids.sort();
             conflicts.push(ZoneConflict {
-                zone: format!("{label}.clusterdeck.local"),
+                zone: format!("{label}.{NODE_ALIAS_DOMAIN}"),
                 profile_ids: ids,
             });
         } else {
@@ -98,7 +98,7 @@ pub fn build_zones(
     let mut claims: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for (p, label) in &active {
         claims
-            .entry(format!("{label}.clusterdeck.local"))
+            .entry(format!("{label}.{NODE_ALIAS_DOMAIN}"))
             .or_default()
             .insert(p.id.clone());
         for zone in p
@@ -134,7 +134,7 @@ pub fn build_zones(
     }
 
     for (p, label) in &active {
-        let alias_zone = format!("{label}.clusterdeck.local");
+        let alias_zone = format!("{label}.{NODE_ALIAS_DOMAIN}");
         if owner.get(&alias_zone) == Some(&p.id) {
             // Alias names use the DNS label, not the raw profile id (the hosts block uses the
             // id): `_` or uppercase in an id cannot appear in a zone name.
@@ -330,7 +330,7 @@ mod tests {
         assert_eq!(out.zones.generation, 3);
         assert_eq!(out.zones.port, 15353);
         let names: Vec<_> = out.zones.zones.iter().map(|z| z.zone.as_str()).collect();
-        assert_eq!(names, vec!["a.clusterdeck.local"]);
+        assert_eq!(names, vec!["a.clusterdeck.internal"]);
         assert_valid(&out, "only-local");
     }
 
@@ -404,7 +404,7 @@ mod tests {
             identity_file: None,
         });
         let out = build_zones(&[p], &HashMap::new(), 1, 15353);
-        let z = zone(&out, "a.clusterdeck.local");
+        let z = zone(&out, "a.clusterdeck.internal");
         let recs: Vec<_> = z
             .records
             .iter()
@@ -413,8 +413,8 @@ mod tests {
         assert_eq!(
             recs,
             vec![
-                ("jump.a.clusterdeck.local", "192.0.2.5"),
-                ("m1.a.clusterdeck.local", "192.0.2.10")
+                ("jump.a.clusterdeck.internal", "192.0.2.5"),
+                ("m1.a.clusterdeck.internal", "192.0.2.10")
             ]
         );
         assert_valid(&out, "alias");
@@ -424,9 +424,9 @@ mod tests {
     fn alias_uses_dns_label_when_id_differs() {
         let p = profile("My_Lab", HostMapping::LocalDns, &[]);
         let out = build_zones(&[p], &HashMap::new(), 1, 15353);
-        let z = zone(&out, "my-lab.clusterdeck.local");
+        let z = zone(&out, "my-lab.clusterdeck.internal");
         assert_eq!(z.profile_id, "My_Lab");
-        assert_eq!(z.records[0].name, "m1.my-lab.clusterdeck.local");
+        assert_eq!(z.records[0].name, "m1.my-lab.clusterdeck.internal");
         assert_valid(&out, "label");
     }
 
@@ -435,7 +435,7 @@ mod tests {
         let mut p = profile("a", HostMapping::LocalDns, &[]);
         p.hosts.push(host("m2", "node2.example.internal"));
         let out = build_zones(&[p], &HashMap::new(), 1, 15353);
-        assert_eq!(zone(&out, "a.clusterdeck.local").records.len(), 1);
+        assert_eq!(zone(&out, "a.clusterdeck.internal").records.len(), 1);
         assert_eq!(out.skipped[0].host, "m2");
         assert_valid(&out, "alias-skip");
     }
@@ -479,9 +479,9 @@ mod tests {
         ];
         let out = build_zones(&profiles, &HashMap::new(), 1, 15353);
         assert_eq!(out.conflicts.len(), 1);
-        assert_eq!(out.conflicts[0].zone, "my-lab.clusterdeck.local");
+        assert_eq!(out.conflicts[0].zone, "my-lab.clusterdeck.internal");
         let names: Vec<_> = out.zones.zones.iter().map(|z| z.zone.as_str()).collect();
-        assert_eq!(names, vec!["ok.clusterdeck.local"]);
+        assert_eq!(names, vec!["ok.clusterdeck.internal"]);
         assert_valid(&out, "label-collision");
     }
 
@@ -558,27 +558,27 @@ mod tests {
         let profiles = vec![profile(
             "a",
             HostMapping::LocalDns,
-            &["x.clusterdeck.local"],
+            &["x.clusterdeck.internal"],
         )];
-        let endpoints = eps("a", vec![ep("app.x.clusterdeck.local", "192.0.2.50")]);
+        let endpoints = eps("a", vec![ep("app.x.clusterdeck.internal", "192.0.2.50")]);
         let out = build_zones(&profiles, &endpoints, 1, 15353);
         assert!(out
             .zones
             .zones
             .iter()
-            .all(|z| z.zone != "x.clusterdeck.local"));
+            .all(|z| z.zone != "x.clusterdeck.internal"));
         assert_valid(&out, "reserved");
     }
 
     #[test]
     fn profile_cannot_claim_another_profiles_alias_zone() {
         let profiles = vec![
-            profile("a", HostMapping::LocalDns, &["b.clusterdeck.local"]),
+            profile("a", HostMapping::LocalDns, &["b.clusterdeck.internal"]),
             profile("b", HostMapping::LocalDns, &[]),
         ];
-        let endpoints = eps("a", vec![ep("evil.b.clusterdeck.local", "192.0.2.66")]);
+        let endpoints = eps("a", vec![ep("evil.b.clusterdeck.internal", "192.0.2.66")]);
         let out = build_zones(&profiles, &endpoints, 1, 15353);
-        let b = zone(&out, "b.clusterdeck.local");
+        let b = zone(&out, "b.clusterdeck.internal");
         assert_eq!(b.profile_id, "b");
         assert!(b.records.iter().all(|r| r.ipv4 != "192.0.2.66"));
         assert_eq!(out.skipped.len(), 1);
@@ -591,7 +591,7 @@ mod tests {
             profile(
                 "a",
                 HostMapping::LocalDns,
-                &["lab.example.internal", "x.clusterdeck.local"],
+                &["lab.example.internal", "x.clusterdeck.internal"],
             ),
             profile("b", HostMapping::LocalDns, &["dev.lab.example.internal"]),
         ];
@@ -599,7 +599,7 @@ mod tests {
             "a",
             vec![
                 ep("evil.dev.lab.example.internal", "192.0.2.66"),
-                ep("evil.x.clusterdeck.local", "192.0.2.67"),
+                ep("evil.x.clusterdeck.internal", "192.0.2.67"),
             ],
         );
         let out = build_zones(&profiles, &endpoints, 1, 15353);

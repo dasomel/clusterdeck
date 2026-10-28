@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use crate::services::k8s_endpoints::DiscoveredEndpoint;
+use crate::services::validate::NODE_ALIAS_DOMAIN;
 
 pub const HOSTS_FILE_PATH: &str = "/etc/hosts";
 /// Run as root right after /etc/hosts is replaced, so name lookups see the new entries.
@@ -63,15 +64,15 @@ pub fn render_hosts_block_with_endpoints(
 
     for host in &profile.hosts {
         block.push_str(&format!(
-            "{} {}.{}.clusterdeck.local\n",
-            host.address, host.name, profile.id
+            "{} {}.{}.{}\n",
+            host.address, host.name, profile.id, NODE_ALIAS_DOMAIN
         ));
     }
 
     if let Some(bastion) = &profile.bastion {
         block.push_str(&format!(
-            "{} {}.{}.clusterdeck.local\n",
-            bastion.address, bastion.name, profile.id
+            "{} {}.{}.{}\n",
+            bastion.address, bastion.name, profile.id, NODE_ALIAS_DOMAIN
         ));
     }
 
@@ -204,8 +205,8 @@ mod tests {
     fn render_hosts_block_includes_hosts_and_bastion_with_namespaced_names() {
         let block = render_hosts_block(&profile()).unwrap();
         assert!(block.contains("# >>> ClusterDeck BEGIN (profile: cka-lab) >>>"));
-        assert!(block.contains("192.0.2.10 cka-m1.cka-lab.clusterdeck.local"));
-        assert!(block.contains("198.51.100.1 bastion01.cka-lab.clusterdeck.local"));
+        assert!(block.contains("192.0.2.10 cka-m1.cka-lab.clusterdeck.internal"));
+        assert!(block.contains("198.51.100.1 bastion01.cka-lab.clusterdeck.internal"));
         assert!(block.contains("# <<< ClusterDeck END (profile: cka-lab) <<<"));
     }
 
@@ -272,10 +273,10 @@ mod tests {
             "",
             "cka-lab",
             Some(
-                "# >>> ClusterDeck BEGIN (profile: cka-lab) >>>\n192.0.2.10 cka-m1.cka-lab.clusterdeck.local\n# <<< ClusterDeck END (profile: cka-lab) <<<\n",
+                "# >>> ClusterDeck BEGIN (profile: cka-lab) >>>\n192.0.2.10 cka-m1.cka-lab.clusterdeck.internal\n# <<< ClusterDeck END (profile: cka-lab) <<<\n",
             ),
         );
-        assert!(result.contains("cka-m1.cka-lab.clusterdeck.local"));
+        assert!(result.contains("cka-m1.cka-lab.clusterdeck.internal"));
     }
 
     #[test]
@@ -285,29 +286,29 @@ mod tests {
             existing,
             "cka-lab",
             Some(
-                "# >>> ClusterDeck BEGIN (profile: cka-lab) >>>\n192.0.2.10 cka-m1.cka-lab.clusterdeck.local\n# <<< ClusterDeck END (profile: cka-lab) <<<\n",
+                "# >>> ClusterDeck BEGIN (profile: cka-lab) >>>\n192.0.2.10 cka-m1.cka-lab.clusterdeck.internal\n# <<< ClusterDeck END (profile: cka-lab) <<<\n",
             ),
         );
         assert!(result.contains("127.0.0.1 localhost"));
         assert!(result.contains("255.255.255.255 broadcasthost"));
-        assert!(result.contains("cka-m1.cka-lab.clusterdeck.local"));
+        assert!(result.contains("cka-m1.cka-lab.clusterdeck.internal"));
     }
 
     #[test]
     fn compute_updated_hosts_content_replaces_only_matching_profile_block_leaving_others() {
-        let existing = "127.0.0.1 localhost\n\n# >>> ClusterDeck BEGIN (profile: cka-lab) >>>\n192.0.2.99 stale.cka-lab.clusterdeck.local\n# <<< ClusterDeck END (profile: cka-lab) <<<\n\n# >>> ClusterDeck BEGIN (profile: dev-cluster) >>>\n198.51.100.20 dev-m1.dev-cluster.clusterdeck.local\n# <<< ClusterDeck END (profile: dev-cluster) <<<\n";
-        let new_block = "# >>> ClusterDeck BEGIN (profile: cka-lab) >>>\n192.0.2.10 cka-m1.cka-lab.clusterdeck.local\n# <<< ClusterDeck END (profile: cka-lab) <<<\n";
+        let existing = "127.0.0.1 localhost\n\n# >>> ClusterDeck BEGIN (profile: cka-lab) >>>\n192.0.2.99 stale.cka-lab.clusterdeck.internal\n# <<< ClusterDeck END (profile: cka-lab) <<<\n\n# >>> ClusterDeck BEGIN (profile: dev-cluster) >>>\n198.51.100.20 dev-m1.dev-cluster.clusterdeck.internal\n# <<< ClusterDeck END (profile: dev-cluster) <<<\n";
+        let new_block = "# >>> ClusterDeck BEGIN (profile: cka-lab) >>>\n192.0.2.10 cka-m1.cka-lab.clusterdeck.internal\n# <<< ClusterDeck END (profile: cka-lab) <<<\n";
         let result = compute_updated_hosts_content(existing, "cka-lab", Some(new_block));
         assert!(
-            !result.contains("stale.cka-lab.clusterdeck.local"),
+            !result.contains("stale.cka-lab.clusterdeck.internal"),
             "old cka-lab entry must be gone"
         );
         assert!(
-            result.contains("cka-m1.cka-lab.clusterdeck.local"),
+            result.contains("cka-m1.cka-lab.clusterdeck.internal"),
             "new cka-lab entry must be present"
         );
         assert!(
-            result.contains("dev-m1.dev-cluster.clusterdeck.local"),
+            result.contains("dev-m1.dev-cluster.clusterdeck.internal"),
             "unrelated profile's block must survive untouched"
         );
         assert!(
@@ -318,18 +319,18 @@ mod tests {
 
     #[test]
     fn compute_updated_hosts_content_removes_block_when_none_given() {
-        let existing = "127.0.0.1 localhost\n# >>> ClusterDeck BEGIN (profile: cka-lab) >>>\n192.0.2.10 cka-m1.cka-lab.clusterdeck.local\n# <<< ClusterDeck END (profile: cka-lab) <<<\n";
+        let existing = "127.0.0.1 localhost\n# >>> ClusterDeck BEGIN (profile: cka-lab) >>>\n192.0.2.10 cka-m1.cka-lab.clusterdeck.internal\n# <<< ClusterDeck END (profile: cka-lab) <<<\n";
         let result = compute_updated_hosts_content(existing, "cka-lab", None);
-        assert!(!result.contains("cka-lab.clusterdeck.local"));
+        assert!(!result.contains("cka-lab.clusterdeck.internal"));
         assert!(result.contains("127.0.0.1 localhost"));
     }
 
     #[test]
     fn get_profile_hosts_block_extracts_entries() {
-        let existing = "127.0.0.1 localhost\n\n# >>> ClusterDeck BEGIN (profile: cka-lab) >>>\n192.0.2.10 cka-m1.cka-lab.clusterdeck.local\n# Discovered endpoints\n192.0.2.10 api.example.com\n# <<< ClusterDeck END (profile: cka-lab) <<<\n";
+        let existing = "127.0.0.1 localhost\n\n# >>> ClusterDeck BEGIN (profile: cka-lab) >>>\n192.0.2.10 cka-m1.cka-lab.clusterdeck.internal\n# Discovered endpoints\n192.0.2.10 api.example.com\n# <<< ClusterDeck END (profile: cka-lab) <<<\n";
         let entries = get_profile_hosts_block(existing, "cka-lab").expect("should find block");
         assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0], "192.0.2.10 cka-m1.cka-lab.clusterdeck.local");
+        assert_eq!(entries[0], "192.0.2.10 cka-m1.cka-lab.clusterdeck.internal");
         assert_eq!(entries[1], "192.0.2.10 api.example.com");
 
         assert!(get_profile_hosts_block(existing, "nonexistent").is_none());
