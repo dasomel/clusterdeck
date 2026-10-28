@@ -168,7 +168,7 @@ export default function LocalRuntimePanel({ isVisible = true }: { isVisible?: bo
                         {host.arch ?? 'arch unknown'} · {host.cpus == null ? 'CPU —' : `${host.cpus} CPU`} · {gib(host.memory_bytes)} memory · {gib(host.disk_bytes)} disk
                       </div>
                       <div className="host-address">
-                        Runtime: {host.runtime ?? '—'} · Docker: {host.docker_context ?? '—'} · Kube: {host.kube_context ?? '—'}
+                        Runtime: {host.runtime ?? '—'} · Address: {host.address ? `${host.address}${host.port ? `:${host.port}` : ''}` : '—'} · Docker: {host.docker_context ?? '—'} · Kube: {host.kube_context ?? '—'}
                       </div>
                     </div>
 
