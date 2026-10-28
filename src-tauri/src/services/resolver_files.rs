@@ -1080,6 +1080,30 @@ mod tests {
     /// A failing final `mv` (simulated by swapping the binary for `false`) must exit 5 and remove its
     /// temp file, leaving the target absent.
     #[test]
+    fn legacy_clusterdeck_local_owned_file_is_removed_when_zone_moves_to_internal() {
+        // D3 (issue #119): the alias zone moved `.local` -> `.internal`; the owned legacy file
+        // is removed, an unowned `.local` file is never touched.
+        let owned = render_resolver_file("lab", DEFAULT_DNS_PORT).unwrap();
+        let existing = vec![
+            ("lab.clusterdeck.local".to_string(), owned),
+            (
+                "foreign.clusterdeck.local".to_string(),
+                "nameserver 10.0.0.1\n".to_string(),
+            ),
+        ];
+        let desired = vec![("lab.clusterdeck.internal".to_string(), "lab".to_string())];
+        let plan = plan_changes(&desired, &existing, &[]);
+        assert_eq!(
+            plan.write,
+            vec![("lab.clusterdeck.internal".to_string(), "lab".to_string())]
+        );
+        assert_eq!(
+            plan.remove,
+            vec![("lab.clusterdeck.local".to_string(), "lab".to_string())]
+        );
+    }
+
+    #[test]
     fn real_sh_failing_mv_exits_5_and_removes_temp_file() {
         let dir = TestDir::new();
         let resolver_dir = dir.path();

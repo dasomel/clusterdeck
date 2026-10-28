@@ -264,13 +264,39 @@ pub fn is_allowed_private_zone(zone: &str) -> bool {
             .any(|tld| zone.ends_with(&format!(".{tld}")))
 }
 
-/// `clusterdeck.local` and everything under it is reserved for the implicit per-profile
-/// node-alias zones (`<label>.clusterdeck.local`); users may not approve it as a zone.
-pub fn is_reserved_clusterdeck_zone(zone: &str) -> bool {
-    zone == "clusterdeck.local" || zone.ends_with(".clusterdeck.local")
+/// Parent domain of node aliases (`<host>.<profile>.<domain>`) and per-profile alias zones
+/// (`<label>.<domain>`). Single source of truth (D1, issue #119).
+///
+/// D5: `.internal`, not `.local` — a negative lookup under mDNS `.local` stalls ~5 s on macOS
+/// (mDNSResponder waits on multicast after the unicast NXDOMAIN; SOA-in-authority did not help,
+/// measured). `.internal` is ICANN-reserved for private use and answers NXDOMAIN in ~1-2 ms.
+pub const NODE_ALIAS_DOMAIN: &str = "clusterdeck.internal";
+/// Pre-rename domain. Never emitted any more; kept so it stays reserved (a user must not approve
+/// it as a zone) and so stale hosts-block lines can be recognised and dropped (D3).
+pub const LEGACY_NODE_ALIAS_DOMAIN: &str = "clusterdeck.local";
+
+fn is_under_domain(name: &str, domain: &str) -> bool {
+    name == domain
+        || name
+            .strip_suffix(domain)
+            .is_some_and(|rest| rest.ends_with('.'))
 }
 
-/// DNS label for a profile's node-alias zone `<label>.clusterdeck.local` (plan R5): profile ids
+/// D2: both the current and the legacy alias domain (and everything under them) are reserved
+/// for the implicit per-profile node-alias zones; users may not approve them as a zone.
+pub fn is_reserved_clusterdeck_zone(zone: &str) -> bool {
+    is_under_domain(zone, NODE_ALIAS_DOMAIN) || is_under_domain(zone, LEGACY_NODE_ALIAS_DOMAIN)
+}
+
+/// True when `host` is a ClusterDeck-generated node alias for `profile_id`, under either the
+/// current or the legacy domain (D3: legacy lines must not be carried over as endpoints).
+pub fn is_node_alias_host(host: &str, profile_id: &str) -> bool {
+    [NODE_ALIAS_DOMAIN, LEGACY_NODE_ALIAS_DOMAIN]
+        .iter()
+        .any(|d| host.ends_with(&format!(".{profile_id}.{d}")))
+}
+
+/// DNS label for a profile's node-alias zone `<label>.clusterdeck.internal` (plan R5): profile ids
 /// may contain `_` and run to 64 chars, which DNS labels may not. `None` when nothing usable is
 /// left; callers must also reject two profiles that map to the same label.
 pub fn profile_dns_label(profile_id: &str) -> Option<String> {
@@ -610,6 +636,7 @@ mod tests {
     #[test]
     fn allowed_private_zone_requires_private_tld_and_three_labels() {
         assert!(is_allowed_private_zone("local.example.internal"));
+        assert!(is_allowed_private_zone("lab.clusterdeck.internal"));
         assert!(is_allowed_private_zone("lab.clusterdeck.local"));
         assert!(is_allowed_private_zone("a.b.home.arpa"));
         assert!(!is_allowed_private_zone("example.internal"));
@@ -619,6 +646,34 @@ mod tests {
         assert!(!is_allowed_private_zone("Upper.example.internal"));
         assert!(!is_allowed_private_zone("bad_label.example.internal"));
         assert!(!is_allowed_private_zone("../x.internal"));
+    }
+
+    #[test]
+    fn reserved_zone_covers_current_and_legacy_domain() {
+        for z in [
+            "clusterdeck.internal",
+            "x.clusterdeck.internal",
+            "clusterdeck.local",
+            "x.clusterdeck.local",
+            "a.b.clusterdeck.local",
+        ] {
+            assert!(is_reserved_clusterdeck_zone(z), "{z}");
+        }
+        for z in [
+            "notclusterdeck.local",
+            "lab.example.internal",
+            "clusterdeck.com",
+        ] {
+            assert!(!is_reserved_clusterdeck_zone(z), "{z}");
+        }
+    }
+
+    #[test]
+    fn node_alias_host_matches_both_domains_for_same_profile_only() {
+        assert!(is_node_alias_host("m1.lab.clusterdeck.internal", "lab"));
+        assert!(is_node_alias_host("m1.lab.clusterdeck.local", "lab"));
+        assert!(!is_node_alias_host("m1.other.clusterdeck.local", "lab"));
+        assert!(!is_node_alias_host("api.lab.example.internal", "lab"));
     }
 
     #[test]

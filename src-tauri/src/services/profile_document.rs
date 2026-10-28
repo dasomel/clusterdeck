@@ -571,7 +571,8 @@ pub fn check_zone_ownership(
     }
     if crate::services::validate::is_reserved_clusterdeck_zone(zone) {
         return Err(format!(
-            "DNS zone {zone} is reserved for ClusterDeck node aliases (clusterdeck.local)"
+            "DNS zone {zone} is reserved for ClusterDeck node aliases ({})",
+            crate::services::validate::NODE_ALIAS_DOMAIN
         ));
     }
     for c in claims

@@ -11,6 +11,7 @@ import {
   type SuggestedDnsZones,
 } from '../../api/tauri';
 import { groupBlockingConflicts, hasBlockingConflicts } from '../../lib/hostsConflicts';
+import { NODE_ALIAS_DOMAIN } from '../../lib/nodeAlias';
 import Pill from '../../components/ui/Pill';
 import Tag from '../../components/ui/Tag';
 import CopyButton from '../../components/ui/CopyButton';
@@ -80,7 +81,7 @@ export default function EndpointsTab({
         ? 'Hosts (/etc/hosts)'
         : 'Off';
   const aliasZone = useMemo(
-    () => `${profile.id.toLowerCase().replace(/_/g, '-')}.clusterdeck.local`,
+    () => `${profile.id.toLowerCase().replace(/_/g, '-')}.${NODE_ALIAS_DOMAIN}`,
     [profile.id],
   );
 
@@ -340,7 +341,7 @@ export default function EndpointsTab({
           </>
         ) : (
           <p style={{ margin: '8px 0 0', fontSize: '12px', color: 'var(--text-secondary)' }}>
-            Maps *.{profile.id}.clusterdeck.local node aliases and discovered Ingress/APISIX/Gateway hosts into /etc/hosts.
+            Maps *.{profile.id}.{NODE_ALIAS_DOMAIN} node aliases and discovered Ingress/APISIX/Gateway hosts into /etc/hosts.
           </p>
         )}
 
@@ -420,11 +421,11 @@ export default function EndpointsTab({
       {/* Node FQDNs */}
       <div className="panel-card" style={{ padding: '14px 16px' }}>
         <div style={{ fontSize: '11px', fontWeight: 600, color: 'var(--text-tertiary)', textTransform: 'uppercase', marginBottom: '8px' }}>
-          Node Host Aliases (*.{profile.id}.clusterdeck.local)
+          Node Host Aliases (*.{profile.id}.{NODE_ALIAS_DOMAIN})
         </div>
         <div className="host-list">
           {profile.hosts.map((host) => {
-            const fqdn = `${host.name}.${profile.id}.clusterdeck.local`;
+            const fqdn = `${host.name}.${profile.id}.${NODE_ALIAS_DOMAIN}`;
             return (
               <div className="host-row" key={host.name}>
                 <div>
@@ -466,7 +467,7 @@ export default function EndpointsTab({
               <div>
                 <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
                   <span className="host-name mono" style={{ fontSize: '12px' }}>
-                    {profile.bastion.name}.{profile.id}.clusterdeck.local
+                    {profile.bastion.name}.{profile.id}.{NODE_ALIAS_DOMAIN}
                   </span>
                   <Tag>Bastion</Tag>
                 </div>
@@ -484,7 +485,7 @@ export default function EndpointsTab({
               </div>
               <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
                 <CopyButton
-                  text={`${profile.bastion.name}.${profile.id}.clusterdeck.local`}
+                  text={`${profile.bastion.name}.${profile.id}.${NODE_ALIAS_DOMAIN}`}
                   title="Copy bastion FQDN"
                 />
               </div>

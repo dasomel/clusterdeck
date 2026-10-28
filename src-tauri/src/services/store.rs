@@ -813,16 +813,19 @@ profiles:
         // Moving only the child would leave a's parent overlapping b's child.
         let err = switch_dns_zone_owner(&paths, "dev.lab.example.internal", "b").unwrap_err();
         assert!(err.contains("'a'"), "{err}");
-        assert!(switch_dns_zone_owner(&paths, "foo.clusterdeck.local", "b").is_err());
+        assert!(switch_dns_zone_owner(&paths, "foo.clusterdeck.internal", "b").is_err());
     }
 
     #[test]
     fn upsert_rejects_zone_under_clusterdeck_local() {
         let paths = temp_paths("zones-reserved");
         for zone in [
+            "clusterdeck.internal",
+            "x.clusterdeck.internal",
+            "a.b.clusterdeck.internal",
+            // Legacy domain stays reserved (D2).
             "clusterdeck.local",
             "x.clusterdeck.local",
-            "a.b.clusterdeck.local",
         ] {
             let mut p = sample_profile("a");
             p.approved_dns_zones = vec![zone.into()];

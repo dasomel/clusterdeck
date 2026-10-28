@@ -330,7 +330,7 @@ async fn sync_applies_zones_built_from_all_inputs_in_one_prompt() {
     assert_eq!(f.count("launchctl bootstrap"), 1);
     assert_eq!(
         zone_names(&f),
-        vec!["cka.clusterdeck.local", "lab.example.internal"]
+        vec!["cka.clusterdeck.internal", "lab.example.internal"]
     );
     assert_eq!(
         records_of(&f, "lab.example.internal"),
@@ -446,7 +446,7 @@ async fn delete_reapplies_without_the_deleted_profile() {
     reapply_after_delete(&paths, &f.env(), "cka").await.unwrap();
     assert_eq!(
         zone_names(&f),
-        vec!["b.example.internal", "ckb.clusterdeck.local"]
+        vec!["b.example.internal", "ckb.clusterdeck.internal"]
     );
     assert!(f.agent_paths.plist.exists());
 
@@ -534,7 +534,7 @@ async fn hosts_to_local_dns_switch_removes_the_block_in_the_same_script() {
     );
     let script = f.last_script().unwrap();
     assert!(script.contains("/private/etc/hosts"), "{script}");
-    assert!(script.contains("cka.clusterdeck.local"), "{script}");
+    assert!(script.contains("cka.clusterdeck.internal"), "{script}");
 }
 
 #[tokio::test(start_paused = true)]
@@ -609,7 +609,7 @@ async fn sync_of_a_former_hosts_profile_removes_its_block_after_the_resolver_wri
     assert_eq!(f.count("osascript"), 1, "one privileged action");
     let script = f.last_script().unwrap();
     let write_at = script
-        .find("cka.clusterdeck.local")
+        .find("cka.clusterdeck.internal")
         .expect("resolver write");
     let hosts_at = script.find("/private/etc/hosts").expect("hosts removal");
     assert!(
@@ -642,6 +642,7 @@ fn suggested_zones_are_private_most_specific_first_and_never_reserved() {
         vec!["lab.example.internal"]
     );
     assert!(suggested_zones("host.example.com").is_empty());
+    assert!(suggested_zones("m1.cka.clusterdeck.internal").is_empty());
     assert!(suggested_zones("m1.cka.clusterdeck.local").is_empty());
 }
 
@@ -753,7 +754,7 @@ async fn startup_sweep_does_not_delete_files_written_by_prior_apply() {
 
     reapply(&paths, &f.env(), None, None, None).await.unwrap();
 
-    let resolver_file = f.resolver.join("cka.clusterdeck.local");
+    let resolver_file = f.resolver.join("cka.clusterdeck.internal");
     std::fs::write(
         &resolver_file,
         render_resolver_file("cka", DEFAULT_DNS_PORT).unwrap(),
@@ -861,7 +862,7 @@ async fn local_dns_to_hosts_switch() {
         .unwrap();
 
     std::fs::write(
-        f.resolver.join("cka.clusterdeck.local"),
+        f.resolver.join("cka.clusterdeck.internal"),
         render_resolver_file("cka", DEFAULT_DNS_PORT).unwrap(),
     )
     .unwrap();
@@ -895,7 +896,7 @@ async fn local_dns_to_hosts_switch() {
         "script must update hosts: {script}"
     );
     assert!(
-        script.contains("cka.clusterdeck.local"),
+        script.contains("cka.clusterdeck.internal"),
         "script must remove local DNS resolver file: {script}"
     );
     assert!(
@@ -1253,7 +1254,7 @@ async fn failed_discovery_result_carries_warning_and_error_text() {
         records_of(&f, "lab.example.internal"),
         vec!["api.lab.example.internal"]
     );
-    assert!(zone_names(&f).contains(&"cka.clusterdeck.local".to_string()));
+    assert!(zone_names(&f).contains(&"cka.clusterdeck.internal".to_string()));
 }
 
 #[tokio::test(start_paused = true)]
@@ -1323,7 +1324,7 @@ async fn empty_successful_discovery_stores_empty() {
     );
     assert!(records_of(&f, "lab.example.internal").is_empty());
     // Node alias zone is still served
-    assert!(zone_names(&f).contains(&"cka.clusterdeck.local".to_string()));
+    assert!(zone_names(&f).contains(&"cka.clusterdeck.internal".to_string()));
 }
 
 #[test]
