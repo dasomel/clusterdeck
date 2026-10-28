@@ -45,6 +45,7 @@ All ClusterDeck runtime state resides exclusively under `~/.clusterdeck/` and is
   - `/etc/hosts` uses `# >>> ClusterDeck BEGIN (profile: <id>) >>>` / `END` marker pairs.
 - ClusterDeck will **never** modify or delete unmanaged lines or third-party resolver files.
 - When invalid profiles exist or the YAML document shape is corrupted, ClusterDeck engages resolver protection mode (`protect_resolver`), blocking global resolver sweeps or teardowns.
+- **Node alias domain rename (Unreleased, BREAKING, #119):** node aliases and per-profile alias zones moved from `*.clusterdeck.local` to `*.clusterdeck.internal`, because negative lookups under mDNS `.local` stall about 5 s on macOS. On the next Sync/apply ClusterDeck removes its own old `/etc/resolver/<label>.clusterdeck.local` files (marker-owned only) and drops legacy `.clusterdeck.local` lines from its hosts block; this needs one admin prompt. Bookmarks, SSH configs or scripts that use the old names must be updated. `clusterdeck.local` stays reserved and cannot be approved as a zone. Downgrading to a version before this change recreates the `.local` zones and aliases.
 
 ---
 

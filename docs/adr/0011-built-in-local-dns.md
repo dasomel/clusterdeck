@@ -119,3 +119,22 @@ Findings that change the plan:
 - **Static answers in resolver files:** not possible, because `/etc/resolver` supports only `nameserver`, `port`, `domain`, `search`, `options` and similar directives.
 - **Port 53:** needs root, and `port` makes it unnecessary.
 - **Network Extension DNS proxy:** needs entitlements and a system extension, too heavy for this problem.
+
+## Amendment 2026-10-28: node alias domain moves to `clusterdeck.internal` (D6 amended, #119)
+
+Spike item 4 ("negative and no-data answers do not stall") passed for the stock `*.example.internal` zone but was never run against a `.local` zone. On a real Mac a negative lookup under `*.clusterdeck.local` stalls: mDNSResponder waits on multicast DNS after the unicast NXDOMAIN, because `.local` is an mDNS domain. The Option-3 mitigation (item 3: add an SOA to the NXDOMAIN authority section) was implemented and measured on the live agent: no effect, even for repeated lookups of the same name. It was reverted and must not be re-added.
+
+Measured with `getaddrinfo` on the same Mac and the same responder:
+
+| Zone | Negative lookup |
+|---|---|
+| `*.clusterdeck.local` (mDNS `.local`) | 5003-5043 ms |
+| `*.clusterdeck.local` with SOA in authority | 5003-5043 ms (no change) |
+| `*.internal` served by the same responder | 1-2 ms |
+
+Decision:
+
+- **D6 (amended):** node aliases are `<host>.<profile>.clusterdeck.internal` and the implicit zone is `<label>.clusterdeck.internal`. `.internal` is reserved by ICANN for private use. The constant `NODE_ALIAS_DOMAIN` in `services/validate.rs` is the single source of truth (the frontend mirrors it in `src/lib/nodeAlias.ts`).
+- **Reservation:** both `clusterdeck.internal` and the legacy `clusterdeck.local` (and everything under them) are reserved, so a user cannot approve either as a zone.
+- **Migration:** the hosts block is emitted with the new names only (no dual emission). Legacy `.clusterdeck.local` lines in an existing block are dropped, not preserved as endpoints. `plan_changes_for_port` already removes marker-owned resolver files whose zone is no longer desired, so the old `/etc/resolver/<label>.clusterdeck.local` files go on the next apply (one admin prompt); unowned files are never touched.
+- **Breaking:** bookmarks, SSH configs and scripts using the old names must be updated. Downgrading below this version recreates the `.local` zones.
