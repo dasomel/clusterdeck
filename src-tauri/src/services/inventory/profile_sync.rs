@@ -37,11 +37,20 @@ async fn probe_private_ip(
         auth: AuthMode::Key,
     };
     let args = crate::services::ssh::build_ssh_target_args(&host, None, &["ip -4 -o addr show"]);
-    let out = runner
+    let mut res = runner
         .run_bounded_with_env("ssh", &args, &[], CommandLimits::default())
-        .await
-        .ok()
-        .filter(|o| o.success)?;
+        .await;
+    // Recreated VMs reuse NAT/forwarded endpoints, so a changed host key is expected, not an
+    // attack signal; prune and retry once (same policy as `ssh::run_with_host_key_retry`).
+    if let Ok(o) = &res {
+        if !o.success && crate::services::ssh::is_host_key_changed_error(&o.stderr) {
+            crate::services::ssh::prune_stale_host_keys(runner, &host, None, &o.stderr).await;
+            res = runner
+                .run_bounded_with_env("ssh", &args, &[], CommandLimits::default())
+                .await;
+        }
+    }
+    let out = res.ok().filter(|o| o.success)?;
     crate::services::local_runtime::extract_private_network_ip(&out.stdout, address)
         .filter(|ip| is_reachable_address(ip))
 }
@@ -107,7 +116,6 @@ pub async fn build_target(
     let dir = Path::new(environment);
     let mut has_k3s = false;
     for m in group.iter().filter(|m| m.state == "running") {
-        let mut address = reachable_ip(&m.ips).cloned();
         let mut port = 22;
         let mut user = "vagrant".to_string();
         let pdir = dir.to_path_buf();
@@ -130,10 +138,14 @@ pub async fn build_target(
             has_k3s = true;
         }
 
-        // `vagrant ssh-config` yields the NAT-forwarded loopback endpoint: SSH works through it but
-        // the Kubernetes API does not. Prefer a real VM address; a non-loopback ssh-config
-        // HostName keeps its own Port.
-        let mut forwarded: Option<(String, u16)> = None;
+        // vagrant-vmware-desktop's ssh-config HostName is nondeterministic per machine (forwarded
+        // loopback or the DHCP NAT address), while Kubernetes and the per-node DNS aliases need the
+        // stable private_network IP (DNS cannot carry a forwarded port; the NAT IP changes). So for
+        // VMware, or any loopback-forwarded endpoint, prefer: (1) static Vagrantfile/cluster.env IP,
+        // (2) private IP probed over the ssh-config endpoint, (3) a non-loopback ssh-config
+        // HostName with its own Port, (4) inventory IPs. Other providers (virtualbox, libvirt,
+        // parallels) have a reliable HostName, so they keep the cheaper probe-free legacy order.
+        let mut endpoint: Option<(String, u16)> = None;
         if let Some(ssh) =
             crate::services::inventory::providers::vagrant_ssh_config(runner, dir, &m.name).await
         {
@@ -141,25 +153,43 @@ pub async fn build_target(
             if ssh.identity_file.is_some() {
                 identity = ssh.identity_file;
             }
-            if is_reachable_address(&ssh.address) {
-                address = Some(ssh.address);
-                port = ssh.port;
-            } else {
-                forwarded = Some((ssh.address, ssh.port));
-            }
+            endpoint = Some((ssh.address, ssh.port));
         }
-        if address.is_none() {
-            // Same real-IP lookups as local_runtime::detect_vagrant: static Vagrantfile IP, then
-            // an `ip addr` probe through the forwarded endpoint.
-            address = static_ip.filter(|ip| is_reachable_address(ip));
-            if address.is_none() {
-                if let Some((faddr, fport)) = &forwarded {
-                    address =
-                        probe_private_ip(runner, &m.name, faddr, *fport, &user, identity.clone())
+        let loopback_endpoint = endpoint
+            .as_ref()
+            .is_some_and(|(a, _)| !is_reachable_address(a));
+        let address = if m.runtime == "vmware" || loopback_endpoint {
+            let mut found = static_ip.filter(|ip| is_reachable_address(ip));
+            if found.is_none() {
+                if let Some((eaddr, eport)) = &endpoint {
+                    found =
+                        probe_private_ip(runner, &m.name, eaddr, *eport, &user, identity.clone())
                             .await;
                 }
             }
-        }
+            if found.is_some() {
+                found
+            } else {
+                match endpoint.as_ref().filter(|(a, _)| is_reachable_address(a)) {
+                    Some((a, p)) => {
+                        port = *p;
+                        Some(a.clone())
+                    }
+                    None => reachable_ip(&m.ips).cloned(),
+                }
+            }
+        } else {
+            let mut address = reachable_ip(&m.ips).cloned();
+            if let Some((a, p)) = &endpoint {
+                address = Some(a.clone());
+                port = *p;
+            }
+            if address.is_none() {
+                address = static_ip.filter(|ip| is_reachable_address(ip));
+            }
+            address
+        };
+        let forwarded = endpoint.filter(|(a, _)| !is_reachable_address(a));
 
         let Some(addr) = address else {
             if forwarded.is_some() {
@@ -381,10 +411,18 @@ profiles:
     }
 
     async fn target_for(runner: &SshConfigRunner, ips: &[&str]) -> Result<Target, String> {
+        target_for_runtime(runner, "virtualbox", ips).await
+    }
+
+    async fn target_for_runtime(
+        runner: &dyn CommandRunner,
+        runtime: &str,
+        ips: &[&str],
+    ) -> Result<Target, String> {
         let dir = std::env::temp_dir().join(format!("cd-target-lab-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let env = dir.to_string_lossy().into_owned();
-        let mut m = Machine::new("virtualbox", "id1", "n1");
+        let mut m = Machine::new(runtime, "id1", "n1");
         m.orchestrator = Some("vagrant".into());
         m.environment = env.clone();
         m.state = "running".into();
@@ -442,6 +480,192 @@ profiles:
         assert_eq!(
             (target.hosts[0].address.as_str(), target.hosts[0].port),
             ("192.168.56.30", 2200)
+        );
+    }
+
+    const NAT_ADDR_CONFIG: &str =
+        "Host n1\n  HostName 172.16.221.138\n  User ops\n  Port 22\n  IdentityFile \"/keys/n1\"\n";
+    const VMWARE_IP_ADDR: &str = "1: lo    inet 127.0.0.1/8 scope host lo\n\
+2: enp2s0    inet 172.16.221.135/24 brd 172.16.221.255 scope global dynamic enp2s0\n\
+3: enp26s0    inet 192.168.56.21/24 brd 192.168.56.255 scope global enp26s0\n\
+4: cilium_host    inet 10.244.0.157/32 scope global cilium_host\n";
+
+    #[tokio::test]
+    async fn vagrant_target_probes_private_ip_when_ssh_config_is_nat_address() {
+        let runner = SshConfigRunner {
+            ssh_config: NAT_ADDR_CONFIG,
+            ip_addr: VMWARE_IP_ADDR,
+        };
+        let target = target_for_runtime(&runner, "vmware", &[]).await.unwrap();
+        assert_eq!(
+            (target.hosts[0].address.as_str(), target.hosts[0].port),
+            ("192.168.56.21", 22)
+        );
+    }
+
+    #[tokio::test]
+    async fn vagrant_target_falls_back_to_nat_ssh_config_when_probe_fails() {
+        let runner = SshConfigRunner {
+            ssh_config: NAT_ADDR_CONFIG,
+            ip_addr: "",
+        };
+        let target = target_for_runtime(&runner, "vmware", &[]).await.unwrap();
+        assert_eq!(
+            (target.hosts[0].address.as_str(), target.hosts[0].port),
+            ("172.16.221.138", 22)
+        );
+    }
+
+    #[tokio::test]
+    async fn vagrant_target_probes_private_ip_through_forwarded_loopback_port() {
+        let runner = SshConfigRunner {
+            ssh_config: NAT_CONFIG,
+            ip_addr: VMWARE_IP_ADDR,
+        };
+        let target = target_for(&runner, &["127.0.0.1"]).await.unwrap();
+        assert_eq!(
+            (target.hosts[0].address.as_str(), target.hosts[0].port),
+            ("192.168.56.21", 22)
+        );
+    }
+
+    /// First ssh probe fails with a changed host key; expects ssh-keygen pruning, then a retry.
+    struct StaleKeyRunner {
+        ssh_calls: std::sync::atomic::AtomicUsize,
+        keygen_argv: std::sync::Mutex<Vec<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl CommandRunner for StaleKeyRunner {
+        async fn run(&self, bin: &str, args: &[String]) -> Result<CommandOutput, String> {
+            if bin == "ssh-keygen" {
+                self.keygen_argv.lock().unwrap().push(args.to_vec());
+            }
+            Ok(CommandOutput {
+                stdout: String::new(),
+                stderr: String::new(),
+                success: true,
+            })
+        }
+        async fn run_bounded_with_env(
+            &self,
+            bin: &str,
+            _args: &[String],
+            _env: &[(String, String)],
+            _limits: CommandLimits,
+        ) -> Result<CommandOutput, String> {
+            if bin == "vagrant" {
+                return Ok(CommandOutput {
+                    stdout: NAT_ADDR_CONFIG.into(),
+                    stderr: String::new(),
+                    success: true,
+                });
+            }
+            let n = self
+                .ssh_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(if n == 0 {
+                CommandOutput {
+                    stdout: String::new(),
+                    stderr: "WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!\nOffending ED25519 key in /Users/x/.ssh/known_hosts:3\nHost key verification failed.\n".into(),
+                    success: false,
+                }
+            } else {
+                CommandOutput {
+                    stdout: VMWARE_IP_ADDR.into(),
+                    stderr: String::new(),
+                    success: true,
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn vagrant_probe_retries_once_after_pruning_stale_host_key() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let runner = StaleKeyRunner {
+            ssh_calls: Default::default(),
+            keygen_argv: Default::default(),
+        };
+        let target = target_for_runtime(&runner, "vmware", &[]).await.unwrap();
+        assert_eq!(
+            (target.hosts[0].address.as_str(), target.hosts[0].port),
+            ("192.168.56.21", 22)
+        );
+        assert_eq!(runner.ssh_calls.load(SeqCst), 2);
+        let keygen = runner.keygen_argv.lock().unwrap();
+        assert!(
+            keygen
+                .iter()
+                .any(|a| a.ends_with(&["-R".into(), "172.16.221.138".into()])),
+            "{keygen:?}"
+        );
+    }
+
+    /// Counts ssh probe calls on top of `SshConfigRunner`.
+    struct CountingRunner {
+        inner: SshConfigRunner,
+        ssh_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl CommandRunner for CountingRunner {
+        async fn run(&self, bin: &str, args: &[String]) -> Result<CommandOutput, String> {
+            self.inner.run(bin, args).await
+        }
+        async fn run_bounded_with_env(
+            &self,
+            bin: &str,
+            args: &[String],
+            env: &[(String, String)],
+            limits: CommandLimits,
+        ) -> Result<CommandOutput, String> {
+            if bin == "ssh" {
+                self.ssh_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            self.inner
+                .run_bounded_with_env(bin, args, env, limits)
+                .await
+        }
+    }
+
+    #[tokio::test]
+    async fn non_vmware_reachable_ssh_config_skips_probe() {
+        let runner = CountingRunner {
+            inner: SshConfigRunner {
+                ssh_config: NAT_ADDR_CONFIG,
+                ip_addr: VMWARE_IP_ADDR,
+            },
+            ssh_calls: Default::default(),
+        };
+        let target = target_for_runtime(&runner, "virtualbox", &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            (target.hosts[0].address.as_str(), target.hosts[0].port),
+            ("172.16.221.138", 22)
+        );
+        assert_eq!(
+            runner.ssh_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn vmware_nat_ssh_config_still_probes() {
+        let runner = CountingRunner {
+            inner: SshConfigRunner {
+                ssh_config: NAT_ADDR_CONFIG,
+                ip_addr: VMWARE_IP_ADDR,
+            },
+            ssh_calls: Default::default(),
+        };
+        let target = target_for_runtime(&runner, "vmware", &[]).await.unwrap();
+        assert_eq!(target.hosts[0].address, "192.168.56.21");
+        assert_eq!(
+            runner.ssh_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1
         );
     }
 }
