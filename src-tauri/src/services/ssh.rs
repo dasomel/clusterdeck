@@ -4,6 +4,13 @@ use crate::services::config::{AuthMode, Bastion, Host};
 use crate::services::process::{CommandOutput, CommandRunner};
 use crate::services::validate::{is_safe_known_hosts_path, is_safe_ssh_identifier};
 use serde::Serialize;
+use tokio::sync::Mutex;
+
+/// Serializes `ssh-keygen -R` across concurrent probes. It rewrites known_hosts via temp file +
+/// rename, so parallel runs on the same file lose each other's removals (last renamer wins) and
+/// leave `known_hosts.XXXXXXXXXX` temp files behind. A concurrent ssh accept-new append can still
+/// be lost during a prune's rename; that is harmless because TOFU re-adds it.
+static KNOWN_HOSTS_PRUNE_LOCK: Mutex<()> = Mutex::const_new(());
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ProbeResult {
@@ -226,19 +233,21 @@ pub async fn prune_stale_host_keys(
     bastion: Option<&Bastion>,
     stderr: &str,
 ) {
+    let _guard = KNOWN_HOSTS_PRUNE_LOCK.lock().await;
     let offending_file = extract_offending_known_hosts_file(stderr);
 
-    let mut targets = Vec::new();
-    targets.push(host.address.clone());
-    if host.port != 22 {
-        targets.push(format!("[{}]:{}", host.address, host.port));
-    }
-
-    if let Some(b) = bastion {
-        targets.push(b.address.clone());
-        if b.port != 22 {
-            targets.push(format!("[{}]:{}", b.address, b.port));
+    // OpenSSH records non-22 ports only as `[addr]:port`, so the bare address is never the
+    // offending entry for them; pruning it would delete the user's unrelated port-22 key.
+    let known_hosts_name = |address: &str, port: u16| {
+        if port == 22 {
+            address.to_string()
+        } else {
+            format!("[{address}]:{port}")
         }
+    };
+    let mut targets = vec![known_hosts_name(&host.address, host.port)];
+    if let Some(b) = bastion {
+        targets.push(known_hosts_name(&b.address, b.port));
     }
 
     for target in targets {
@@ -1178,6 +1187,86 @@ Host key verification failed.
         );
         // Call 4: ssh retry (succeeded)
         assert_eq!(recorded[3].0, "ssh");
+    }
+
+    struct ConcurrencyProbeRunner {
+        in_flight: std::sync::atomic::AtomicUsize,
+        max_in_flight: std::sync::atomic::AtomicUsize,
+        keygen_args: std::sync::Mutex<Vec<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl CommandRunner for ConcurrencyProbeRunner {
+        async fn run(&self, bin: &str, args: &[String]) -> Result<CommandOutput, String> {
+            use std::sync::atomic::Ordering::SeqCst;
+            assert_eq!(bin, "ssh-keygen");
+            let now = self.in_flight.fetch_add(1, SeqCst) + 1;
+            self.max_in_flight.fetch_max(now, SeqCst);
+            self.keygen_args.lock().unwrap().push(args.to_vec());
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            self.in_flight.fetch_sub(1, SeqCst);
+            Ok(CommandOutput {
+                stdout: String::new(),
+                stderr: String::new(),
+                success: true,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_prunes_never_run_ssh_keygen_in_parallel() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let runner = ConcurrencyProbeRunner {
+            in_flight: Default::default(),
+            max_in_flight: Default::default(),
+            keygen_args: std::sync::Mutex::new(Vec::new()),
+        };
+        let hosts: Vec<Host> = ["192.0.2.11", "192.0.2.12", "192.0.2.13"]
+            .iter()
+            .map(|a| {
+                let mut h = host();
+                h.address = a.to_string();
+                h
+            })
+            .collect();
+
+        futures::future::join_all(
+            hosts
+                .iter()
+                .map(|h| prune_stale_host_keys(&runner, h, None, "")),
+        )
+        .await;
+
+        assert_eq!(runner.max_in_flight.load(SeqCst), 1);
+        let calls = runner.keygen_args.lock().unwrap();
+        assert_eq!(calls.len(), 3);
+        for h in &hosts {
+            assert!(calls.contains(&vec!["-R".to_string(), h.address.clone()]));
+        }
+    }
+
+    #[tokio::test]
+    async fn prune_uses_bracketed_form_only_for_non_default_ports() {
+        let runner = ConcurrencyProbeRunner {
+            in_flight: Default::default(),
+            max_in_flight: Default::default(),
+            keygen_args: std::sync::Mutex::new(Vec::new()),
+        };
+        let mut h = host();
+        h.address = "127.0.0.1".to_string();
+        h.port = 2250;
+        prune_stale_host_keys(&runner, &h, None, "").await;
+        h.port = 22;
+        prune_stale_host_keys(&runner, &h, None, "").await;
+
+        let calls = runner.keygen_args.lock().unwrap();
+        assert_eq!(
+            *calls,
+            vec![
+                vec!["-R".to_string(), "[127.0.0.1]:2250".to_string()],
+                vec!["-R".to_string(), "127.0.0.1".to_string()],
+            ]
+        );
     }
 
     #[test]
