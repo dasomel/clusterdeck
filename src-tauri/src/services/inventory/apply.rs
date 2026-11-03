@@ -1,11 +1,14 @@
 #![allow(dead_code)]
 
+use std::path::{Path, PathBuf};
+
 use crate::services::config::{
     BootstrapPolicy, Host, KubeconfigSource, LocalRuntimeSource, Profile,
 };
 
 #[derive(Debug, Clone)]
 pub struct Target {
+    pub vagrant_project_dir: Option<PathBuf>,
     pub id: String,
     pub name: String,
     pub hosts: Vec<Host>,
@@ -15,10 +18,11 @@ pub struct Target {
 }
 
 // D5/D6: Apply target to typed Profiles. Validates via services/validate.rs,
-// refreshes existing matching profile (same id) without replacing user-configured fields.
+// refreshes an identified profile without replacing user-configured fields.
 pub fn apply(
     profiles: &mut Vec<Profile>,
     t: &Target,
+    canonicalize: &dyn Fn(&Path) -> Option<PathBuf>,
 ) -> Result<(String, bool, Vec<String>), String> {
     if !crate::services::validate::is_safe_profile_id(&t.id) {
         return Err(format!("invalid profile id: {}", t.id));
@@ -44,9 +48,14 @@ pub fn apply(
         }
     }
 
+    let existing_idx = profiles
+        .iter()
+        .position(|p| p.id == t.id)
+        .or_else(|| super::legacy::candidate(profiles, t, canonicalize));
+
     // R1: If a DIFFERENT profile already uses the same address+port, REFUSE.
-    for p in profiles.iter() {
-        if p.id != t.id {
+    for (idx, p) in profiles.iter().enumerate() {
+        if Some(idx) != existing_idx {
             for h in &p.hosts {
                 for new_host in &t.hosts {
                     // Loopback (forwarded ports) is reused by other/recreated VMs: not an identity.
@@ -63,9 +72,6 @@ pub fn apply(
             }
         }
     }
-
-    // R1: Match an existing profile by ID ONLY.
-    let existing_idx = profiles.iter().position(|p| p.id == t.id);
 
     let Some(idx) = existing_idx else {
         let first_cp = t
@@ -115,7 +121,7 @@ pub fn apply(
             updated.push(spec.name.clone());
         }
     }
-    if let Some(instance) = &t.local_runtime {
+    if let Some(instance) = t.local_runtime.as_ref().filter(|_| id == t.id) {
         if profile.local_runtime.is_none() {
             profile.local_runtime = Some(instance.clone());
         }
@@ -128,6 +134,13 @@ mod tests {
     use super::*;
     use crate::services::config::AuthMode;
 
+    fn apply(
+        profiles: &mut Vec<Profile>,
+        t: &Target,
+    ) -> Result<(String, bool, Vec<String>), String> {
+        super::apply(profiles, t, &|path| path.canonicalize().ok())
+    }
+
     fn target() -> Target {
         let host = |n: &str, ip: &str| Host {
             name: n.into(),
@@ -138,6 +151,7 @@ mod tests {
             auth: AuthMode::Key,
         };
         Target {
+            vagrant_project_dir: None,
             id: "vagrant-lab-111111".into(),
             name: "lab (Vagrant)".into(),
             hosts: vec![

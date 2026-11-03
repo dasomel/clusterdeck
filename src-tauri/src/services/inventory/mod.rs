@@ -4,6 +4,7 @@ pub mod apply;
 pub mod details;
 pub mod identity;
 pub mod k8s;
+mod legacy;
 pub mod model;
 pub mod profile_sync;
 pub mod providers;

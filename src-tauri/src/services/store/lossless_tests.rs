@@ -189,6 +189,7 @@ pub(super) fn op_create_from_environment(paths: &ClusterDeckPaths) -> Result<(),
         auth: crate::services::config::AuthMode::Key,
     };
     let target = crate::services::inventory::apply::Target {
+        vagrant_project_dir: None,
         id: "env-new".into(),
         name: "Env".into(),
         hosts: vec![host],
@@ -196,7 +197,7 @@ pub(super) fn op_create_from_environment(paths: &ClusterDeckPaths) -> Result<(),
         kubeconfig_path: "/etc/rancher/k3s/k3s.yaml".into(),
         context: "env".into(),
     };
-    let (id, _, _) = crate::services::inventory::apply::apply(&mut profiles, &target)?;
+    let (id, _, _) = crate::services::inventory::apply::apply(&mut profiles, &target, &|_| None)?;
     let profile = profiles.into_iter().find(|p| p.id == id).unwrap();
     upsert_profile(paths, profile)
 }
