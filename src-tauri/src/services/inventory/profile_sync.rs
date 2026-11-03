@@ -89,6 +89,7 @@ pub async fn build_target(
             auth: AuthMode::Key,
         });
         return Ok(Target {
+            vagrant_project_dir: None,
             id: format!("colima-{}", slug(&first.name)),
             name: format!("Colima {}", first.name),
             hosts,
@@ -204,6 +205,7 @@ pub async fn build_target(
     };
 
     Ok(Target {
+        vagrant_project_dir: Some(dir.to_path_buf()),
         id,
         name: format!("{base} (Vagrant)"),
         hosts,
@@ -254,7 +256,12 @@ pub async fn create_profile_from_environment(
     let inventory = discover(runner, false).await;
     let target = build_target(runner, environment, &inventory.machines).await?;
 
-    let (profile_id, created, updated_hosts) = apply(&mut profiles, &target)?;
+    let (profiles, (profile_id, created, updated_hosts)) = tokio::task::spawn_blocking(move || {
+        let outcome = apply(&mut profiles, &target, &|path| path.canonicalize().ok())?;
+        Ok::<_, String>((profiles, outcome))
+    })
+    .await
+    .map_err(|e| e.to_string())??;
     let profile = profiles
         .iter()
         .find(|p| p.id == profile_id)
@@ -409,6 +416,7 @@ profiles:
             ip_addr: IP_ADDR,
         };
         let target = target_for(&runner, &["127.0.0.1"]).await.unwrap();
+        assert!(target.vagrant_project_dir.is_some());
         let host = &target.hosts[0];
         assert_eq!(
             (host.address.as_str(), host.port, host.user.as_str()),
