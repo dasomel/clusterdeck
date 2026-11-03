@@ -30,6 +30,20 @@ pub fn find_vmx(dir: &Path) -> Option<String> {
         })
 }
 
+/// Canonical form of `id` when it is an absolute `.vmx` file located inside `machine_dir`.
+fn contained_vmx(machine_dir: &Path, id: &str) -> Option<String> {
+    let p = Path::new(id);
+    if !p.is_absolute()
+        || p.extension().is_none_or(|x| x != "vmx")
+        || id.chars().any(char::is_control)
+    {
+        return None;
+    }
+    let real = std::fs::canonicalize(p).ok()?;
+    let root = std::fs::canonicalize(machine_dir).ok()?;
+    (real.is_file() && real.starts_with(&root)).then(|| real.to_string_lossy().into_owned())
+}
+
 /// Absolute, no `..`, no control characters: the only shape of project dir we hand to the
 /// filesystem or to `VAGRANT_CWD`. Existence is checked separately (a vanished project is
 /// reported "stale", not dropped).
@@ -148,17 +162,26 @@ async fn fill_from_project(
         .ok()
         .map(|s| s.trim().to_owned())
         .filter(|s| !s.is_empty());
-    // Validate id content with path-segment validator before use
-    m.runtime_id = raw_id.filter(|id| validate::is_safe_path_segment(id));
-
+    // vagrant-vmware-desktop 3.x writes the ABSOLUTE .vmx path into `id` (older releases a
+    // bare directory name), so for vmware accept that shape too, but only when it resolves to
+    // a file inside this machine's own dir (rejects `..`, symlink escapes, other projects).
     if runtime == "vmware" {
-        if let Some(id) = &m.runtime_id {
-            let id_dir = machine_dir.join(id);
-            m.runtime_id = tokio::task::spawn_blocking(move || find_vmx(&id_dir))
-                .await
-                .ok()
-                .flatten();
+        if let Some(id) = raw_id {
+            let dir = machine_dir.clone();
+            m.runtime_id = tokio::task::spawn_blocking(move || {
+                if validate::is_safe_path_segment(&id) {
+                    find_vmx(&dir.join(&id))
+                } else {
+                    contained_vmx(&dir, &id)
+                }
+            })
+            .await
+            .ok()
+            .flatten();
         }
+    } else {
+        // Validate id content with path-segment validator before use
+        m.runtime_id = raw_id.filter(|id| validate::is_safe_path_segment(id));
     }
     let id_file = machine_dir.join("id");
     m.created_at = tokio::task::spawn_blocking(move || details::created_ms(&id_file))
@@ -379,5 +402,85 @@ mod tests {
         assert!(!is_plain_project_dir(Path::new("relative/dir")));
         assert!(!is_plain_project_dir(Path::new("/var/log/../etc")));
         assert!(is_plain_project_dir(Path::new("/var/log")));
+    }
+
+    /// Project with a vmware_desktop machine whose `id` file holds `id_for(machine_dir)`.
+    async fn vmware_discover(
+        tag: &str,
+        id_for: impl Fn(&Path) -> String,
+    ) -> (PathBuf, Vec<Machine>) {
+        let dir = temp_dir(tag);
+        let machine_dir = dir.join(".vagrant/machines/master-1/vmware_desktop");
+        std::fs::create_dir_all(machine_dir.join("uuid-1")).unwrap();
+        std::fs::write(machine_dir.join("uuid-1/box.vmx"), "numvcpus = \"2\"\n").unwrap();
+        std::fs::write(machine_dir.join("id"), id_for(&machine_dir)).unwrap();
+        let runner = FakeVagrantRunner {
+            global_status: format!(
+                "id       name      provider        state   directory\n\
+                 ------------------------------------------------\n\
+                 1234567  master-1  vmware_desktop  running {}\n",
+                dir.display()
+            ),
+            ..Default::default()
+        };
+        (dir, discover(&runner).await.unwrap())
+    }
+
+    #[tokio::test]
+    async fn vmware_absolute_vmx_id_inside_machine_dir_is_not_stale() {
+        let (dir, machines) = vmware_discover("absvmx", |md| {
+            format!("{}\n", md.join("uuid-1/box.vmx").display())
+        })
+        .await;
+        let expected = std::fs::canonicalize(
+            dir.join(".vagrant/machines/master-1/vmware_desktop/uuid-1/box.vmx"),
+        )
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+        assert_eq!(machines[0].runtime_id.as_deref(), Some(expected.as_str()));
+        // No live VMware observation to match: with a runtime_id it stays "running", not "stale".
+        let reconciled = reconcile(machines, &[]);
+        assert_eq!(reconciled[0].state, "running");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn vmware_absolute_vmx_id_outside_machine_dir_is_rejected() {
+        let other = temp_dir("outside");
+        std::fs::write(other.join("evil.vmx"), "").unwrap();
+        let target = other.join("evil.vmx");
+        let (dir, machines) =
+            vmware_discover("absout", |_| format!("{}\n", target.display())).await;
+        assert_eq!(machines[0].runtime_id, None);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&other);
+    }
+
+    #[tokio::test]
+    async fn vmware_legacy_uuid_dir_id_still_resolves() {
+        let (dir, machines) = vmware_discover("legacy", |_| "uuid-1\n".into()).await;
+        assert!(machines[0]
+            .runtime_id
+            .as_deref()
+            .is_some_and(|p| p.ends_with("uuid-1/box.vmx")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn vmware_absolute_vmx_id_symlink_escaping_machine_dir_is_rejected() {
+        let other = temp_dir("symtarget");
+        let target = other.join("outside.vmx");
+        std::fs::write(&target, "").unwrap();
+        let (dir, machines) = vmware_discover("symlink", |md| {
+            let link = md.join("uuid-1/link.vmx");
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            format!("{}\n", link.display())
+        })
+        .await;
+        assert_eq!(machines[0].runtime_id, None);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&other);
     }
 }
