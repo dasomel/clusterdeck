@@ -6,9 +6,28 @@ The format follows the principles of Keep a Changelog and uses semantic versioni
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-04
+
 ### Changed — BREAKING
 
-- Move node aliases and per-profile local DNS zones from `*.clusterdeck.local` to `*.clusterdeck.internal`: macOS stalls about 5 s on every negative lookup under mDNS `.local` (measured 5003-5043 ms vs 1-2 ms under `.internal`; adding an SOA to the NXDOMAIN had no effect). Node aliases in the hosts block and the alias zone are renamed with no dual emission; ClusterDeck removes its own old `/etc/resolver/*.clusterdeck.local` files and legacy hosts lines on the next apply (one admin prompt), `clusterdeck.local` stays reserved, and external uses of the old names must be updated (#119, [ADR-0011](docs/adr/0011-built-in-local-dns.md) D6 amendment)
+- Move node aliases and per-profile local DNS zones from `*.clusterdeck.local` to `*.clusterdeck.internal`: macOS stalls about 5 s on every negative lookup under mDNS `.local` (measured 5003-5043 ms vs 1-2 ms under `.internal`; adding an SOA to the NXDOMAIN had no effect). Node aliases in the hosts block and the alias zone are renamed with no dual emission; ClusterDeck removes its own old `/etc/resolver/*.clusterdeck.local` files and legacy hosts lines on the next apply (one admin prompt), even in protection mode, `clusterdeck.local` stays reserved, and external uses of the old names must be updated (#119, #123, [ADR-0011](docs/adr/0011-built-in-local-dns.md) D6 amendment)
+
+### Added
+
+- Show each VM's address in the Local Runtime panel (#14, #122)
+
+### Fixed
+
+- Reconnect to recreated VMs whose host keys changed: concurrent host probes ran `ssh-keygen -R` in parallel on the same `known_hosts`, and its temp-file + rename rewrite lost the other runs' removals, so stale keys survived the retry ("Host key verification failed"). Pruning is now serialized, and for non-22 ports only the `[addr]:port` entry is pruned instead of also deleting the unrelated `addr:22` key (#128, #132)
+- Detect running VMware Vagrant machines again: vagrant-vmware-desktop 3.x writes the absolute `.vmx` path into the machine `id` file, which failed path validation, so every VM was reported "stale" and Infrastructure could not set up or refresh the cluster. An absolute id is accepted only when it resolves to a file inside that machine's own `.vagrant` directory (#130, #133)
+- Use the VM's private network IP for VMware Vagrant hosts: `vagrant ssh-config` reports either a forwarded `127.0.0.1:<port>` endpoint or the DHCP NAT address, so hosts were saved with addresses whose node DNS aliases resolved to the Mac itself. VMware machines (and loopback endpoints) now prefer the static IP, then the private IP probed over SSH (retrying once after pruning a changed host key), then the ssh-config address; other providers keep the previous order (#129, #134)
+- Refresh profiles created by the earlier detection flow from Infrastructure: their `vagrant-<project>` id differed from the inventory's `vagrant-<project>-<hash>`, so refresh was refused as an address conflict with the profile itself. Such a profile is now updated in place, keeping its id and settings, only when its host names match exactly and every host key lives in that project's `.vagrant/machines/<host>/` ([ADR-0008](docs/adr/0008-vm-inventory-environment-source.md) amendment, #131, #135)
+
+### Known limitations
+
+- Some local DNS lifecycle paths are covered by unit tests but not yet verified on a real Mac: the agent surviving logout/login, port-squatter cleanup (D-DEAD), cancelling the administrator prompt, and removing the last local DNS profile (#95)
+- Builds remain ad-hoc signed (no Apple Developer ID): macOS shows an "unidentified developer" warning, and file-access permissions such as Documents may need re-granting after each update
+- The Intel (`x64`) build is cross-compiled and not tested on Intel hardware
 
 ## [0.5.0] - 2026-10-27
 
