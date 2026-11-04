@@ -412,8 +412,8 @@ ever touches keychain trust entries it created itself. The endpoints view and th
 see [ADR-0006](adr/0006-private-ca-local-trust.md) for the full design and security rationale).
 
 Each discovered CA also carries a `warnings: Vec<String>` computed from `openssl x509 -noout
--text`/`-checkend` (macOS's LibreSSL has no `-ext` flag, hence text-parsing): missing `serverAuth`
-EKU, leaf/CA expiry within 14/30 days respectively (with a distinct already-expired message), a
+-text`/`-checkend` (macOS's LibreSSL has no `-ext` flag, hence text-parsing): an EKU that excludes
+`serverAuth`, leaf/CA expiry within 14/30 days respectively (with a distinct already-expired message), a
 leaf SAN that does not cover a discovered host, and a CA that is structurally invalid (missing
 CA:TRUE or keyCertSign). A genuine `-checkend` result is always silent on stdout/stderr — only
 the exit code carries it — so a non-zero exit *with* stderr output (e.g. an unreadable temp file)

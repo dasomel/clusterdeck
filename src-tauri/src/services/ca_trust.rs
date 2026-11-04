@@ -92,9 +92,10 @@ fn extract_openssl_section(text: &str, header: &str) -> Option<String> {
     Some(body.join(" "))
 }
 
-fn has_server_auth_eku(text: &str) -> bool {
-    extract_openssl_section(text, "X509v3 Extended Key Usage")
-        .is_some_and(|body| body.contains("TLS Web Server Authentication"))
+fn eku_forbids_server_auth(text: &str) -> bool {
+    extract_openssl_section(text, "X509v3 Extended Key Usage").is_some_and(|body| {
+        !body.contains("TLS Web Server Authentication") && !body.contains("Any Extended Key Usage")
+    })
 }
 
 fn has_ca_true_basic_constraint(text: &str) -> bool {
@@ -425,7 +426,8 @@ async fn leaf_health_warnings(
     // check here -- matching how the EKU check below already skips silently in that case.
     if let Some(text) = text_out.as_deref() {
         leaf_sans = parse_openssl_sans(text);
-        if !has_server_auth_eku(text) {
+        // An absent EKU does not restrict certificate purpose; Apple and browsers accept it.
+        if eku_forbids_server_auth(text) {
             warnings.push(
                 "이 인증서엔 server auth 용도가 없어 CA를 신뢰해도 브라우저 경고가 계속될 수 있음"
                     .to_string(),
@@ -845,28 +847,31 @@ mod tests {
     }
 
     #[test]
-    fn has_server_auth_eku_detects_presence_and_absence() {
+    fn eku_forbids_server_auth_detects_restrictive_eku_only() {
         let with_eku = "Certificate:\n    Data:\n        X509v3 extensions:\n            \
              X509v3 Extended Key Usage: \n                TLS Web Server Authentication, TLS \
              Web Client Authentication\n            X509v3 Subject Alternative Name: \n         \
              DNS:example.internal\n    Signature Algorithm: sha256WithRSAEncryption";
-        assert!(has_server_auth_eku(with_eku));
+        assert!(!eku_forbids_server_auth(with_eku));
 
-        // Reproduces the real incident this feature exists to catch: cert-manager's Certificate
-        // had no `usages` field, so the leaf defaulted to `digital signature, key encipherment`
-        // only -- no Extended Key Usage extension is emitted at all in that case.
+        // cert-manager's default leaf (no `usages`): `digital signature, key encipherment` and no
+        // EKU extension at all. That is NOT a warning case (#137): an absent EKU is unrestricted
+        // (RFC 5280 4.2.1.12) and macOS `security verify-cert -p ssl` / URLSession accept it. The
+        // browser failure originally blamed on it was an antivirus HTTPS-scanning proxy.
         let without_eku = "Certificate:\n    Data:\n        X509v3 extensions:\n            \
              X509v3 Key Usage: critical\n                Digital Signature, Key \
              Encipherment\n            X509v3 Subject Alternative Name: \n                \
              DNS:example.internal\n    Signature Algorithm: sha256WithRSAEncryption";
-        assert!(!has_server_auth_eku(without_eku));
+        assert!(!eku_forbids_server_auth(without_eku));
 
         let eku_present_without_server_auth =
             "            X509v3 Extended Key Usage: \n                TLS Web Client \
              Authentication\n    Signature Algorithm: sha256WithRSAEncryption";
-        assert!(!has_server_auth_eku(eku_present_without_server_auth));
+        assert!(eku_forbids_server_auth(eku_present_without_server_auth));
 
-        assert!(!has_server_auth_eku("no extensions at all"));
+        let any_eku = "            X509v3 Extended Key Usage: \n                Any Extended Key Usage\n    Signature Algorithm: sha256WithRSAEncryption";
+        assert!(!eku_forbids_server_auth(any_eku));
+        assert!(!eku_forbids_server_auth("no extensions at all"));
     }
 
     #[test]
@@ -1025,9 +1030,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn leaf_health_warnings_flags_missing_server_auth_eku() {
+    async fn leaf_health_warnings_ignores_absent_eku() {
         let runner = FakeCertHealthRunner {
             text_output: MISSING_EKU_LEAF_TEXT.to_string(),
+            seconds_until_expiry: 365 * 24 * 3600,
+        };
+        let (warnings, _) = leaf_health_warnings(&runner, TEST_CA_PEM).await;
+        assert!(
+            warnings.is_empty(),
+            "expected no warnings, got {warnings:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn leaf_health_warnings_flags_eku_with_only_client_auth() {
+        let runner = FakeCertHealthRunner {
+            text_output: "            X509v3 Extended Key Usage: \n                TLS Web Client Authentication\n            X509v3 Subject Alternative Name: \n                DNS:argocd.local.beluga.internal\n    Signature Algorithm: sha256WithRSAEncryption".to_string(),
             seconds_until_expiry: 365 * 24 * 3600,
         };
         let (warnings, _) = leaf_health_warnings(&runner, TEST_CA_PEM).await;
@@ -1037,6 +1055,19 @@ mod tests {
                 "이 인증서엔 server auth 용도가 없어 CA를 신뢰해도 브라우저 경고가 계속될 수 있음"
                     .to_string()
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn leaf_health_warnings_ignores_any_extended_key_usage() {
+        let runner = FakeCertHealthRunner {
+            text_output: "            X509v3 Extended Key Usage: \n                Any Extended Key Usage\n            X509v3 Subject Alternative Name: \n                DNS:argocd.local.beluga.internal\n    Signature Algorithm: sha256WithRSAEncryption".to_string(),
+            seconds_until_expiry: 365 * 24 * 3600,
+        };
+        let (warnings, _) = leaf_health_warnings(&runner, TEST_CA_PEM).await;
+        assert!(
+            warnings.is_empty(),
+            "expected no warnings, got {warnings:?}"
         );
     }
 

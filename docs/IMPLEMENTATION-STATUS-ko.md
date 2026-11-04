@@ -16,7 +16,7 @@ Last verified: 2026-09-23 against `feat/14-local-runtime-lifecycle`
 - Profile editor를 prefill하는 on-demand local VM detection(Colima/Lima/Vagrant). Detected 상태는 editor component state에만 유지되며 사용자가 profile을 저장하기 전까지 persist되지 않습니다 (ADR-0005 참조).
 - 가져온 kubeconfig의 server endpoint를 정규화하기 위한 Kubernetes API endpoint discovery(APISIX/Ingress/Istio/Gateway API/Service), 그리고 기본/kubeconfig-manager/profile-editor 화면에 노출되는 status banner UI.
 - Ingress/ApisixTls → Secret의 `ca.crt`를 discovery하여 CA별 New/Trusted/Rotated 상태를 계산하고, macOS login keychain에 대해 `security(1)`로 trust/replace/remove를 수행하며, Settings에 프로필 전체를 아우르는 Trusted CAs 목록을 제공합니다 (ADR-0006 참조).
-- 발견된 CA/leaf 인증서마다 health warning을 표시합니다: `serverAuth` EKU 누락, leaf/CA 만료 임박(14일/30일 threshold, 이미 만료된 경우 별도 메시지), 발견된 host를 커버하지 않는 SAN, 구조적으로 올바르지 않은 CA(CA:TRUE/keyCertSign 누락).
+- 발견된 CA/leaf 인증서마다 health warning을 표시합니다: serverAuth(또는 anyExtendedKeyUsage)가 없는 EKU(EKU 확장 자체가 없으면 경고하지 않음), leaf/CA 만료 임박(14일/30일 threshold, 이미 만료된 경우 별도 메시지), 발견된 host를 커버하지 않는 SAN, 구조적으로 올바르지 않은 CA(CA:TRUE/keyCertSign 누락).
 - 원격 kubeconfig fetch가 `scp`를 shell-out하는 대신 SSH exec(`sudo cat` 실패 시 `cat`으로 fallback)로 읽도록 바뀌어 local temp-file permission window를 제거했습니다 (#23).
 - curl Kubernetes API fallback 경로(예: macOS Sequoia Local Network Privacy로 `kubectl` 자체가 실패하는 경우)에서 TLS 인증서를 검증합니다: kubeconfig의 CA 데이터로 `--cacert` 검증하거나, CA 데이터가 없으면 curl의 system trust store를 사용하며, `-k`/`--insecure`는 사용하지 않습니다 (#24).
 - Colima/Lima instance의 architecture/CPU/memory/disk 표시와 Docker context 연동을 포함한 local runtime discovery dashboard가 완성되어 Settings의 read-only "Local Runtime" 섹션으로 제공됩니다 (#14 Phase 1).
