@@ -6,6 +6,17 @@ The format follows the principles of Keep a Changelog and uses semantic versioni
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-11-05
+
+### Fixed
+
+- Never install a non-app binary as the local DNS responder: a sync run from another process (e.g. a test harness) could copy that executable over `~/.clusterdeck/bin/clusterdeck-dns`, crash-looping the LaunchAgent and removing every ClusterDeck `/etc/resolver` file. The candidate now must pass a side-effect-free `--dns-responder-selftest` before it replaces the installed responder; otherwise the old binary, zones and resolver files are left untouched (#139, #140)
+- Stop warning "no server auth usage" for leaf certificates without an Extended Key Usage extension (cert-manager's default when `usages` is unset): an absent EKU is unrestricted and macOS accepts it for TLS. The warning now appears only when an EKU is present without serverAuth or anyExtendedKeyUsage (#137, #138)
+
+### Known limitations
+
+- Same as 0.6.0: unverified local DNS lifecycle paths (#95), ad-hoc signing, and the Intel (`x64`) build is not tested on Intel hardware
+
 ## [0.6.0] - 2026-11-04
 
 ### Changed — BREAKING
