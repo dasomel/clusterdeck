@@ -262,8 +262,7 @@ async fn wait_for_status(env: &ManagerEnv<'_>, generation: u64) -> Result<Status
     }
 }
 
-async fn ensure_agent(env: &ManagerEnv<'_>, uid: u32) -> Result<(), String> {
-    let bin_changed = agent::ensure_binary(env.current_exe, &env.paths.binary)?;
+async fn ensure_agent(env: &ManagerEnv<'_>, uid: u32, bin_changed: bool) -> Result<(), String> {
     let plist_changed = agent::ensure_plist(env.paths, env.port)?;
     let running = agent::agent_pid(env.runner, uid).await?.is_some();
     // Not running covers both never-loaded and loaded-but-dead; `reload` handles either.
@@ -584,11 +583,15 @@ pub async fn apply(env: &ManagerEnv<'_>, req: ApplyRequest<'_>) -> Result<ApplyR
         return failure.map_or(Ok(result), Err);
     }
 
+    // An invalid candidate says nothing about the installed responder's health: fail before
+    // the availability gate, whose cleanup would otherwise destroy working DNS state.
+    let bin_changed = agent::ensure_binary(env.runner, env.current_exe, &env.paths.binary).await?;
+
     // Gate: nothing privileged happens before the responder proves it loaded this generation
     // and owns the port. EVERY failure here (agent start included) ends in D-DEAD.
     let gate: Result<(u32, u64, StatusFile), String> = async {
         let uid = agent::current_uid(env.runner).await?;
-        ensure_agent(env, uid).await?;
+        ensure_agent(env, uid, bin_changed).await?;
         let g1 = next_generation(env.paths);
         let mut first = free.clone();
         first.extend(kept.iter().cloned());
@@ -806,7 +809,7 @@ pub async fn teardown(env: &ManagerEnv<'_>) -> Result<TeardownResult, String> {
 /// Returns whether the copy changed.
 pub async fn refresh_binary(env: &ManagerEnv<'_>) -> Result<bool, String> {
     let _guard = MANAGER_MUTEX.lock().await;
-    let changed = agent::ensure_binary(env.current_exe, &env.paths.binary)?;
+    let changed = agent::ensure_binary(env.runner, env.current_exe, &env.paths.binary).await?;
     if changed {
         let uid = agent::current_uid(env.runner).await?;
         if agent::is_loaded(env.runner, uid).await? {
@@ -891,6 +894,7 @@ mod tests {
     }
 
     struct Behaviour {
+        selftest: Result<CommandOutput, String>,
         loaded: bool,
         responder_alive: bool,
         responder_pid: u32,
@@ -937,6 +941,7 @@ mod tests {
                 log: StdMutex::new(Vec::new()),
                 scripts: StdMutex::new(Vec::new()),
                 b: StdMutex::new(Behaviour {
+                    selftest: ok("clusterdeck-dns-responder-ok v1\n"),
                     loaded: false,
                     responder_alive: true,
                     responder_pid: PID,
@@ -1077,6 +1082,20 @@ mod tests {
 
     #[async_trait]
     impl CommandRunner for Fake {
+        async fn run_bounded(
+            &self,
+            bin: &str,
+            args: &[String],
+            limits: crate::services::process::CommandLimits,
+        ) -> Result<CommandOutput, String> {
+            assert_eq!(bin, self.exe.to_str().unwrap());
+            assert_eq!(args, &["--dns-responder-selftest"]);
+            assert_eq!(limits.timeout, Duration::from_secs(5));
+            assert!(limits.max_output_bytes <= 4096);
+            self.log.lock().unwrap().push("selftest".into());
+            self.b.lock().unwrap().selftest.clone()
+        }
+
         async fn run(&self, bin: &str, args: &[String]) -> Result<CommandOutput, String> {
             if bin != "osascript" {
                 let mut b = self.b.lock().unwrap();
@@ -2060,6 +2079,82 @@ mod tests {
         );
         assert!(!f.resolver.join("lab.example.internal").exists());
         assert!(f.served_zones().is_empty());
+    }
+
+    #[tokio::test]
+    async fn selftest_failure_preserves_binary_zones_and_resolvers() {
+        for response in [
+            fail("Unrecognized option: dns-responder-selftest"),
+            Ok(CommandOutput {
+                stdout: "clusterdeck-dns-responder-ok v1\n".into(),
+                stderr: String::new(),
+                success: false,
+            }),
+            ok("wrong token\n"),
+            ok("clusterdeck-dns-responder-ok v1\nextra"),
+            Err("self-test timed out".into()),
+        ] {
+            for refresh in [false, true] {
+                for installed in [false, true] {
+                    let f = Fake::new();
+                    if installed {
+                        agent::atomic_write(&f.paths.binary, b"previous responder", 0o755).unwrap();
+                    }
+                    f.put_marker_file("keep.example.internal", "prof-a");
+                    write_zones(
+                        &f.paths.zones,
+                        &zones(3, &[("keep.example.internal", "prof-a")]),
+                    )
+                    .unwrap();
+                    let before = std::fs::read(&f.paths.zones).unwrap();
+                    let resolver = f.resolver.join("keep.example.internal");
+                    let resolver_before = std::fs::read(&resolver).unwrap();
+                    f.set(|b| b.selftest = response.clone());
+                    let err = if refresh {
+                        refresh_binary(&f.env()).await.unwrap_err()
+                    } else {
+                        apply(
+                            &f.env(),
+                            req(zones(0, &[("new.example.internal", "prof-a")])),
+                        )
+                        .await
+                        .unwrap_err()
+                    };
+                    assert!(
+                        err.contains(&format!(
+                            "refusing to install {} as DNS responder: self-test failed",
+                            f.exe.display()
+                        )),
+                        "{err}"
+                    );
+                    assert_eq!(
+                        std::fs::read(&f.paths.binary).ok(),
+                        installed.then(|| b"previous responder".to_vec())
+                    );
+                    assert_eq!(std::fs::read(&f.paths.zones).unwrap(), before);
+                    assert_eq!(std::fs::read(&resolver).unwrap(), resolver_before);
+                    assert!(!f.paths.plist.exists());
+                    assert!(!f.paths.generation.exists());
+                    assert_eq!(f.calls(), vec!["selftest"]);
+                    assert!(f.scripts.lock().unwrap().is_empty());
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_binary_selftests_before_replacement_and_skips_matching_sha() {
+        let f = Fake::new();
+        agent::atomic_write(&f.paths.binary, b"previous responder", 0o755).unwrap();
+        f.set(|b| b.loaded = true);
+        assert!(refresh_binary(&f.env()).await.unwrap());
+        assert_eq!(std::fs::read(&f.paths.binary).unwrap(), b"binary-v1");
+        assert_eq!(f.calls().first().unwrap(), "selftest");
+        assert_eq!(f.count("launchctl bootstrap"), 1);
+        f.log.lock().unwrap().clear();
+        f.set(|b| b.selftest = Err("must not run".into()));
+        assert!(!refresh_binary(&f.env()).await.unwrap());
+        assert!(f.calls().is_empty());
     }
 
     /// Fails each runner call in turn (every await point of the gate and of the post-script

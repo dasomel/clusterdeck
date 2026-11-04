@@ -224,6 +224,13 @@ In the ClusterDeck desktop app, the **Endpoints** tab provides live visibility i
 
 ## 7. Troubleshooting
 
+If a sync reports `refusing to install <path> as DNS responder: self-test failed`,
+run it from the ClusterDeck app rather than a test harness or unrelated executable.
+Before installing a missing or changed responder binary, ClusterDeck runs a bounded
+five-second `--dns-responder-selftest` and requires its versioned success token.
+Failure leaves the installed binary, LaunchAgent, zones, and resolver files untouched.
+Identical SHA-256 binaries skip the self-test.
+
 If hostnames fail to resolve or behave unexpectedly, follow this structured diagnosis:
 
 ### Step 1: Check the LaunchAgent
