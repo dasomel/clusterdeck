@@ -1,0 +1,242 @@
+[
+  {
+    "file": "2026-09.jsonl",
+    "line": 1,
+    "sha256": "cc369ab977e9dcb1bcba13a118f154f04476932f61c8466a40385c7c1eb93be9",
+    "reason": "pre-v1 local collector (scripts/collect-evidence.sh): environment 'darwin/arm64' violates pattern; human_interventions/review_corrections/ci_retries null instead of integer. Preserved verbatim; was gitignored until recovery."
+  },
+  {
+    "file": "2026-09.jsonl",
+    "line": 2,
+    "sha256": "9c0276e5f739cd351f5484baa38150ebe730350add39aee65e73aa0025bf0892",
+    "reason": "pre-v1 local collector (scripts/collect-evidence.sh): environment 'darwin/arm64' violates pattern; human_interventions/review_corrections/ci_retries null instead of integer. Preserved verbatim; was gitignored until recovery."
+  },
+  {
+    "file": "2026-09.jsonl",
+    "line": 3,
+    "sha256": "b443abb165aa2c665e2f0d35639a710f98e0e9f0547d361912647040ebc534c2",
+    "reason": "pre-v1 local collector (scripts/collect-evidence.sh): environment 'darwin/arm64' violates pattern; human_interventions/review_corrections/ci_retries null instead of integer. Preserved verbatim; was gitignored until recovery."
+  },
+  {
+    "file": "2026-09.jsonl",
+    "line": 4,
+    "sha256": "07babd9b848dd2057841e91d9e6ac9474e955ddbf113e2ddfc81a37b7f52b189",
+    "reason": "pre-v1 local collector (scripts/collect-evidence.sh): environment 'darwin/arm64' violates pattern; human_interventions/review_corrections/ci_retries null instead of integer. Preserved verbatim; was gitignored until recovery."
+  },
+  {
+    "file": "2026-09.jsonl",
+    "line": 5,
+    "sha256": "77817a8f3a5f17315ec33426e4e7ff3b4fc61201104597543716934eb238e11f",
+    "reason": "pre-v1 local collector (scripts/collect-evidence.sh): environment 'darwin/arm64' violates pattern; human_interventions/review_corrections/ci_retries null instead of integer. Preserved verbatim; was gitignored until recovery."
+  },
+  {
+    "file": "2026-09.jsonl",
+    "line": 6,
+    "sha256": "d8ef97def216f51ba500ef75cbffafeec70f150de7d0c26f9c99207b2c2f3168",
+    "reason": "pre-v1 local collector (scripts/collect-evidence.sh): environment 'darwin/arm64' violates pattern; human_interventions/review_corrections/ci_retries null instead of integer. Preserved verbatim; was gitignored until recovery."
+  },
+  {
+    "file": "2026-09.jsonl",
+    "line": 7,
+    "sha256": "37b7677b2ffa5aaf9a77350daf0194dd8e6e22584e720925bcd6a01dfd09e320",
+    "reason": "pre-v1 local collector (scripts/collect-evidence.sh): environment 'darwin/arm64' violates pattern; human_interventions/review_corrections/ci_retries null instead of integer. Preserved verbatim; was gitignored until recovery."
+  },
+  {
+    "file": "2026-09.jsonl",
+    "line": 8,
+    "sha256": "214e3bd3c6e29d3601fd313a1bcc2e8747a48ffc4dbd67bb184755606b63e7ad",
+    "reason": "pre-v1 local collector (scripts/collect-evidence.sh): environment 'darwin/arm64' violates pattern; human_interventions/review_corrections/ci_retries null instead of integer. Preserved verbatim; was gitignored until recovery."
+  },
+  {
+    "file": "2026-09.jsonl",
+    "line": 9,
+    "sha256": "2e3e4c67ff1412f2d85e68f0159b23aa765279937d358fbb2d30d79f5f698851",
+    "reason": "pre-v1 local collector (scripts/collect-evidence.sh): environment 'darwin/arm64' violates pattern; human_interventions/review_corrections/ci_retries null instead of integer. Preserved verbatim; was gitignored until recovery."
+  },
+  {
+    "file": "2026-09.jsonl",
+    "line": 10,
+    "sha256": "9cdbeb483ce493aa65d601e888cdc3b4eba8765dbd6965bf71daca581d0dd9cc",
+    "reason": "pre-v1 local collector (scripts/collect-evidence.sh): environment 'darwin/arm64' violates pattern; human_interventions/review_corrections/ci_retries null instead of integer. Preserved verbatim; was gitignored until recovery."
+  },
+  {
+    "file": "2026-09.jsonl",
+    "line": 11,
+    "sha256": "3c56ef8ce637dc3b965733af40ae444a765061b0ebbdf28048c363ebbae133dc",
+    "reason": "pre-v1 local collector (scripts/collect-evidence.sh): environment 'darwin/arm64' violates pattern; human_interventions/review_corrections/ci_retries null instead of integer. Preserved verbatim; was gitignored until recovery."
+  },
+  {
+    "file": "2026-09.jsonl",
+    "line": 12,
+    "sha256": "4586672ff33db41bbbe13d67b85d793b71e9ac712240b066ce0928c1f660bf78",
+    "reason": "pre-v1 local collector (scripts/collect-evidence.sh): environment 'darwin/arm64' violates pattern; human_interventions/review_corrections/ci_retries null instead of integer. Preserved verbatim; was gitignored until recovery."
+  },
+  {
+    "file": "2026-09.jsonl",
+    "line": 13,
+    "sha256": "24941d835118647e818ff216cc4bc13000b67184dcb345e059bdcd372f6b2096",
+    "reason": "pre-v1 local collector (scripts/collect-evidence.sh): environment 'darwin/arm64' violates pattern; human_interventions/review_corrections/ci_retries null instead of integer. Preserved verbatim; was gitignored until recovery."
+  },
+  {
+    "file": "2026-09.jsonl",
+    "line": 14,
+    "sha256": "c0757f35e6ce1007fd7e305d9b14ca59ae791ed6a95b864f5728719982ffc137",
+    "reason": "pre-v1 local collector (scripts/collect-evidence.sh): environment 'darwin/arm64' violates pattern; human_interventions/review_corrections/ci_retries null instead of integer. Preserved verbatim; was gitignored until recovery."
+  },
+  {
+    "file": "2026-09.jsonl",
+    "line": 15,
+    "sha256": "20eb0640ed884eec41f409057d637f83b20fbd889a1fbfdda9376c7884c88a42",
+    "reason": "pre-v1 local collector (scripts/collect-evidence.sh): environment 'darwin/arm64' violates pattern; human_interventions/review_corrections/ci_retries null instead of integer. Preserved verbatim; was gitignored until recovery."
+  },
+  {
+    "file": "2026-09.jsonl",
+    "line": 16,
+    "sha256": "c7f35823d0c77411a1a6c4808979b5c7577a3b066f91f94d632c5b0844766d0d",
+    "reason": "pre-v1 local collector (scripts/collect-evidence.sh): environment 'darwin/arm64' violates pattern; human_interventions/review_corrections/ci_retries null instead of integer. Preserved verbatim; was gitignored until recovery."
+  },
+  {
+    "file": "2026-09.jsonl",
+    "line": 17,
+    "sha256": "d08f8da9e05e06201a252f6f0cf70c32883e9fe4664e9ae2a0c44d026352e165",
+    "reason": "pre-v1 local collector (scripts/collect-evidence.sh): environment 'darwin/arm64' violates pattern; human_interventions/review_corrections/ci_retries null instead of integer. Preserved verbatim; was gitignored until recovery."
+  },
+  {
+    "file": "2026-09.jsonl",
+    "line": 18,
+    "sha256": "f7e8d9fc5c4865345508f897dfccba0084b138aeefebb3e7f03a3fd3d22691d0",
+    "reason": "pre-v1 local collector (scripts/collect-evidence.sh): environment 'darwin/arm64' violates pattern; human_interventions/review_corrections/ci_retries null instead of integer. Preserved verbatim; was gitignored until recovery."
+  },
+  {
+    "file": "2026-09.jsonl",
+    "line": 19,
+    "sha256": "0d363570ee1521910fa1cb46b9511709468ee730d8df94097f3e999d954f300e",
+    "reason": "pre-v1 local collector (scripts/collect-evidence.sh): environment 'darwin/arm64' violates pattern; human_interventions/review_corrections/ci_retries null instead of integer. Preserved verbatim; was gitignored until recovery."
+  },
+  {
+    "file": "2026-09.jsonl",
+    "line": 20,
+    "sha256": "3379defe861a2088f8dde258a47c67371cdf78f8cfcfac810a5f51230b777cfb",
+    "reason": "pre-v1 local collector (scripts/collect-evidence.sh): environment 'darwin/arm64' violates pattern; human_interventions/review_corrections/ci_retries null instead of integer. Preserved verbatim; was gitignored until recovery."
+  },
+  {
+    "file": "2026-10.jsonl",
+    "line": 1,
+    "sha256": "d7456b2ede7bab6e4125c14410f88e541de85594814845e961811c0997a6be68",
+    "reason": "pre-v1 local collector (scripts/collect-evidence.sh): environment 'darwin/arm64' violates pattern; human_interventions/review_corrections/ci_retries null instead of integer. Preserved verbatim; was gitignored until recovery."
+  },
+  {
+    "file": "2026-10.jsonl",
+    "line": 2,
+    "sha256": "d334027523bfe99d570593d6d52b592a1aaa17e733fbb199cc1e940d5b9f1e2b",
+    "reason": "pre-v1 local collector (scripts/collect-evidence.sh): environment 'darwin/arm64' violates pattern; human_interventions/review_corrections/ci_retries null instead of integer. Preserved verbatim; was gitignored until recovery."
+  },
+  {
+    "file": "2026-10.jsonl",
+    "line": 3,
+    "sha256": "0780e5a25a12b5684262da427b95d5927efde94da188017536d83b18869162d7",
+    "reason": "pre-v1 local collector (scripts/collect-evidence.sh): environment 'darwin/arm64' violates pattern; human_interventions/review_corrections/ci_retries null instead of integer. Preserved verbatim; was gitignored until recovery."
+  },
+  {
+    "file": "2026-10.jsonl",
+    "line": 4,
+    "sha256": "6587c5ee4e7eac8dc115350f8aff999ac6142eec22ddb96541c640210069f65d",
+    "reason": "pre-v1 local collector (scripts/collect-evidence.sh): environment 'darwin/arm64' violates pattern; human_interventions/review_corrections/ci_retries null instead of integer. Preserved verbatim; was gitignored until recovery."
+  },
+  {
+    "file": "2026-10.jsonl",
+    "line": 5,
+    "sha256": "8bc1f5156bf87f058d4360f03faec1435c23ab16bfdd3b39dcc36f06361fa70a",
+    "reason": "pre-v1 local collector (scripts/collect-evidence.sh): environment 'darwin/arm64' violates pattern; human_interventions/review_corrections/ci_retries null instead of integer. Preserved verbatim; was gitignored until recovery."
+  },
+  {
+    "file": "2026-10.jsonl",
+    "line": 6,
+    "sha256": "4935f206dc19f0c5f11919db5bf2cbd5a5883df8d79af0e1c14d18f14931ad69",
+    "reason": "pre-v1 local collector (scripts/collect-evidence.sh): environment 'darwin/arm64' violates pattern; human_interventions/review_corrections/ci_retries null instead of integer. Preserved verbatim; was gitignored until recovery."
+  },
+  {
+    "file": "2026-10.jsonl",
+    "line": 7,
+    "sha256": "88c8a9656b446350c032fe6ef3baff0b39241030b40b05c7ea4b965e7cb38153",
+    "reason": "pre-v1 local collector (scripts/collect-evidence.sh): environment 'darwin/arm64' violates pattern; human_interventions/review_corrections/ci_retries null instead of integer. Preserved verbatim; was gitignored until recovery."
+  },
+  {
+    "file": "2026-10.jsonl",
+    "line": 8,
+    "sha256": "0972117dc3065faff504d28ecb2bf3cc8a7faba31e8546810e1b11cfe9dace34",
+    "reason": "pre-v1 local collector (scripts/collect-evidence.sh): environment 'darwin/arm64' violates pattern; human_interventions/review_corrections/ci_retries null instead of integer. Preserved verbatim; was gitignored until recovery."
+  },
+  {
+    "file": "2026-10.jsonl",
+    "line": 9,
+    "sha256": "3d055ff72c52d7796f14f53462fd897a00ea2f355ddcb99c52f86f60f65699a8",
+    "reason": "pre-v1 local collector (scripts/collect-evidence.sh): environment 'darwin/arm64' violates pattern; human_interventions/review_corrections/ci_retries null instead of integer. Preserved verbatim; was gitignored until recovery."
+  },
+  {
+    "file": "2026-10.jsonl",
+    "line": 10,
+    "sha256": "d9eeafa5e58aa4b8b0bea8d3b1f1befb595bb6ea0f7a373e2ae62780ce5e34ab",
+    "reason": "pre-v1 local collector (scripts/collect-evidence.sh): environment 'darwin/arm64' violates pattern; human_interventions/review_corrections/ci_retries null instead of integer. Preserved verbatim; was gitignored until recovery."
+  },
+  {
+    "file": "2026-10.jsonl",
+    "line": 11,
+    "sha256": "afbe3bc9540a1e36d5d298fea5d407c3dc3ad3cdd6c30df691149f1197021dec",
+    "reason": "pre-v1 local collector (scripts/collect-evidence.sh): environment 'darwin/arm64' violates pattern; human_interventions/review_corrections/ci_retries null instead of integer. Preserved verbatim; was gitignored until recovery."
+  },
+  {
+    "file": "2026-10.jsonl",
+    "line": 12,
+    "sha256": "5c20454279d204369fc7d66b527f2cbd4f96eb004a98332ff97296536ae232d6",
+    "reason": "pre-v1 local collector (scripts/collect-evidence.sh): environment 'darwin/arm64' violates pattern; human_interventions/review_corrections/ci_retries null instead of integer. Preserved verbatim; was gitignored until recovery."
+  },
+  {
+    "file": "2026-10.jsonl",
+    "line": 13,
+    "sha256": "c21c3bcd1d5998febeba8266f7713e9927e0fe52617bf8602d709d9f0707287b",
+    "reason": "pre-v1 local collector (scripts/collect-evidence.sh): environment 'darwin/arm64' violates pattern; human_interventions/review_corrections/ci_retries null instead of integer. Preserved verbatim; was gitignored until recovery."
+  },
+  {
+    "file": "2026-10.jsonl",
+    "line": 14,
+    "sha256": "d8a4f4c71c2dbeb988af037d9f819cbe68967351fa747931ac08e28905c48544",
+    "reason": "pre-v1 local collector (scripts/collect-evidence.sh): environment 'darwin/arm64' violates pattern; human_interventions/review_corrections/ci_retries null instead of integer. Preserved verbatim; was gitignored until recovery."
+  },
+  {
+    "file": "2026-10.jsonl",
+    "line": 15,
+    "sha256": "e1199c342be436ea019f2c84981122b3a23877ad9377c8d0a9f8def2dae86cb3",
+    "reason": "pre-v1 local collector (scripts/collect-evidence.sh): environment 'darwin/arm64' violates pattern; human_interventions/review_corrections/ci_retries null instead of integer. Preserved verbatim; was gitignored until recovery."
+  },
+  {
+    "file": "2026-10.jsonl",
+    "line": 16,
+    "sha256": "1cd47d77b2d770006cbe43297c96dfd266ed19c2ae94e97eb251a9a631171974",
+    "reason": "pre-v1 local collector (scripts/collect-evidence.sh): environment 'darwin/arm64' violates pattern; human_interventions/review_corrections/ci_retries null instead of integer. Preserved verbatim; was gitignored until recovery."
+  },
+  {
+    "file": "2026-10.jsonl",
+    "line": 17,
+    "sha256": "868c879708c15e7003bcd1ad977a8fd33c114e6d4cdc6d6d2943c17853c13182",
+    "reason": "pre-v1 local collector (scripts/collect-evidence.sh): environment 'darwin/arm64' violates pattern; human_interventions/review_corrections/ci_retries null instead of integer. Preserved verbatim; was gitignored until recovery."
+  },
+  {
+    "file": "2026-10.jsonl",
+    "line": 18,
+    "sha256": "9c718560aa921a127c7681fbbd1ff896c7b39723a859956b1b834d75d56baefb",
+    "reason": "pre-v1 local collector (scripts/collect-evidence.sh): environment 'darwin/arm64' violates pattern; human_interventions/review_corrections/ci_retries null instead of integer. Preserved verbatim; was gitignored until recovery."
+  },
+  {
+    "file": "2026-10.jsonl",
+    "line": 19,
+    "sha256": "fed05def414928f8edda4c53d5b86b39bff05da9b2c84c6da3f9f4943ef3f26b",
+    "reason": "pre-v1 local collector (scripts/collect-evidence.sh): environment 'darwin/arm64' violates pattern; human_interventions/review_corrections/ci_retries null instead of integer. Preserved verbatim; was gitignored until recovery."
+  },
+  {
+    "file": "2026-10.jsonl",
+    "line": 20,
+    "sha256": "bdf0969c318bf23b359a2ce561a33957b81b0e7d8554405fda5e37ca17c8179c",
+    "reason": "pre-v1 local collector (scripts/collect-evidence.sh): environment 'darwin/arm64' violates pattern; human_interventions/review_corrections/ci_retries null instead of integer. Preserved verbatim; was gitignored until recovery."
+  }
+]

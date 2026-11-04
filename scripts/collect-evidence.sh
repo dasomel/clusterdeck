@@ -18,7 +18,7 @@ arch="$(uname -m)"
 
 record() {
   local target="$1" result="$2" duration_ms="$3"
-  printf '{"schema_version":"1.0","timestamp":"%s","repository":"dasomel/clusterdeck","revision":"%s","event_type":"build","task_or_test":"%s","result":"%s","duration_ms":%s,"environment":"%s/%s","attempt":1,"human_interventions":null,"review_corrections":null,"ci_retries":null,"metadata":{"os":"%s","arch":"%s","make_target":"%s"}}\n' \
+  printf '{"schema_version":"1.0","timestamp":"%s","repository":"dasomel/clusterdeck","revision":"%s","event_type":"build","task_or_test":"%s","result":"%s","duration_ms":%s,"environment":"%s-%s","attempt":1,"human_interventions":0,"review_corrections":0,"ci_retries":0,"metadata":{"os":"%s","arch":"%s","make_target":"%s"}}\n' \
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$revision" "$target" "$result" "$duration_ms" "$os" "$arch" "$os" "$arch" "$target" \
     >> "$out_file"
 }
