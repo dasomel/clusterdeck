@@ -1,8 +1,9 @@
-.PHONY: help verify format fmt lint test build install dev release clean evidence
+.PHONY: help verify format fmt lint test build install dev release clean evidence research-check
 
 help:
 	@echo "verify   - run the full CI-equivalent gate (format+lint+test+build)"
 	@echo "evidence - run verify stages and append sanitized JSONL timing/result records (docs/research-evidence.md)"
+	@echo "research-check - validate research/evidence against the OpenForge v1 schema"
 	@echo "format   - check Rust formatting (no changes written)"
 	@echo "fmt      - apply Rust formatting"
 	@echo "lint     - cargo clippy -D warnings"
@@ -45,3 +46,6 @@ clean:
 
 evidence:
 	./scripts/collect-evidence.sh
+
+research-check:
+	python3 scripts/research/check-research-evidence.py
