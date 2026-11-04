@@ -160,6 +160,15 @@ fn udp_response_limit(query: &[u8]) -> usize {
         })
 }
 
+pub const SELFTEST_FLAG: &str = "--dns-responder-selftest";
+pub const SELFTEST_TOKEN: &str = "clusterdeck-dns-responder-ok v1";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResponderCliMode {
+    SelfTest,
+    Run(ResponderCliArgs),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResponderCliArgs {
     pub zones_path: PathBuf,
@@ -167,14 +176,20 @@ pub struct ResponderCliArgs {
     pub port: u16,
 }
 
-/// Parses `--dns-responder --zones <path> --status <path> --port <u16>` when `--dns-responder`
-/// is present in `args`. Returns `None` when the process was not invoked in responder mode.
-pub fn parse_cli_args<I, S>(args: I) -> Option<Result<ResponderCliArgs, String>>
+/// Parses responder or side-effect-free self-test mode; returns `None` for app startup.
+pub fn parse_cli_args<I, S>(args: I) -> Option<Result<ResponderCliMode, String>>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
     let collected: Vec<String> = args.into_iter().map(|s| s.as_ref().to_string()).collect();
+    if collected.iter().any(|a| a == SELFTEST_FLAG) {
+        return Some(if collected.len() == 1 {
+            Ok(ResponderCliMode::SelfTest)
+        } else {
+            Err(format!("{SELFTEST_FLAG} must be used alone"))
+        });
+    }
     if !collected.iter().any(|a| a == "--dns-responder") {
         return None;
     }
@@ -241,11 +256,11 @@ where
         _ => PathBuf::from("status.json"),
     });
 
-    Some(Ok(ResponderCliArgs {
+    Some(Ok(ResponderCliMode::Run(ResponderCliArgs {
         zones_path,
         status_path,
         port,
-    }))
+    })))
 }
 
 /// Runs the authoritative loopback DNS responder until the process exits or an unrecoverable
@@ -1408,6 +1423,22 @@ mod tests {
     }
 
     #[test]
+    fn parse_cli_args_handles_selftest_without_paths_or_port() {
+        assert_eq!(
+            parse_cli_args([SELFTEST_FLAG]),
+            Some(Ok(ResponderCliMode::SelfTest))
+        );
+        assert!(parse_cli_args([SELFTEST_FLAG, "--dns-responder"])
+            .unwrap()
+            .is_err());
+        assert!(
+            parse_cli_args([SELFTEST_FLAG, "--zones", "/tmp/zones.json"])
+                .unwrap()
+                .is_err()
+        );
+    }
+
+    #[test]
     fn parse_cli_args_handles_responder_flags_and_normal_startup() {
         assert!(parse_cli_args(["clusterdeck"]).is_none());
 
@@ -1422,6 +1453,9 @@ mod tests {
         ])
         .unwrap()
         .unwrap();
+        let ResponderCliMode::Run(parsed) = parsed else {
+            panic!("expected responder mode");
+        };
         assert_eq!(parsed.zones_path, PathBuf::from("/tmp/zones.json"));
         assert_eq!(parsed.status_path, PathBuf::from("/tmp/status.json"));
         assert_eq!(parsed.port, 15353);

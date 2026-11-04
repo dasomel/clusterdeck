@@ -5,8 +5,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::services::local_dns::responder::{SELFTEST_FLAG, SELFTEST_TOKEN};
 use crate::services::local_dns::zone_file::StatusFile;
-use crate::services::process::CommandRunner;
+use crate::services::process::{CommandLimits, CommandRunner};
 
 pub const AGENT_LABEL: &str = "com.clusterdeck.dns";
 // Apple-installed tools by absolute path (R10): a GUI app's PATH must not decide what runs.
@@ -132,18 +133,68 @@ pub fn atomic_write(path: &Path, bytes: &[u8], mode: u32) -> Result<(), String> 
 /// Copies `current_exe` to the stable agent path only when its SHA-256 differs (R10), so app
 /// moves/updates/dev rebuilds never leave the LaunchAgent pointing at a vanished binary.
 /// Returns whether the destination changed (the caller then reloads the agent).
-pub fn ensure_binary(current_exe: &Path, dest: &Path) -> Result<bool, String> {
+pub async fn ensure_binary(
+    runner: &dyn CommandRunner,
+    current_exe: &Path,
+    dest: &Path,
+) -> Result<bool, String> {
+    match prepare_binary(runner, current_exe, dest).await? {
+        Some(src) => {
+            atomic_write(dest, &src, 0o755)?;
+            Ok(true)
+        }
+        None => {
+            // Contents match; still make sure it stays executable.
+            let _ = std::fs::set_permissions(dest, std::fs::Permissions::from_mode(0o755));
+            Ok(false)
+        }
+    }
+}
+
+/// Side-effect-free preflight, also used before startup cleanup. Installation rechecks the
+/// candidate because a rebuild may have changed it between the sweep and refresh.
+pub(crate) async fn prepare_binary(
+    runner: &dyn CommandRunner,
+    current_exe: &Path,
+    dest: &Path,
+) -> Result<Option<Vec<u8>>, String> {
     let src = std::fs::read(current_exe)
         .map_err(|e| format!("failed to read {}: {e}", current_exe.display()))?;
     if let Ok(existing) = std::fs::read(dest) {
         if Sha256::digest(&existing) == Sha256::digest(&src) {
-            // Contents match; still make sure it stays executable.
-            let _ = std::fs::set_permissions(dest, std::fs::Permissions::from_mode(0o755));
-            return Ok(false);
+            return Ok(None);
         }
     }
-    atomic_write(dest, &src, 0o755)?;
-    Ok(true)
+    // D1 (#139): a test harness can be current_exe; reject it before replacing a live
+    // responder. Cost: a bounded process for changed SHAs (also before startup cleanup).
+    // Escape hatch: update the versioned protocol here and in responder/main if it changes.
+    let refusal = |detail: &str| {
+        format!(
+            "refusing to install {} as DNS responder: self-test failed ({detail})",
+            current_exe.display()
+        )
+    };
+    let bin = current_exe
+        .to_str()
+        .ok_or_else(|| refusal("path is not valid UTF-8"))?;
+    let output = runner
+        .run_bounded(
+            bin,
+            &[SELFTEST_FLAG.to_string()],
+            CommandLimits {
+                timeout: std::time::Duration::from_secs(5),
+                max_output_bytes: 4096,
+            },
+        )
+        .await
+        .map_err(|e| refusal(&e))?;
+    if !output.success {
+        return Err(refusal("non-zero exit status"));
+    }
+    if output.stdout != format!("{SELFTEST_TOKEN}\n") {
+        return Err(refusal("unexpected stdout token"));
+    }
+    Ok(Some(src))
 }
 
 /// Writes the plist when its content differs; returns whether it changed.
@@ -387,22 +438,63 @@ mod tests {
         assert!(render_plist(&AgentPaths::new(Path::new("/Users/a")), 0).is_err());
     }
 
-    #[test]
-    fn ensure_binary_copies_only_when_hash_differs_and_sets_0755() {
+    #[tokio::test]
+    async fn ensure_binary_rejects_real_cargo_test_harness() {
+        let home = tmp_home("harness");
+        let dest = home.join("clusterdeck-dns");
+        std::fs::write(&dest, b"previous responder").unwrap();
+        let err = ensure_binary(
+            &crate::services::process::SystemRunner,
+            &std::env::current_exe().unwrap(),
+            &dest,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.contains("self-test failed (non-zero exit status)"),
+            "{err}"
+        );
+        assert_eq!(std::fs::read(dest).unwrap(), b"previous responder");
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[tokio::test]
+    async fn ensure_binary_copies_only_when_hash_differs_and_sets_0755() {
+        struct SelfTestRunner;
+        #[async_trait::async_trait]
+        impl CommandRunner for SelfTestRunner {
+            async fn run(
+                &self,
+                _: &str,
+                _: &[String],
+            ) -> Result<crate::services::process::CommandOutput, String> {
+                Ok(crate::services::process::CommandOutput {
+                    stdout: format!("{SELFTEST_TOKEN}\n"),
+                    stderr: String::new(),
+                    success: true,
+                })
+            }
+        }
         let home = tmp_home("bin");
         let src = home.join("src-exe");
         let dest = home.join("bin").join("clusterdeck-dns");
         std::fs::write(&src, b"v1").unwrap();
 
-        assert!(ensure_binary(&src, &dest).unwrap(), "first copy");
+        assert!(
+            ensure_binary(&SelfTestRunner, &src, &dest).await.unwrap(),
+            "first copy"
+        );
         assert_eq!(std::fs::read(&dest).unwrap(), b"v1");
         let mode = std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o755);
 
-        assert!(!ensure_binary(&src, &dest).unwrap(), "identical: no copy");
+        assert!(
+            !ensure_binary(&SelfTestRunner, &src, &dest).await.unwrap(),
+            "identical: no copy"
+        );
 
         std::fs::write(&src, b"v2").unwrap();
-        assert!(ensure_binary(&src, &dest).unwrap());
+        assert!(ensure_binary(&SelfTestRunner, &src, &dest).await.unwrap());
         assert_eq!(std::fs::read(&dest).unwrap(), b"v2");
         let leftovers = std::fs::read_dir(dest.parent().unwrap())
             .unwrap()

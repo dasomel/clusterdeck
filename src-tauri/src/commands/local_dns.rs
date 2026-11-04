@@ -1141,6 +1141,11 @@ pub async fn startup_with(paths: &ClusterDeckPaths, env: &ManagerEnv<'_>) -> Res
     let any_local_dns = store::load_profiles(paths)?
         .iter()
         .any(|p| p.host_mapping == HostMapping::LocalDns);
+    if any_local_dns {
+        // Preflight before cleanup, but reload afterwards: reloading first would make the
+        // ownership check race the new responder's status.json PID update.
+        agent::prepare_binary(env.runner, env.current_exe, &env.paths.binary).await?;
+    }
     let sweep = manager::startup_sweep(env, any_local_dns).await;
     let refresh = if any_local_dns {
         manager::refresh_binary(env).await.map(|_| ())

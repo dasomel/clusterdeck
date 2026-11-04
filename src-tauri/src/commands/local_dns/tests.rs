@@ -29,6 +29,7 @@ mod test_support {
         scripts: Mutex<Vec<String>>,
         loaded: Mutex<bool>,
         cancel_osascript: Mutex<bool>,
+        pub selftest_fails: Mutex<bool>,
     }
 
     impl Fake {
@@ -55,6 +56,7 @@ mod test_support {
                 scripts: Mutex::new(Vec::new()),
                 loaded: Mutex::new(false),
                 cancel_osascript: Mutex::new(false),
+                selftest_fails: Mutex::new(false),
             });
             let responder = Arc::clone(&f);
             tokio::spawn(async move {
@@ -146,6 +148,23 @@ mod test_support {
 
     #[async_trait]
     impl CommandRunner for Fake {
+        async fn run_bounded(
+            &self,
+            bin: &str,
+            args: &[String],
+            limits: crate::services::process::CommandLimits,
+        ) -> Result<CommandOutput, String> {
+            assert_eq!(bin, self.exe.to_str().unwrap());
+            assert_eq!(args, &["--dns-responder-selftest"]);
+            assert_eq!(limits.timeout, Duration::from_secs(5));
+            self.log.lock().unwrap().push("selftest".into());
+            if *self.selftest_fails.lock().unwrap() {
+                Err("self-test timed out".into())
+            } else {
+                ok("clusterdeck-dns-responder-ok v1\n")
+            }
+        }
+
         async fn run(&self, bin: &str, args: &[String]) -> Result<CommandOutput, String> {
             let sub = args.first().map(String::as_str).unwrap_or("");
             match bin {
@@ -558,6 +577,27 @@ async fn startup_sweeps_our_files_when_no_profile_uses_local_dns_and_prompts_onl
     startup_with(&paths, &f.env()).await.unwrap();
     assert_eq!(f.count("osascript"), 1);
     assert!(f.last_script().unwrap().contains("lab.example.internal"));
+}
+
+#[tokio::test]
+async fn startup_selftest_failure_aborts_before_resolver_sweep() {
+    let f = Fake::new();
+    let paths = f.cd_paths();
+    store::upsert_profile(&paths, profile("cka", HostMapping::LocalDns, &[])).unwrap();
+    let resolver = f.resolver.join("cka.clusterdeck.internal");
+    let content = render_resolver_file("cka", DEFAULT_DNS_PORT).unwrap();
+    std::fs::write(&resolver, &content).unwrap();
+    agent::atomic_write(&f.agent_paths.binary, b"previous responder", 0o755).unwrap();
+    *f.selftest_fails.lock().unwrap() = true;
+    let err = startup_with(&paths, &f.env()).await.unwrap_err();
+    assert!(err.contains("self-test failed"), "{err}");
+    assert_eq!(std::fs::read_to_string(resolver).unwrap(), content);
+    assert_eq!(
+        std::fs::read(&f.agent_paths.binary).unwrap(),
+        b"previous responder"
+    );
+    assert_eq!(f.count("selftest"), 1);
+    assert_eq!(f.total_calls(), 1);
 }
 
 #[tokio::test(start_paused = true)]
