@@ -10,9 +10,7 @@ ClusterDeck은 VM과 Kubernetes 환경을 자주 생성·삭제·재생성하면
 
 ClusterDeck은 현재 **초기 MVP / 소스 중심 프로젝트**다. 저장소에서 확인되는 핵심 범위는 Profile, SSH, Bastion/ProxyJump, kubeconfig 가져오기·정규화, Kubernetes 연결 확인으로 이어지는 Workstation Access 흐름이다.
 
-현재 신규 사용자의 기본 경로는 Tauri 기반 소스 실행이다. 패키지 앱 배포, 대규모 Fleet 관리, 일반적인 Kubernetes 관리자 콘솔 기능은 Release나 저장소 문서에서 명시적으로 검증되기 전까지 구현 완료 기능으로 간주하지 않는다.
-
-GitHub Actions release pipeline(`.github/workflows/release.yml`)이 추가되었다: `v*` tag를 push하면 macOS `.dmg`를 빌드(ad-hoc 서명 — 아직 Apple Developer ID 인증서가 없어 최초 실행 시 "unidentified developer" 경고가 표시됨)하고 **draft** GitHub Release로 연다. 이 파이프라인으로 아직 실제 Release가 게시된 적은 없으므로, 패키지 앱 배포는 여전히 확립된 경로가 아니며 현재는 소스 실행이 유일하게 지원되는 방법이다.
+0.6.0 및 0.6.1 릴리스는 macOS `.dmg` 파일을 제공합니다. 앱은 ad-hoc 서명되어 있어 최초 실행 시 macOS에서 "unidentified developer" 경고가 표시됩니다. ClusterDeck은 workstation access, VM inventory, local runtime 작업을 위한 초기 MVP이며, 대규모 Fleet 관리와 일반적인 Kubernetes 관리자 콘솔은 범위에 포함되지 않습니다.
 
 ## ClusterDeck이 Mac에서 변경하는 것
 
@@ -20,13 +18,15 @@ ClusterDeck은 자체 데이터 디렉터리(`~/.clusterdeck/`) 밖의 무언가
 
 - **로그인 키체인(CA 인증서)** — 클러스터의 내부 CA를 신뢰하기로 선택하면(발견된 엔드포인트별 opt-in 동작, 또는 설정 → Trusted CAs에서), ClusterDeck은 그 인증서를 **로그인 키체인**(System 키체인이 아님)에 추가하며, SSL/TLS 신뢰 정책으로만 범위를 제한한다. 매번 macOS 자체 인증 프롬프트(암호 또는 Touch ID)가 뜬다. 신뢰된 항목은 언제든 Keychain Access.app에서 확인할 수 있고, ClusterDeck 자체(설정 → Trusted CAs, 또는 신뢰된 엔드포인트의 "제거" 동작)에서도 제거할 수 있다 — 둘 다 로컬에서 그냥 잊어버리는 게 아니라 인증서를 실제로 신뢰 해제한다.
 - **`/etc/hosts`** — 기본값은 비활성화이며 Profile별 opt-in이다. 활성화하면 ClusterDeck은 클러스터 내부 도메인 항목을 하나의 표시된 블록(`# >>> ClusterDeck BEGIN (profile: <id>) >>>` … `# <<< ClusterDeck END (profile: <id>) <<<`) 안에만 macOS 관리자 권한 프롬프트를 통해 작성한다. 해당 프로필의 자기 블록만 편집한다.
-  - 선택 사항인 **Gateway public address**(IP): 게이트웨이가 외부 로드밸런서 뒤에 있는 클러스터(프라이빗 노드)에서, 검색된 엔드포인트를 클러스터 사설 주소 대신 이 IP로 매핑한다.
+  - 선택 사항인 **Gateway address**(IP): 게이트웨이가 외부 로드밸런서 뒤에 있는 클러스터(프라이빗 노드)에서, 검색된 엔드포인트를 클러스터 사설 주소 대신 이 IP로 매핑한다. 로컬 런타임의 ingress VIP가 Mac에서 라우팅되지 않으면 `gateway_address: 127.0.0.1`로 호스트 측 listener를 지정할 수 있다.
 - **Local DNS (`/etc/resolver/<zone>`)** — Profile별 opt-in(`host_mapping: local_dns`). macOS Safari/Network.framework의 완벽한 호환성과 암호 입력 없는 레코드 갱신을 위해 `/etc/hosts`보다 권장된다. 사용자 LaunchAgent로 실행되는 루프백 전용 authoritative 응답기(`127.0.0.1:15353`)를 가리키는 전용 `/etc/resolver/<zone>` 파일을 작성한다. [Local DNS 사용자 가이드](docs/LOCAL-DNS-ko.md)를 참조한다.
 - **`~/.ssh/config`** — ClusterDeck은 `Include ~/.clusterdeck/ssh/*.conf` 한 줄만 추가하고, 프로필별 SSH 옵션은 그 include된 디렉터리 안에 보관한다. 사용자의 config 파일에 직접 쓰지 않는다.
 
 ClusterDeck이 추가한 모든 것을 제거하고 싶다면: Keychain Access.app(또는 ClusterDeck 자체 설정)에서 CA 신뢰를 해제하고, opt-in했다면 `/etc/hosts`의 표시된 블록을 삭제하고, `/etc/resolver/`에서 마커가 표시된 파일을 제거하고, `~/.ssh/config`에서 `Include` 줄을 제거하고, `~/.clusterdeck/`를 삭제하면 된다.
 
 앱을 시작하면 인증 없이 `api.github.com`에 GET 요청 한 번을 보내 새 버전을 확인한다. 앱 이름과 버전만 전송하며 사용자나 인프라 식별자는 보내지 않는다. 화면 상단 macOS 메뉴 막대의 **ClusterDeck → Check for Updates…**에서 직접 확인하거나 새 릴리스 페이지를 브라우저로 열 수 있다. 다운로드와 설치는 사용자가 진행하며, 시작 시 확인에 실패해도 알림을 띄우지 않는다. [ADR-0013](docs/adr/0013-update-check.md)을 참조한다.
+
+Local Runtime 패널은 주소를 확인할 수 있는 VM의 주소를 표시한다.
 
 ## 핵심 흐름
 
@@ -92,7 +92,7 @@ ClusterDeck은 기존 InfraDeck에서 개발되었던 멀티 프로바이더 VM 
 | Colima | `colima list --json` | Profile, 상태, CPU, RAM, 디스크 용량, 데이터 디스크 사용량, 생성 시각, advertised address | Kubernetes 상태는 아래 공통 감지를 따른다 |
 | VirtualBox | `VBoxManage list vms`, `showvminfo`, `showmediuminfo`, `guestproperty` | 등록된 VM, UUID, 상태, CPU, RAM, 디스크 용량/사용량, 생성 시각; 실행 중일 때 게스트 IP | 게스트가 IP를 보고할 때만 표시 |
 | VMware Fusion | 번들 `vmrun -T fusion list`, VMX 파일 | 실행 중인 VM, CPU, RAM, VMDK 디스크 용량/사용량, 생성 시각; `getGuestIPAddress`로 게스트 IP | 정지된 독립 VM은 목록에 없음; IP는 VMware Tools 실행 필요 |
-| Vagrant | `vagrant global-status`, `.vagrant/.../id`, `vagrant ssh-config` | 프로젝트, 상태, orchestrator/runtime 관계; VMware의 VMX/디스크 데이터; 고정 IP 또는 ssh-config 주소 | 프로젝트 디렉터리 또는 `.vagrant` 데이터가 사라진 항목은 `stale`로 표시; 미지원 provider는 건너뜀 |
+| Vagrant | `vagrant global-status`, `.vagrant/.../id`, `vagrant ssh-config` | 프로젝트, 상태, orchestrator/runtime 관계; VMware의 VMX/디스크 데이터; static 또는 SSH-config 주소 | VMware host는 static IP, SSH-config endpoint로 probe한 private IP, SSH-config 주소와 inventory IP 순으로 선택한다. 다른 provider는 기존 순서를 유지한다. 절대 경로 VMware `.vmx` machine ID는 해당 machine 디렉터리 안에 있을 때만 허용한다. 기존 `vagrant-<project>` 프로필은 host 이름이 정확히 일치하고 프로젝트 내부 key 근거가 있을 때만 그대로 채택한다. 프로젝트나 `.vagrant` 데이터가 사라지면 `stale`로 표시하며 미지원 provider는 건너뛴다 |
 
 IP가 있는 머신의 Kubernetes 상태는 kubeconfig server 호스트와 6443 포트에 대한 500 ms TCP probe로 판단한다(`kubeconfig server`, `API server reachable (6443)`, `not detected`, IP가 없으면 `unknown`). 자격 증명은 읽지 않는다.
 

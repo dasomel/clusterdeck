@@ -1,6 +1,6 @@
 # 구현 상태
 
-Last verified: 2026-09-23 against `feat/14-local-runtime-lifecycle`
+Last verified: 2026-11-14 against the default branch after releases 0.6.0 and 0.6.1.
 
 이 문서는 미래 product direction이 아니라 현재 default branch의 동작을 기록합니다.
 
@@ -16,14 +16,18 @@ Last verified: 2026-09-23 against `feat/14-local-runtime-lifecycle`
 - Profile editor를 prefill하는 on-demand local VM detection(Colima/Lima/Vagrant). Detected 상태는 editor component state에만 유지되며 사용자가 profile을 저장하기 전까지 persist되지 않습니다 (ADR-0005 참조).
 - 가져온 kubeconfig의 server endpoint를 정규화하기 위한 Kubernetes API endpoint discovery(APISIX/Ingress/Istio/Gateway API/Service), 그리고 기본/kubeconfig-manager/profile-editor 화면에 노출되는 status banner UI.
 - Ingress/ApisixTls → Secret의 `ca.crt`를 discovery하여 CA별 New/Trusted/Rotated 상태를 계산하고, macOS login keychain에 대해 `security(1)`로 trust/replace/remove를 수행하며, Settings에 프로필 전체를 아우르는 Trusted CAs 목록을 제공합니다 (ADR-0006 참조).
-- 발견된 CA/leaf 인증서마다 health warning을 표시합니다: serverAuth(또는 anyExtendedKeyUsage)가 없는 EKU(EKU 확장 자체가 없으면 경고하지 않음), leaf/CA 만료 임박(14일/30일 threshold, 이미 만료된 경우 별도 메시지), 발견된 host를 커버하지 않는 SAN, 구조적으로 올바르지 않은 CA(CA:TRUE/keyCertSign 누락).
+- 발견된 CA/leaf 인증서마다 health warning을 표시합니다: EKU 확장이 있고 `serverAuth` 및 `anyExtendedKeyUsage`가 모두 없을 때 경고(EKU 확장 자체가 없으면 경고하지 않음), leaf/CA 만료 임박(14일/30일 threshold, 이미 만료된 경우 별도 메시지), 발견된 host를 커버하지 않는 SAN, 구조적으로 올바르지 않은 CA(CA:TRUE/keyCertSign 누락).
 - 원격 kubeconfig fetch가 `scp`를 shell-out하는 대신 SSH exec(`sudo cat` 실패 시 `cat`으로 fallback)로 읽도록 바뀌어 local temp-file permission window를 제거했습니다 (#23).
 - curl Kubernetes API fallback 경로(예: macOS Sequoia Local Network Privacy로 `kubectl` 자체가 실패하는 경우)에서 TLS 인증서를 검증합니다: kubeconfig의 CA 데이터로 `--cacert` 검증하거나, CA 데이터가 없으면 curl의 system trust store를 사용하며, `-k`/`--insecure`는 사용하지 않습니다 (#24).
-- Colima/Lima instance의 architecture/CPU/memory/disk 표시와 Docker context 연동을 포함한 local runtime discovery dashboard가 완성되어 Settings의 read-only "Local Runtime" 섹션으로 제공됩니다 (#14 Phase 1).
+- Colima/Lima instance의 architecture/CPU/memory/disk 및 VM 주소 표시와 Docker context 연동을 포함한 local runtime discovery dashboard가 Settings의 read-only "Local Runtime" 섹션으로 제공됩니다 (#14 Phase 1).
 - Colima/Lima instance에 대한 local runtime lifecycle action(Start/Stop/Restart, VM shell 열기, instance의 Docker/kube context로 scope된 host-side shell 열기, runtime info 복사)을 추가했습니다: `LocalRuntimeProvider` enum dispatch, 모든 action 전 fresh-discovery 재확인, 동일 instance에 대한 두 번째 동시 Start/Stop/Restart를 거부하는 per-instance concurrency guard, Settings 패널의 Stop/Restart 확인 모달을 포함합니다 (#14 Phase 2, ADR-0007 참조). 실제 `colima` instance(`nqa-node2`)로 검증: Stopped → Start → Running 확인 → Stop → Stopped 확인.
 - 실제 대상에 대한 fresh-session replay로 `clusterdeck-connection-workflow` Agent Skill을 재검증했습니다; `openforge-maturity`는 다시 `verified`입니다 (#22).
 - Host별 명시적 SSH 인증 모드(`key`, 기본값, 또는 `password`)를 추가했습니다: password 모드는 Connect, Test Connection, kubeconfig fetch 전 경로에서 일관되게 `sshpass -e`/`SSHPASS`를 사용하고, sshpass가 응답할 password prompt를 막는 `BatchMode=yes`는 생략하되 `StrictHostKeyChecking=accept-new`는 유지하며, password는 frontend state에만 존재하는 ephemeral 값입니다. 이 field가 없던 기존 profile YAML은 변경 없이 `key`로 역직렬화됩니다 (#26).
-- 사용자 LaunchAgent 기반 loopback authoritative 응답기(`127.0.0.1:15353`)와 존별 `/etc/resolver` 파일을 사용하는 내장 Local DNS(`host_mapping: local_dns`): 반복적인 `/etc/hosts` 관리자 권한 프롬프트 없이 노드 별칭 및 승인된 프라이빗 ingress 존을 제공하며, macOS Safari/URLSession의 이름 확인 불일치 문제를 해결합니다([ADR-0011](adr/0011-built-in-local-dns.md) 및 [Local DNS 가이드](LOCAL-DNS-ko.md) 참조).
+- 사용자 LaunchAgent 기반 loopback authoritative 응답기(`127.0.0.1:15353`)와 존별 `/etc/resolver` 파일을 사용하는 내장 Local DNS(`host_mapping: local_dns`): 노드 별칭과 프로필별 존은 0.6.0부터 `*.clusterdeck.internal`을 사용하며, 다음 적용 때 ClusterDeck 소유의 기존 `.local` 매핑을 제거합니다. 응답기 후보는 설치 전에 5초 제한 `--dns-responder-selftest`를 통과해야 합니다 (0.6.1). [ADR-0011](adr/0011-built-in-local-dns.md) 및 [Local DNS 가이드](LOCAL-DNS-ko.md) 참조.
+
+- (미릴리스, 0.6.1 이후) 시작 시 GitHub Releases에 인증 없는 GET 한 번으로 업데이트를 확인하고, **ClusterDeck → Check for Updates…** 메뉴에서 수동으로 확인할 수 있습니다. 새 stable release는 브라우저에서 열어 수동 설치합니다 ([ADR-0013](adr/0013-update-check.md)).
+- SSH known-host 정리는 프로세스 전체에서 직렬화되며, 기본 포트가 아니면 `[address]:port` 항목만 제거합니다.
+- VMware Vagrant는 machine 디렉터리 내부에 포함된 절대 `.vmx` ID만 허용합니다. 주소 선택은 static IP, SSH-config endpoint로 probe한 private IP, SSH-config 주소 순입니다. 기존 `vagrant-<project>` 프로필은 host 이름과 프로젝트 내부 key 근거가 정확히 맞을 때만 채택합니다 ([ADR-0008](adr/0008-vm-inventory-environment-source.md) amendment).
 
 ## 진행 중 (In progress)
 

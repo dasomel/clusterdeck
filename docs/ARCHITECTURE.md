@@ -176,7 +176,7 @@ This allows the user to keep unrelated SSH settings untouched.
 
 ### 7.1 Optional `/etc/hosts` Managed Block
 
-For profiles that opt in via `manage_hosts_file: true`, ClusterDeck also maps each host and
+For profiles that opt in via `host_mapping: hosts`, ClusterDeck also maps each host and
 bastion to a stable, namespaced hostname in `/etc/hosts`:
 
 ```text
@@ -193,7 +193,7 @@ and never touches any other line in the file:
 # <<< ClusterDeck END (profile: <profile-id>) <<<
 ```
 
-Discovered ingress/gateway endpoints map to the cluster's LoadBalancer IP, or the control-plane address as a fallback. A profile can set an optional `gateway_address` (IP only, validated) to override that for all discovered endpoints, e.g. an external cloud load balancer in front of private nodes ([ADR-0010](adr/0010-profile-gateway-address.md)).
+Discovered ingress/gateway endpoints map to the cluster's LoadBalancer IP, or the control-plane address as a fallback. A profile can set an optional `gateway_address` (IP only, validated) to override that for all discovered endpoints, e.g. an external cloud load balancer in front of private nodes. For a local runtime whose ingress VIP is not routable from the host, `127.0.0.1` can target a host-side listener ([ADR-0010](adr/0010-profile-gateway-address.md)).
 
 On some macOS setups the Network.framework path used by Safari ignores `/etc/hosts` while honoring `/etc/resolver/<domain>`. [ADR-0011](adr/0011-built-in-local-dns.md) adds `host_mapping: local_dns`: a built-in authoritative DNS responder (user LaunchAgent, loopback only) serving approved per-profile zones through `/etc/resolver`, so `/etc/hosts` no longer needs to change.
 
@@ -203,9 +203,7 @@ than one password prompt per action) rather than running the whole app elevated.
 written as part of `connect_profile` when the flag is set, and removed when the profile is
 deleted. A cancelled password prompt is treated as a non-fatal stage failure, the same way a
 failed kubeconfig fetch or alias write is: it is recorded in `ConnectionResult.errors` and does
-not abort the rest of the pipeline. This flag defaults to `false` and currently has no UI
-toggle — it is set by editing `profiles.yaml` directly, matching the deferred Profile-creation
-UI elsewhere in this MVP.
+not abort the rest of the pipeline. This mode is selected by the profile’s `host_mapping` setting. Legacy `manage_hosts_file` values are accepted during profile migration; `host_mapping` takes precedence when present.
 
 ## 8. Bastion / Relay
 
@@ -412,8 +410,8 @@ ever touches keychain trust entries it created itself. The endpoints view and th
 see [ADR-0006](adr/0006-private-ca-local-trust.md) for the full design and security rationale).
 
 Each discovered CA also carries a `warnings: Vec<String>` computed from `openssl x509 -noout
--text`/`-checkend` (macOS's LibreSSL has no `-ext` flag, hence text-parsing): an EKU that excludes
-`serverAuth`, leaf/CA expiry within 14/30 days respectively (with a distinct already-expired message), a
+-text`/`-checkend` (macOS's LibreSSL has no `-ext` flag, hence text-parsing): when an EKU extension
+is present, one that excludes `serverAuth` and `anyExtendedKeyUsage`, leaf/CA expiry within 14/30 days respectively (with a distinct already-expired message), a
 leaf SAN that does not cover a discovered host, and a CA that is structurally invalid (missing
 CA:TRUE or keyCertSign). A genuine `-checkend` result is always silent on stdout/stderr — only
 the exit code carries it — so a non-zero exit *with* stderr output (e.g. an unreadable temp file)
@@ -446,7 +444,9 @@ Any dynamic machine name, runtime identifier, or project directory joined into l
 
 - **Exact ID matching:** Observations from runtime providers (VirtualBox, VMware) and orchestrators (Vagrant) are reconciled strictly on exact `runtime:runtime_id`. VirtualBox UUIDs match directly; VMware merges only when Vagrant's ID matches the VMX path exactly.
 - **No VM name merging:** Merging by machine name is strictly prohibited because names can collide across environments. Unresolved identities remain separate observations.
-- **Vagrant state correction:** Vagrant's cached `global-status` is cross-checked against actual provider state: unmatched running entries are corrected to `stopped`, and entries whose `.vagrant` project metadata has been deleted are marked `stale`.
+- **Vagrant state correction:** Vagrant's cached `global-status` is cross-checked against actual provider state: unmatched running entries are corrected to `stopped`, and entries whose `.vagrant` project metadata has been deleted are marked `stale`. VMware machine ID files may contain an absolute `.vmx` path only when it resolves inside that machine's own directory.
+- **Provider address selection:** VMware Vagrant hosts prefer a reachable static IP, then a private IP probed over the SSH-config endpoint, then a reachable SSH-config `HostName`; other providers retain their existing address order.
+- **Legacy profile adoption:** Inventory refresh can update an old `vagrant-<project>` profile in place only when its host names match exactly and every host key has project-local machine evidence; ambiguous or conflicting candidates are not adopted ([ADR-0008](adr/0008-vm-inventory-environment-source.md) amendment).
 
 ### 17.5 Kubernetes Detection
 
