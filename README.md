@@ -26,6 +26,8 @@ ClusterDeck asks macOS for permission before touching anything outside its own d
 
 If you ever want to remove everything ClusterDeck has added: untrust its CAs from Keychain Access.app (or ClusterDeck's own Settings), delete the marked block(s) from `/etc/hosts` if you opted in, remove any marked files from `/etc/resolver/`, remove the `Include` line from `~/.ssh/config`, and delete `~/.clusterdeck/`.
 
+On launch, ClusterDeck checks for updates with one unauthenticated GET to `api.github.com`, sending only the app name and version (no user or infrastructure identifiers). Use **ClusterDeck → Check for Updates…** in the macOS menu bar to check manually or open an available release in your browser. Downloads and installation remain manual; launch failures are silent. See [ADR-0013](docs/adr/0013-update-check.md).
+
 ## Core Flow
 
 ```text

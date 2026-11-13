@@ -1,5 +1,7 @@
 mod commands;
 mod services;
+#[cfg(target_os = "macos")]
+mod update_menu;
 
 pub use services::local_dns;
 
@@ -8,6 +10,8 @@ pub fn run() {
         .manage(services::local_runtime_lifecycle::LifecycleGuard::default())
         .manage(services::store::ProfileWriteGuard)
         .setup(|_app| {
+            #[cfg(target_os = "macos")]
+            update_menu::setup(_app)?;
             // ADR-0009 / Issue #97: Reap orphaned SSH tunnels left by previous crash/force-restart
             if let Ok(paths) = services::paths::ClusterDeckPaths::resolve() {
                 tauri::async_runtime::spawn(async move {

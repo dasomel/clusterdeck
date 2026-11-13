@@ -26,6 +26,8 @@ ClusterDeck은 자체 데이터 디렉터리(`~/.clusterdeck/`) 밖의 무언가
 
 ClusterDeck이 추가한 모든 것을 제거하고 싶다면: Keychain Access.app(또는 ClusterDeck 자체 설정)에서 CA 신뢰를 해제하고, opt-in했다면 `/etc/hosts`의 표시된 블록을 삭제하고, `/etc/resolver/`에서 마커가 표시된 파일을 제거하고, `~/.ssh/config`에서 `Include` 줄을 제거하고, `~/.clusterdeck/`를 삭제하면 된다.
 
+앱을 시작하면 인증 없이 `api.github.com`에 GET 요청 한 번을 보내 새 버전을 확인한다. 앱 이름과 버전만 전송하며 사용자나 인프라 식별자는 보내지 않는다. 화면 상단 macOS 메뉴 막대의 **ClusterDeck → Check for Updates…**에서 직접 확인하거나 새 릴리스 페이지를 브라우저로 열 수 있다. 다운로드와 설치는 사용자가 진행하며, 시작 시 확인에 실패해도 알림을 띄우지 않는다. [ADR-0013](docs/adr/0013-update-check.md)을 참조한다.
+
 ## 핵심 흐름
 
 ```text

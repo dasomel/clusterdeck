@@ -6,6 +6,10 @@ The format follows the principles of Keep a Changelog and uses semantic versioni
 
 ## [Unreleased]
 
+### Added
+
+- Check for newer stable releases at launch and from **ClusterDeck → Check for Updates…** in the macOS menu bar; open available releases in the browser for manual installation (#145, [ADR-0013](docs/adr/0013-update-check.md))
+
 ## [0.6.1] - 2026-11-05
 
 ### Fixed
