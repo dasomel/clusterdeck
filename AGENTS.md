@@ -26,7 +26,7 @@ Do not turn ClusterDeck into a general Kubernetes administration console unless 
 - Treat Tauri command exposure, filesystem/process access, and public API widening as design changes.
 - All process execution goes through the `CommandRunner` trait (`services/process.rs`), never `tokio::process::Command` directly — this is what makes services unit-testable with a `FakeRunner` instead of hitting real SSH/kubectl/osascript.
 - Any `profile.id`, host/bastion name, or address that will reach a privileged sink (SSH argv, `~/.ssh/config`, `/etc/hosts`, a generated file path) must be validated via `services/validate.rs` (`is_safe_profile_id`, `is_safe_ssh_identifier`) first. `store::upsert_profile` already enforces this at the persistence boundary; a new sink should still re-check defensively rather than assume upstream validation covers it — a sink trusting unvalidated profile data is how SSH-config injection and path traversal happen.
-- Frontend styling uses CSS custom-property design tokens in `src/styles.css` (the "Patch Panel" system — `--bg`, `--bg-elevated`, `--border`, `--text-primary/secondary`, `--accent`, `--font-mono`, separated for light/dark via `prefers-color-scheme` + an explicit `data-theme` override). Reuse these tokens; do not hardcode colors in new components.
+- Frontend styling uses CSS custom-property design tokens in `src/styles/tokens.css`, imported by `src/styles.css` (the "Patch Panel" system — `--bg`, `--bg-elevated`, `--border`, `--text-primary/secondary`, `--accent`, `--font-mono`, separated for light/dark via `prefers-color-scheme` + an explicit `data-theme` override). Reuse these tokens; do not hardcode colors in new components.
 
 ## Security Rules
 
@@ -35,7 +35,7 @@ Do not turn ClusterDeck into a general Kubernetes administration console unless 
 - Do not expose private-key contents to the frontend.
 - Do not store bootstrap passwords in repository files.
 - Keep generated state under the ClusterDeck-owned local directory.
-- Never overwrite a user's entire `~/.ssh/config`, `~/.kube/config`, or `/etc/hosts` — own only a clearly marked block (`Include ~/.clusterdeck/ssh/*.conf` for SSH; a `# >>> ClusterDeck BEGIN (profile: <id>) >>>` / `END` marker pair per profile for `/etc/hosts`, opt-in via `Profile.manage_hosts_file`) and never touch lines outside it.
+- Never overwrite a user's entire `~/.ssh/config`, `~/.kube/config`, `/etc/hosts`, or another tool's `/etc/resolver/*` file — own only clearly marked content (`Include ~/.clusterdeck/ssh/*.conf` for SSH; a `# >>> ClusterDeck BEGIN (profile: <id>) >>>` / `END` marker pair per profile for `/etc/hosts` when `Profile.host_mapping` is `hosts`; `/etc/resolver/<zone>` files carrying `# managed by ClusterDeck (profile: <id>)` when it is `local_dns`) and never touch anything outside it.
 - Any SSH bootstrap password goes through `CommandRunner::run_with_env` as the `SSHPASS` env var (`sshpass -e`), never as a `-p <password>` argv element — argv is visible to other local processes via `ps`.
 - Every SSH invocation in `BatchMode=yes` (used everywhere so probes never hang on an interactive prompt) must also set `StrictHostKeyChecking=accept-new` — without it, connecting to any host not already in `known_hosts` fails outright instead of trust-on-first-use, which breaks the app's core scenario (frequently recreated VMs are by definition new hosts). `FakeRunner` tests don't check argv content, so a missing option here passes them; check each new SSH invocation site against a real SSH target (see Validation).
 
