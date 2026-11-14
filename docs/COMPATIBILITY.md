@@ -45,9 +45,11 @@ All ClusterDeck runtime state resides exclusively under `~/.clusterdeck/` and is
   - `/etc/hosts` uses `# >>> ClusterDeck BEGIN (profile: <id>) >>>` / `END` marker pairs.
 - ClusterDeck will **never** modify or delete unmanaged lines or third-party resolver files.
 - When invalid profiles exist or the YAML document shape is corrupted, ClusterDeck engages resolver protection mode (`protect_resolver`), blocking global resolver sweeps or teardowns.
-- **Node alias domain rename (Unreleased, BREAKING, #119):** node aliases and per-profile alias zones moved from `*.clusterdeck.local` to `*.clusterdeck.internal`, because negative lookups under mDNS `.local` stall about 5 s on macOS. On the next Sync/apply ClusterDeck removes its own old `/etc/resolver/<label>.clusterdeck.local` files (marker-owned only) and drops legacy `.clusterdeck.local` lines from its hosts block; this needs one admin prompt. Bookmarks, SSH configs or scripts that use the old names must be updated. `clusterdeck.local` stays reserved and cannot be approved as a zone. Downgrading to a version before this change recreates the `.local` zones and aliases.
+- **Node alias domain rename (0.6.0, BREAKING, #119):** node aliases and per-profile alias zones moved from `*.clusterdeck.local` to `*.clusterdeck.internal`, because negative lookups under mDNS `.local` stall about 5 s on macOS. On the next Sync/apply ClusterDeck removes its own old `/etc/resolver/<label>.clusterdeck.local` files (marker-owned only) and drops legacy `.clusterdeck.local` lines from its hosts block; this needs one admin prompt. Bookmarks, SSH configs or scripts that use the old names must be updated. `clusterdeck.local` stays reserved and cannot be approved as a zone. Downgrading to a version before this change recreates the `.local` zones and aliases.
 
 ---
+
+The 0.6.1 responder installer runs `--dns-responder-selftest` with a five-second bound before replacing `~/.clusterdeck/bin/clusterdeck-dns`; a failed check leaves the installed binary and DNS state in place. Leaf certificates without an EKU extension are not warned as lacking server-auth usage; the warning requires an EKU that excludes both `serverAuth` and `anyExtendedKeyUsage`.
 
 ## 2. Downgrade Policy & Behavior
 
@@ -72,7 +74,7 @@ ClusterDeck designs state to be backward-tolerable, but downgrades below schema 
 
 ## 3. Code Signing & Gatekeeper Policy
 
-### 3.1 Current Status (v0.5.x / 1.0.0-rc)
+### 3.1 Current Status (0.6.1)
 - ClusterDeck is currently built with **ad-hoc code signing** (`signingIdentity: "-"` in `tauri.conf.json`).
 - Because ClusterDeck is distributed as an open-source tool without an active Apple Developer ID certificate:
   1. macOS Gatekeeper may flag the `.app` or `.dmg` on first download ("unidentified developer").

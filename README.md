@@ -10,9 +10,7 @@ ClusterDeck is designed for environments that are frequently created, deleted, o
 
 ClusterDeck is an **early MVP / source-first project**. The repository currently documents and implements the workstation-access flow around Profiles, SSH, bastion/ProxyJump, kubeconfig retrieval/normalization, and Kubernetes connectivity checks.
 
-The supported first-time path is development from source with Tauri. Do not treat packaged-app distribution, broad fleet management, or a general Kubernetes administration console as established product capabilities unless a release or repository documentation explicitly says so.
-
-A GitHub Actions release pipeline now exists (`.github/workflows/release.yml`): pushing a `v*` tag builds a macOS `.dmg` (ad-hoc signed — there is no Apple Developer ID certificate yet, so macOS shows an "unidentified developer" warning on first launch) and opens it as a **draft** GitHub Release. No release has been published from this pipeline yet, so packaged-app distribution is still not an established path — development from source remains how to run ClusterDeck today.
+Releases 0.6.0 and 0.6.1 are available as macOS `.dmg` artifacts; the release pipeline builds ad-hoc signed apps, so macOS shows an "unidentified developer" warning on first launch. ClusterDeck remains an early MVP for workstation access, VM inventory, and local runtime workflows; broad fleet management and a general Kubernetes administration console are outside its scope.
 
 ## What ClusterDeck Changes on Your Mac
 
@@ -20,13 +18,15 @@ ClusterDeck asks macOS for permission before touching anything outside its own d
 
 - **Login Keychain (CA certificates)** — when you choose to trust a cluster's internal CA (an opt-in action per discovered endpoint, or from Settings → Trusted CAs), ClusterDeck adds that certificate to your **login keychain** (never the System keychain), scoped only to the SSL/TLS trust policy. macOS will show its own authorization prompt (password or Touch ID) each time. You can inspect what's trusted in Keychain Access.app at any time, or remove it from ClusterDeck itself (Settings → Trusted CAs, or the "Remove" action on a trusted endpoint) — both properly untrust the certificate rather than just forgetting it locally.
 - **`/etc/hosts`** — off by default, opt-in per Profile. When enabled, ClusterDeck writes cluster-internal domain entries inside a single marked block (`# >>> ClusterDeck BEGIN (profile: <id>) >>>` … `# <<< ClusterDeck END (profile: <id>) <<<`) via a macOS admin-privileged prompt. It only ever edits its own block for that profile.
-  - Optional **Gateway public address** (IP): for clusters whose gateway sits behind an external load balancer (private nodes), discovered endpoints map to this IP instead of the cluster's private address.
+  - Optional **Gateway address** (IP): for clusters whose gateway sits behind an external load balancer (private nodes), discovered endpoints map to this IP instead of the cluster's private address. For a local runtime whose ingress VIP is not routable from the Mac, `gateway_address: 127.0.0.1` can target a host-side listener.
 - **Local DNS (`/etc/resolver/<zone>`)** — opt-in per Profile (`host_mapping: local_dns`). Recommended over `/etc/hosts` for full macOS Safari/Network.framework compatibility and zero-prompt record updates. Writes dedicated `/etc/resolver/<zone>` files pointing to a loopback-only authoritative responder (`127.0.0.1:15353`) run via a user LaunchAgent. See [Local DNS User Guide](docs/LOCAL-DNS.md).
 - **`~/.ssh/config`** — ClusterDeck adds one `Include ~/.clusterdeck/ssh/*.conf` line and keeps its own per-profile SSH options in that included directory, rather than writing directly into your config.
 
 If you ever want to remove everything ClusterDeck has added: untrust its CAs from Keychain Access.app (or ClusterDeck's own Settings), delete the marked block(s) from `/etc/hosts` if you opted in, remove any marked files from `/etc/resolver/`, remove the `Include` line from `~/.ssh/config`, and delete `~/.clusterdeck/`.
 
 On launch, ClusterDeck checks for updates with one unauthenticated GET to `api.github.com`, sending only the app name and version (no user or infrastructure identifiers). Use **ClusterDeck → Check for Updates…** in the macOS menu bar to check manually or open an available release in your browser. Downloads and installation remain manual; launch failures are silent. See [ADR-0013](docs/adr/0013-update-check.md).
+
+The Local Runtime panel shows each VM address when one is available.
 
 ## Core Flow
 
@@ -92,7 +92,7 @@ Install only the providers you use. ClusterDeck executes discovery commands read
 | Colima | `colima list --json` | Profile, state, CPU, RAM, disk capacity, data-disk usage, creation time, advertised address | Kubernetes status comes from the shared detection below |
 | VirtualBox | `VBoxManage list vms`, `showvminfo`, `showmediuminfo`, `guestproperty` | Registered VM, UUID, state, CPU, RAM, disk capacity/usage, creation time; guest IPs while running | IP only when the guest reports one |
 | VMware Fusion | bundled `vmrun -T fusion list`, VMX files | Running VMs, CPU, RAM, VMDK disk capacity/usage, creation time; guest IP via `getGuestIPAddress` | Stopped standalone VMs are not listed; IP needs running VMware Tools |
-| Vagrant | `vagrant global-status`, `.vagrant/.../id`, `vagrant ssh-config` | Project, state, orchestrator/runtime relationship; VMX/disk data for VMware; static or ssh-config address | Entries whose project directory or `.vagrant` data is gone are shown as `stale`; unsupported providers are skipped |
+| Vagrant | `vagrant global-status`, `.vagrant/.../id`, `vagrant ssh-config` | Project, state, orchestrator/runtime relationship; VMX/disk data for VMware; static or SSH-config address | VMware hosts prefer static IP, then private IP probed over the SSH-config endpoint, then SSH-config address and inventory IP; other providers retain their existing address order. An absolute VMware `.vmx` machine ID is accepted only when contained in that machine directory. Legacy `vagrant-<project>` profiles are adopted in place only with exact host-name and project-local key evidence. Missing project or `.vagrant` data is marked `stale`; unsupported providers are skipped |
 
 Kubernetes status for any machine with an IP is derived from kubeconfig server hosts and a 500 ms TCP probe of port 6443 (`kubeconfig server`, `API server reachable (6443)`, `not detected`, or `unknown` without an IP); credentials are never read.
 

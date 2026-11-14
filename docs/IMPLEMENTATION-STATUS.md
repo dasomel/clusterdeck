@@ -1,6 +1,6 @@
 # Implementation Status
 
-Last verified: 2026-09-23 against `feat/14-local-runtime-lifecycle`
+Last verified: 2026-11-14 against the default branch after releases 0.6.0 and 0.6.1.
 
 This file records current default-branch behavior, not future product direction.
 
@@ -16,14 +16,18 @@ This file records current default-branch behavior, not future product direction.
 - On-demand local VM detection (Colima/Lima/Vagrant) that prefills the Profile editor form; detected state is held in editor component state only and never persisted unless the user saves the profile (see ADR-0005).
 - Kubernetes API endpoint discovery (APISIX/Ingress/Istio/Gateway API/Service) used to normalize a fetched kubeconfig's server endpoint, plus a status banner UI surfaced on the default, kubeconfig-manager, and profile-editor views.
 - Private cluster CA discovery (Ingress/ApisixTls → Secret `ca.crt`) with per-CA New/Trusted/Rotated status, trust/replace/remove actions against the macOS login keychain via `security(1)`, and a cross-profile Trusted CAs list in Settings (see ADR-0006).
-- CA/leaf certificate health warnings surfaced per discovered CA: an EKU present without `serverAuth` or anyExtendedKeyUsage (no EKU extension at all is not flagged), leaf/CA expiry (14-day/30-day thresholds, with a distinct already-expired message), SAN not covering a discovered host, and structurally invalid CA (missing CA:TRUE/keyCertSign).
+- CA/leaf certificate health warnings surfaced per discovered CA: an EKU extension present without `serverAuth` or `anyExtendedKeyUsage` (no EKU extension at all is not flagged), leaf/CA expiry (14-day/30-day thresholds, with a distinct already-expired message), SAN not covering a discovered host, and structurally invalid CA (missing CA:TRUE/keyCertSign).
 - Remote kubeconfig fetch reads over SSH exec (`sudo cat`, falling back to `cat`) instead of shelling out to `scp`, removing the local temp-file permission window (#23).
 - TLS certificate verification on the curl Kubernetes API fallback path (used when `kubectl` itself fails, e.g. macOS Sequoia Local Network Privacy): verifies against the kubeconfig's CA data via `--cacert`, or curl's system trust store when no CA data is present — never `-k`/`--insecure` (#24).
-- Local runtime discovery dashboard: architecture/CPU/memory/disk display and Docker context association for Colima/Lima instances, in a read-only "Local Runtime" section in Settings (#14 Phase 1).
+- Local runtime discovery dashboard: architecture/CPU/memory/disk and VM address display, plus Docker context association for Colima/Lima instances, in a read-only "Local Runtime" section in Settings (#14 Phase 1).
 - Local runtime lifecycle actions for Colima/Lima instances (Start/Stop/Restart, open VM shell, open a host-side shell scoped to the instance's Docker/kube context, copy runtime info): a `LocalRuntimeProvider` enum dispatch, a fresh-discovery re-check before every action, a per-instance concurrency guard rejecting a second in-flight Start/Stop/Restart, and Stop/Restart confirmation modals in the Settings panel (#14 Phase 2, see ADR-0007). Verified against a real `colima` instance (`nqa-node2`): Stopped → Start → confirmed Running → Stop → confirmed Stopped.
 - `clusterdeck-connection-workflow` Agent Skill re-verified via a fresh-session replay against a real target; `openforge-maturity` is `verified` again (#22).
 - Explicit per-host SSH authentication mode (`key`, the default, or `password`): password mode uses `sshpass -e`/`SSHPASS` consistently across Connect, Test Connection, and kubeconfig fetch, omits `BatchMode=yes` (which would block the password prompt) while keeping `StrictHostKeyChecking=accept-new`, and keeps the password ephemeral in frontend state only. Profile YAML written before this field existed deserializes unchanged as `key` (#26).
-- Built-in local DNS (`host_mapping: local_dns`) using a user LaunchAgent authoritative loopback responder (`127.0.0.1:15353`) and per-zone `/etc/resolver` files for node aliases and approved private ingress zones, resolving macOS Safari/URLSession resolution divergence without recurring `/etc/hosts` privileged writes (see [ADR-0011](adr/0011-built-in-local-dns.md) and [Local DNS Guide](LOCAL-DNS.md)).
+- Built-in local DNS (`host_mapping: local_dns`) using a user LaunchAgent authoritative loopback responder (`127.0.0.1:15353`) and per-zone `/etc/resolver` files for node aliases and approved private ingress zones, resolving macOS Safari/URLSession resolution divergence without recurring `/etc/hosts` privileged writes. Node aliases and per-profile zones use `*.clusterdeck.internal` since 0.6.0; legacy owned `.local` mappings are removed on apply. The responder candidate must pass a five-second `--dns-responder-selftest` before installation (0.6.1). See [ADR-0011](adr/0011-built-in-local-dns.md) and [Local DNS Guide](LOCAL-DNS.md).
+
+- (Unreleased, after 0.6.1) Launch-time update check and **ClusterDeck → Check for Updates…** menu item: one unauthenticated GET to GitHub Releases per launch; newer stable releases open in the browser for manual installation (see [ADR-0013](adr/0013-update-check.md)).
+- SSH known-host pruning is serialized process-wide; non-default ports prune only `[address]:port` entries.
+- VMware Vagrant accepts an absolute `.vmx` machine ID only when contained in its machine directory; VMware host address selection prefers static IP, then private IP probed through the SSH-config endpoint, then SSH-config address. Legacy `vagrant-<project>` profiles are adopted only under exact host-name/project-local key evidence ([ADR-0008](adr/0008-vm-inventory-environment-source.md) amendment).
 
 ## In progress
 

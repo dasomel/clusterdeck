@@ -2,6 +2,8 @@
 
 ClusterDeck은 macOS에서 `/etc/hosts` 파일을 수정하는 대신 `/etc/resolver`를 통해 프라이빗 클러스터 도메인을 확인하는 내장 로컬 DNS 응답기(`host_mapping: local_dns`)를 제공합니다.
 
+노드 별칭과 프로필별 별칭 존은 `*.clusterdeck.internal`을 사용합니다. 0.6.0에서 macOS mDNS `.local` 부정 조회 지연 때문에 기존 `*.clusterdeck.local` 이름을 변경했습니다. 다음 적용 시 ClusterDeck 소유의 기존 resolver 파일과 hosts 줄을 제거합니다. 이전 이름을 쓰는 외부 북마크, SSH 설정, 스크립트는 갱신해야 합니다. `clusterdeck.local`은 계속 예약되어 있습니다.
+
 아키텍처 배경 및 설계 결정에 대한 자세한 내용은 [ADR-0011: 내장 로컬 DNS](adr/0011-built-in-local-dns.md)와 [ARCHITECTURE.md §7.1](ARCHITECTURE.md#7-hosts-file-management)을 참조하십시오.
 
 ---
@@ -50,6 +52,8 @@ ClusterDeck 프로필은 `host_mapping` 설정 키를 통해 세 가지 이름 �
 - **중단 없는 전환 (Make-Before-Break, MBB):** `hosts` 모드와 `local_dns` 모드 사이를 전환할 때, ClusterDeck은 단 한 번의 권한 승인 스크립트 실행으로 `/etc/hosts` 정리와 `/etc/resolver` 생성/삭제를 함께 처리합니다. 두 매핑 방식이 모두 끊어지는 공백 시간은 발생하지 않습니다.
 
 ---
+
+응답기 바이너리가 없거나 변경된 경우, 설치 전에 5초 제한의 `--dns-responder-selftest`를 실행하고 버전이 지정된 성공 토큰을 확인합니다. 실패하면 기존 바이너리를 교체하지 않습니다.
 
 ## 3. 존(Zone) 아키텍처
 

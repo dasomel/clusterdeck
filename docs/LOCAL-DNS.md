@@ -2,6 +2,8 @@
 
 ClusterDeck provides an integrated local DNS responder (`host_mapping: local_dns`) that routes private cluster hostnames on macOS through `/etc/resolver` rather than editing `/etc/hosts`.
 
+Node aliases and per-profile alias zones use `*.clusterdeck.internal`; the former `*.clusterdeck.local` names were moved in 0.6.0 because macOS negative lookups under mDNS `.local` stalled. The next apply removes ClusterDeck-owned legacy resolver files and hosts lines; external bookmarks, SSH settings, and scripts using the old names must be updated. `clusterdeck.local` remains reserved.
+
 For architecture background and design rationale, see [ADR-0011: Built-in local DNS](adr/0011-built-in-local-dns.md) and [ARCHITECTURE.md §7.1](ARCHITECTURE.md#7-hosts-file-management).
 
 ---
