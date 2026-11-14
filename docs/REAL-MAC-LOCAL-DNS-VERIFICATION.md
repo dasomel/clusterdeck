@@ -1,12 +1,12 @@
 # Issue #95: Real-Mac Verification Procedure for ADR-0011 Built-in Local DNS
 
 - **Target Issue:** #95 (*test(local-dns): remaining real-Mac verification for ADR-0011*)
-- **Target Architecture:** [ADR-0011: Built-in local DNS](file:///Users/m/Documents/IdeaProjects/20.dasomel/clusterdeck/docs/adr/0011-built-in-local-dns.md)
+- **Target Architecture:** [ADR-0011: Built-in local DNS](adr/0011-built-in-local-dns.md)
 - **Relevant Implementations:**
-  - Manager & Lifecyle: [`src/services/local_dns/manager.rs`](file:///Users/m/Documents/IdeaProjects/20.dasomel/clusterdeck/src-tauri/src/services/local_dns/manager.rs)
-  - LaunchAgent & Process Gate: [`src/services/local_dns/agent.rs`](file:///Users/m/Documents/IdeaProjects/20.dasomel/clusterdeck/src-tauri/src/services/local_dns/agent.rs)
-  - Resolver File Generator: [`src/services/resolver_files.rs`](file:///Users/m/Documents/IdeaProjects/20.dasomel/clusterdeck/src-tauri/src/services/resolver_files.rs)
-  - Tauri Local DNS Commands: [`src/commands/local_dns.rs`](file:///Users/m/Documents/IdeaProjects/20.dasomel/clusterdeck/src-tauri/src/commands/local_dns.rs)
+  - Manager & Lifecycle: [`src/services/local_dns/manager.rs`](../src-tauri/src/services/local_dns/manager.rs)
+  - LaunchAgent & Process Gate: [`src/services/local_dns/agent.rs`](../src-tauri/src/services/local_dns/agent.rs)
+  - Resolver File Generator: [`src/services/resolver_files.rs`](../src-tauri/src/services/resolver_files.rs)
+  - Tauri Local DNS Commands: [`src/commands/local_dns.rs`](../src-tauri/src/commands/local_dns.rs)
 - **Author:** QA Auditor, ClusterDeck
 
 ---
@@ -30,7 +30,7 @@ This document establishes the exact test matrix, separation between code guarant
 | **1. Agent survives logout & login** | `agent::render_plist` renders `RunAtLoad: true`, `KeepAlive: true`, valid XML escaping, 0644/0755 file modes. | Real `launchd` GUI domain (`gui/<uid>`) session lifecycle: Does `launchd` actually spawn `clusterdeck-dns` upon login without TCC/SIP/sandboxing blocks? Does it bind port 15353 cleanly? |
 | **2. App move/update binary refresh** | `agent::ensure_binary` compares SHA-256; atomic copy with 0755; `manager::refresh_binary` triggers `launchctl bootout` + `bootstrap`. | Replacing a binary on a live macOS filesystem; `launchd` restarting the process with the new binary without port collision (`EADDRINUSE`); updating `status.json` with the new PID. |
 | **3. Port squatter triggers D-DEAD** | Pre-flight ownership gate (`agent::ownership_ok`) checks launchctl PID, status PID, UDP listener, and TCP LISTEN listener; triggers `on_responder_unavailable`. Root script exit 7 gate. | Real macOS `lsof` detecting an external rogue process (e.g. `nc -l 15353`); triggering privileged prompt to remove `/etc/resolver/*`; verifying NO 30s stall occurs in system resolution. |
-| **4. Cancelling admin prompt** | `manager::run_script` captures AppleScript `-128` ("User canceled"); `manager::reconcile_publish` reads disk and publishes ONLY on-disk zones. | Real macOS SecurityAgent dialog cancellation; no orphan temp files left in `/tmp` or `/etc/resolver`; UI surfaces warning; existing zones resolve, unapproved zone does not. |
+| **4. Cancelling admin prompt** | `manager::run_script` captures AppleScript `-128` ("User canceled"); `manager::reconcile_publish` reads disk and publishes ONLY on-disk zones. | Real macOS SecurityAgent dialog cancellation; resolver files unchanged; UI surfaces warning; existing zones resolve, cancelled candidate remains pending. |
 | **5. "Remove from local DNS" (Teardown)** | `manager::teardown` removes resolver files first, verifies deletion on disk, unloads LaunchAgent, deletes plist & binary, preserves monotonic `generation`. | Privileged prompt executes cleanly; third-party resolver files are untouched; `launchctl` service completely unloaded; files removed; immediate NXDOMAIN in Safari (no 30s hang). |
 | **6. Connect refresh (#94 zero-prompt)** | `commands::local_dns::refresh_local_dns_on_connect_detailed` detects unchanged zone set; calls `manager::apply_records_only`; no `build_privileged_script`. | Zero administrator prompt dialogs appear during Connect; `zones.json` updates; responder reloads new generation; Safari immediately connects to the new IP. |
 | **7. Safari check after each item** | N/A (Unit tests cannot run WebKit or Network.framework). | Safari and `URLSession` resolve through `mDNSResponder` + `/etc/resolver`; verification that no test leaves Safari in a 30-second hanging state. |
@@ -71,31 +71,13 @@ Verify that `com.clusterdeck.dns` automatically starts upon user GUI login (`Run
 - Profile synced: `/etc/resolver/<profile>.clusterdeck.internal` exists.
 - Agent running: `launchctl print gui/$(id -u)/com.clusterdeck.dns | grep "state = running"`.
 
-#### Execution Steps
-1. In macOS Terminal, record current PID and generation:
-   ```bash
-   BEFORE_PID=$(cat ~/.clusterdeck/dns/status.json | jq -r .pid)
-   BEFORE_GEN=$(cat ~/.clusterdeck/dns/status.json | jq -r .generation)
-   echo "Pre-logout PID: $BEFORE_PID, Generation: $BEFORE_GEN"
-   ```
-2. Log out of the macOS user account:
-   - Click **Apple menu () → Log Out <user>...** (or run `sudo launchctl bootout user/$(id -u)`).
-3. Log back into the macOS user account.
-4. Open Terminal and run the verification command:
-   ```bash
-   # Check LaunchAgent status
-   launchctl print gui/$(id -u)/com.clusterdeck.dns | grep -E "(state =|pid =|last exit code =)"
-   
-   # Check status.json
-   cat ~/.clusterdeck/dns/status.json
-   ```
-
-#### Verification Criteria
-- [ ] `launchctl print` reports `state = running` with a valid numeric `pid`.
-- [ ] `~/.clusterdeck/dns/status.json` has `error: null` and `pid` matches `launchctl print`.
-- [ ] `generation` in `status.json` is `>= BEFORE_GEN`.
-- [ ] `dig @127.0.0.1 -p 15353 bastion.<profile>.clusterdeck.internal +short` returns the expected IP.
-- [ ] **Checklist 7 (Safari):** Safari / `URLSession` resolves cluster hostnames within 0.1s.
+#### Execution and criteria
+Use `item1-before`, then log out via the Apple menu, log back in, and run
+`item1-after <printed-snapshot-dir>` **before opening ClusterDeck** (see §6).
+The script checks a changed launchd PID, matching status PID with `error: null`,
+nondecreasing generation, exclusive UDP/TCP ownership, and direct/Safari resolution.
+A reused PID needs manual review; a different PID alone does not prove login persistence.
+Keep the temporary snapshot across logout; if the OS removes it, repeat the test.
 
 ---
 
@@ -142,129 +124,63 @@ Verify that when the ClusterDeck application is updated or launched from a new b
 
 ---
 
-### Checklist Item 3: Port Squatter on 127.0.0.1:15353 Triggers D-DEAD Cleanup
+### Checklist Item 3: Port Squatter / D-DEAD
 
-#### Objective
-Verify that if another process occupies `127.0.0.1:15353`, ClusterDeck's pre-flight and script-level ownership gates catch the squatter, prevent pointing system DNS at an untrusted port, trigger a privileged prompt to remove `/etc/resolver` files, and surface a clear warning.
+Run `item3` (§6). Only an explicit lowercase `y` authorizes agent bootout. The
+script starts its own isolated Python child bound to `127.0.0.1:15353` on both
+UDP and TCP. In the open app, click **Sync to local DNS** and approve cleanup.
+`manager::apply` ensures the agent, waits for status and checks ownership; a
+start/status failure also enters D-DEAD, so the warning need not mention only
+"port not owned". Approve the removal prompt and observe the unavailable warning.
 
-#### Pre-conditions
-- Profile `lab` active with `host_mapping: local_dns`.
-- `/etc/resolver/lab.clusterdeck.internal` exists.
-
-#### Execution Steps
-1. Unload the legitimate ClusterDeck agent to release port 15353:
-   ```bash
-   launchctl bootout gui/$(id -u)/com.clusterdeck.dns 2>/dev/null || true
-   ```
-2. Spawn a port squatter on `127.0.0.1:15353` (UDP and TCP):
-   ```bash
-   # In a separate terminal or background job:
-   nc -l 127.0.0.1 15353 &
-   SQUATTER_PID=$!
-   echo "Squatter PID: $SQUATTER_PID"
-   ```
-3. In ClusterDeck, click **Sync to local DNS** (or run `sync_local_dns_profile`).
-4. An administrator authentication prompt will appear:
-   - Enter your password to authorize the cleanup script.
-5. Inspect the command output / UI banner and filesystem:
-   ```bash
-   # Verify resolver files removed
-   ls -la /etc/resolver/
-   ```
-6. Clean up the squatter:
-   ```bash
-   kill -9 $SQUATTER_PID 2>/dev/null || true
-   ```
-
-#### Verification Criteria
-- [ ] The app displays the warning:
-  `local DNS responder unavailable; resolver entries removed (port 15353 is not owned by the ClusterDeck DNS agent)` (or port not owned).
-- [ ] All ClusterDeck-managed `/etc/resolver/<zone>` files are deleted.
-- [ ] Non-ClusterDeck files in `/etc/resolver/` (if any) are strictly untouched.
-- [ ] **Checklist 7 (Safari):** Querying `bastion.lab.clusterdeck.internal` in Safari / `URLSession` returns `NSURLErrorCannotFindHost (-1003)` in **< 0.05 seconds** (proves that the dangling resolver file was removed, preventing the 30-second stall!).
+Startup also checks ownership and can sweep managed resolver files, but startup
+results are not surfaced as the Sync warning. **Connect** uses records-only apply:
+it reports unavailable and asks for Sync without privileged cleanup. Use Sync
+for this guided test. PASS requires managed resolvers gone, pre-existing foreign
+resolvers unchanged, fast negative Safari-stack results, and a successful restore.
+Cached positive answers or another resolver may fail the negative check; record
+that result rather than treating it as proof of a dangling resolver.
 
 ---
 
-### Checklist Item 4: Cancelling Admin Prompt Preserves Consistency
+### Checklist Item 4: Cancel a New-Zone Approval
 
-#### Objective
-Verify that when an administrator prompt is displayed (e.g. approving a new zone) and the user clicks **Cancel** (or presses Escape), ClusterDeck leaves the disk untouched, reconciles `zones.json` to reflect only what is actually on disk, and reports a clear warning.
+Run `item4` (§6) with a healthy existing setup and a new, nonconflicting suggested
+zone whose resolver file is absent. Click **Approve <zone>**, then **Cancel** in
+the actual macOS admin dialog. Do not use a mode change or a no-op Sync instead.
+Observe **Zone Approval Incomplete**. Approval is saved in the profile before
+apply; cancellation leaves it pending, rather than rolling back profile settings.
 
-#### Pre-conditions
-- Profile `lab` has `lab.clusterdeck.internal` already published and active on disk.
-- Candidate ingress zone `lab.example.internal` is suggested in the Endpoints tab.
-
-#### Execution Steps
-1. Click **Approve lab.example.internal** in ClusterDeck UI.
-2. The macOS SecurityAgent administrator prompt appears asking for password:
-   - **Click "Cancel"** (or press Escape).
-3. Observe the UI notification and examine disk state:
-   ```bash
-   # 1. Check /etc/resolver
-   ls -la /etc/resolver/lab.example.internal
-   
-   # 2. Check zones.json content
-   cat ~/.clusterdeck/dns/zones.json | jq -r '.zones[].zone'
-   
-   # 3. Check status.json generation
-   cat ~/.clusterdeck/dns/status.json
-   ```
-
-#### Verification Criteria
-- [ ] UI shows notification/banner: `Admin approval was cancelled; local DNS was not changed`.
-- [ ] `/etc/resolver/lab.example.internal` was **NOT** created on disk.
-- [ ] `/etc/resolver/lab.clusterdeck.internal` remains intact.
-- [ ] `~/.clusterdeck/dns/zones.json` contains ONLY `lab.clusterdeck.internal` (the cancelled zone is discarded).
-- [ ] Generation in `status.json` and `zones.json` advances cleanly without corruption.
-- [ ] **Checklist 7 (Safari):**
-  - `bastion.lab.clusterdeck.internal` continues to resolve normally.
-  - `api.lab.example.internal` returns immediate `NSURLErrorCannotFindHost (-1003)`.
+PASS requires all resolver bytes unchanged and published `(zone, profile_id)`
+pairs reconciled from known previous entries whose exact owner marker remains
+on disk. Arbitrary marked files unknown to desired/previous zones are not
+necessarily published. The cancelled candidate must not be published. Generation
+may advance; records can refresh. Existing records must still resolve. This does
+not assert the absence of every temporary file created by the app. Afterwards,
+Sync to install the pending approval or revoke it in the UI.
 
 ---
 
-### Checklist Item 5: "Remove from local DNS" on Last LocalDns Profile (Teardown)
+### Checklist Item 5: Remove the Sole Remaining LocalDns Profile
 
-#### Objective
-Verify that clicking **Remove from local DNS** on the last profile configured for Local DNS executes the proper ADR-0011 teardown sequence:
-1. Deletes `/etc/resolver/<zone>` entries.
-2. Verifies removal on disk.
-3. Only then unloads LaunchAgent, deletes plist, and deletes binary.
-4. Preserves the `generation` counter.
+Run `item5` (§6). It first snapshots the full setup. Record original mappings,
+then use **Settings** to save every other Local DNS profile as **Off**, approving
+changes. Leave exactly one saved `local_dns` profile, then click its
+**Remove from local DNS** and approve.
 
-#### Pre-conditions
-- Exactly one profile exists with `host_mapping: local_dns` (e.g. `profile-a`).
-- Resolver files exist: `/etc/resolver/profile-a.clusterdeck.internal`.
-- LaunchAgent `com.clusterdeck.dns` is running.
+Remove excludes the selected profile for that apply; it does **not** persist a
+mapping change. Repeatedly clicking Remove across several saved Local DNS profiles
+can recreate other profiles' zones and does not guarantee teardown.
 
-#### Execution Steps
-1. In ClusterDeck Endpoints tab, click **Remove from local DNS**.
-2. When the administrator prompt appears, enter your password.
-3. Verify filesystem and process state:
-   ```bash
-   # 1. Check /etc/resolver
-   ls -la /etc/resolver/profile-a.clusterdeck.internal
-   
-   # 2. Check LaunchAgent status
-   launchctl print gui/$(id -u)/com.clusterdeck.dns 2>&1
-   
-   # 3. Check LaunchAgent plist
-   ls -la ~/Library/LaunchAgents/com.clusterdeck.dns.plist
-   
-   # 4. Check binary
-   ls -la ~/.clusterdeck/bin/clusterdeck-dns
-   
-   # 5. Check generation and zones
-   ls -la ~/.clusterdeck/dns/
-   ```
-
-#### Verification Criteria
-- [ ] `/etc/resolver/profile-a.clusterdeck.internal` is deleted.
-- [ ] `launchctl print` returns `Could not find service "com.clusterdeck.dns" in domain for gui/...` (or exit code 113).
-- [ ] `~/Library/LaunchAgents/com.clusterdeck.dns.plist` is deleted.
-- [ ] `~/.clusterdeck/bin/clusterdeck-dns` is deleted.
-- [ ] `~/.clusterdeck/dns/zones.json` and `status.json` are deleted.
-- [ ] `~/.clusterdeck/dns/generation` is **PRESERVED** (ensures monotonic counter survives re-enablement).
-- [ ] **Checklist 7 (Safari):** Safari / `URLSession` returns immediate `NSURLErrorCannotFindHost (-1003)` in <0.05s (proves resolver file was removed before agent stop; no 30s hang).
+PASS requires owned resolvers removed before teardown, foreign resolver hashes
+unchanged, agent explicitly absent from launchd, no port listeners, and these files
+absent: `~/Library/LaunchAgents/com.clusterdeck.dns.plist`,
+`~/.clusterdeck/bin/clusterdeck-dns`, `~/.clusterdeck/dns/zones.json` and
+`status.json`. `generation` stays monotonic; the DNS directory, `endpoints.json`
+and `agent.err.log` are not teardown targets. Final snapshots prove final state,
+not deletion ordering; ordering is the code guarantee. The script checks fast
+negative Safari resolution, guides Sync of the remaining profile, then restoration
+of the other saved mappings and Sync, and compares against both baselines.
 
 ---
 
@@ -340,7 +256,64 @@ scripts/test-real-mac-local-dns.sh --help
 
 ---
 
-## 6. QA Audit Conclusion & Sign-off Recommendation
+## 6. Guided Lifecycle Script (remaining #95 operator checklist)
+
+Run from a macOS Terminal in the repository, with ClusterDeck open and a healthy,
+synced Local DNS setup. Requirements: Bash (including macOS Bash 3.2), Python 3,
+`launchctl`, `lsof`, `dig`, and Swift command-line tools. Interactive commands
+require a terminal and stop on EOF. Prompts are Korean + English; only `y` counts
+as confirmation. Do not run this through an unattended agent.
+
+```bash
+./scripts/verify-local-dns-lifecycle.sh --help
+./scripts/verify-local-dns-lifecycle.sh snapshot
+./scripts/verify-local-dns-lifecycle.sh item1-before
+# Apple menu → Log Out; log in; do not open ClusterDeck yet:
+./scripts/verify-local-dns-lifecycle.sh item1-after "<printed-state-directory>"
+# Open ClusterDeck again for the remaining guided steps:
+./scripts/verify-local-dns-lifecycle.sh item3
+./scripts/verify-local-dns-lifecycle.sh item4
+./scripts/verify-local-dns-lifecycle.sh item5
+./scripts/verify-local-dns-lifecycle.sh safari
+./scripts/verify-local-dns-lifecycle.sh restore-check "<earlier-state-directory>"
+```
+
+| Command | Operator action | PASS means |
+|---|---|---|
+| `snapshot` | None | State captured successfully, including explicit absence; **not** a health verdict. |
+| `item1-before` | Keep printed state directory; log out through Apple menu. | Baseline captured and agent/publication healthy. |
+| `item1-after <dir>` | After login, run before opening app. | PID changed, status/generation/ownership healthy, names resolve. |
+| `item3` | Answer `y` to bootout; Sync and approve cleanup; attest warning; Sync all profiles after squatter stops. | D-DEAD removed owned files, foreign files unchanged, fast negatives, restored hashes/records/health. |
+| `item4` | Approve a new suggested zone, Cancel actual admin prompt, attest warning. | Resolver bytes unchanged, exact known owner pairs reconciled, existing names resolve; saved approval remains pending. |
+| `item5` | Save other mappings as Off; Remove on the sole remaining profile; restore mappings and Sync when prompted. | Teardown targets absent, generation retained, fast negatives, both baselines restored. |
+| `safari` | None | Existing Swift CFHost/URLSession check passes for every record in every zone; empty zones use a generated negative name. Also checks direct DNS for positive records. |
+| `restore-check <dir>` | Restore manually beforehand if needed. | Resolver hashes, binary/plist hashes, zone owners/records match baseline; generation may advance, PID may change; current health and resolution pass. Prints each comparison. |
+
+Each check prints PASS/FAIL; the final summary counts top-level checks (nested
+inspection checks are printed separately). Any FAIL, inspection error, interruption,
+or declined required confirmation returns nonzero. Read errors, unrecognized
+launchctl errors and resolver symlinks fail closed. Positive DNS caching can cause
+negative checks to fail; a FAIL remains an unresolved result, not a waived check.
+Swift's existing 4.5-second resolver threshold and URLSession result rules apply;
+there is no invented sub-100-ms PASS threshold.
+
+Snapshots are private timestamped directories beneath `${TMPDIR}` (fallback
+`/tmp`), with a `state-XXXXXX` directory printed for comparisons. They hold owned
+resolver contents, hashes of all resolver files, zones/status/generation, plist,
+launchctl output/PID, UDP/TCP listener PIDs and binary SHA-256. They may contain
+private infrastructure identifiers: keep them local, outside Git and issues.
+The script never runs sudo, writes/deletes protected application/system files,
+or restores them itself. The app performs every privileged change after human
+approval. It signals only its own Python squatter after checking parent PID,
+Python command and unique token; TERM precedes KILL, with EXIT/INT/TERM cleanup.
+Interrupting does not restore the app configuration: after interruption, open
+ClusterDeck and Sync original Local DNS profiles manually. Evidence is retained;
+Swift module cache also lives in the temporary work directory.
+
+This script supplies executable operator steps; completing syntax/help/snapshot
+checks alone does **not** complete the real-Mac lifecycle checklist.
+
+## 7. QA Audit Conclusion & Sign-off Recommendation
 
 The local DNS codebase in `src-tauri/src/services/local_dns/` and `src-tauri/src/services/resolver_files.rs` provides strict software invariants (PID validation in root scripts, atomic temp files, generation monotonicity, and automatic D-DEAD cleanup routing).
 
