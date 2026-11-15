@@ -6,6 +6,12 @@ The format follows the principles of Keep a Changelog and uses semantic versioni
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-11-16
+
+### Fixed
+
+- Refresh the local DNS responder after an app update again: the responder self-test compared the runner's trimmed output with the token plus a newline, so the real app always failed it ("self-test failed (unexpected stdout token)"). Since 0.6.1 this left `~/.clusterdeck/bin/clusterdeck-dns` at the old build after an update, skipped the startup check from #150, and refused any apply that had to reinstall the binary, including a first-time local DNS setup (#154, #155)
+
 ## [0.7.0] - 2026-11-15
 
 ### Added
