@@ -399,6 +399,8 @@ async fn disable(
             port: env.port,
             status_timeout: env.status_timeout,
             status_poll: env.status_poll,
+            startup_grace: env.startup_grace,
+            startup_poll: env.startup_poll,
             protect_resolver: true,
         };
         &teardown_env
@@ -1137,16 +1139,32 @@ pub async fn status_with(env: &ManagerEnv<'_>) -> LocalDnsStatus {
 /// App start (D4): remove our resolver files if nothing uses local DNS or the agent does not own
 /// the port (no prompt unless such files exist), then keep the agent's binary copy current.
 pub async fn startup_with(paths: &ClusterDeckPaths, env: &ManagerEnv<'_>) -> Result<(), String> {
+    let any_local_dns = {
+        let _lane_guard = lock_lane().await;
+        let any_local_dns = store::load_profiles(paths)?
+            .iter()
+            .any(|p| p.host_mapping == HostMapping::LocalDns);
+        if any_local_dns {
+            // Preflight before cleanup, but reload afterwards: reloading first would make the
+            // ownership check race the new responder's status.json PID update.
+            agent::prepare_binary(env.runner, env.current_exe, &env.paths.binary).await?;
+        }
+        any_local_dns
+    };
+    if any_local_dns {
+        manager::wait_for_startup_ownership(env).await;
+    }
     let _lane_guard = lock_lane().await;
+    // Sync or profile edits may have completed during the grace. Re-read profiles and let
+    // startup_sweep re-check ownership under its lock, without waiting again in this lane.
     let any_local_dns = store::load_profiles(paths)?
         .iter()
         .any(|p| p.host_mapping == HostMapping::LocalDns);
-    if any_local_dns {
-        // Preflight before cleanup, but reload afterwards: reloading first would make the
-        // ownership check race the new responder's status.json PID update.
-        agent::prepare_binary(env.runner, env.current_exe, &env.paths.binary).await?;
-    }
-    let sweep = manager::startup_sweep(env, any_local_dns).await;
+    let sweep_env = ManagerEnv {
+        startup_grace: std::time::Duration::ZERO,
+        ..*env
+    };
+    let sweep = manager::startup_sweep(&sweep_env, any_local_dns).await;
     let refresh = if any_local_dns {
         manager::refresh_binary(env).await.map(|_| ())
     } else {

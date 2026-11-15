@@ -323,6 +323,7 @@ Or open `http://api.lab.example.internal` directly in Safari.
 ### Responder Down (D-DEAD State)
 - **Symptom:** System lookups for cluster domains stall for 30 seconds before failing.
 - **Cause:** A resolver file pointing to an inactive port causes macOS resolution to stall. ClusterDeck enforces a safety mechanism (**D-DEAD**): whenever the manager detects that the responder is unavailable or port ownership is lost, it initiates a cleanup prompt to remove dangling resolver files.
+- **App startup:** If any profile uses local DNS, ClusterDeck allows up to 30 seconds for the LaunchAgent to become ready, reloading `status.json` and checking process/UDP/TCP ownership about every 500 ms. A successful check preserves the resolver files without a cleanup prompt or a manual Sync. If ownership still fails at the deadline (including a persistent port squatter), the existing cleanup prompt applies. With no local DNS profiles, cleanup is immediate. This background wait releases the manager and Sync locks; ownership and profiles are checked again before cleanup.
 - **Remedy:** Inspect `~/.clusterdeck/dns/agent.err.log`. If port 15353 was occupied by another process, free the port or restart the LaunchAgent:
   ```bash
   launchctl kickstart -k gui/$(id -u)/com.clusterdeck.dns

@@ -786,6 +786,45 @@ async fn lane_mutex_serializes_startup_with() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn sync_completes_during_startup_grace() {
+    let f = Fake::new();
+    let paths = f.cd_paths();
+    store::upsert_profile(&paths, profile("cka", HostMapping::LocalDns, &[])).unwrap();
+    let resolver_file = f.resolver.join("cka.clusterdeck.internal");
+    std::fs::write(
+        &resolver_file,
+        render_resolver_file("cka", DEFAULT_DNS_PORT).unwrap(),
+    )
+    .unwrap();
+    let env = f.env();
+    let startup = startup_with(&paths, &env);
+    tokio::pin!(startup);
+    while f.count("selftest") == 0 {
+        tokio::select! {
+            biased;
+            result = &mut startup => panic!("startup should wait for the agent: {result:?}"),
+            _ = tokio::task::yield_now() => {}
+        }
+    }
+    assert!(resolver_file.exists());
+    assert_eq!(f.count("osascript"), 0);
+
+    // Keep startup parked in its grace while Sync runs: completion proves neither lock
+    // is held by startup. Virtual timeouts would also measure contention from other tests
+    // sharing the process-wide locks on independent paused runtimes.
+    let sync = reapply(&paths, &env, None, None, None).await.unwrap();
+    assert!(!sync.cancelled);
+    let prompts = f.count("osascript");
+    startup.await.unwrap();
+    assert!(resolver_file.exists());
+    assert_eq!(
+        f.count("osascript"),
+        prompts,
+        "startup must re-check ownership"
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn startup_sweep_does_not_delete_files_written_by_prior_apply() {
     let f = Fake::new();
     let paths = f.cd_paths();

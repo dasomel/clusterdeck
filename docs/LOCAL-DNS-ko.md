@@ -318,6 +318,7 @@ sem.wait()
 ### 응답기 다운 (D-DEAD 상태)
 - **증상:** 클러스터 도메인 조회가 30초 동안 멈춘(stall) 후 실패함.
 - **원인:** 응답기가 켜져 있지 않은 상태에서 resolver 파일만 남아있으면 macOS의 DNS 조회가 30초 타임아웃에 걸립니다. ClusterDeck은 이를 방지하기 위한 안전장치(**D-DEAD**)를 갖추고 있습니다. 매니저가 응답기 다운 또는 포트 점유권 상실을 감지하면 자동으로 관리자 권한을 요청하여 dangling resolver 파일을 제거합니다.
+- **앱 시작 시:** 로컬 DNS 프로필이 있으면 LaunchAgent가 준비될 때까지 최대 30초 동안 약 500ms 간격으로 `status.json`을 다시 읽고 프로세스·UDP·TCP 포트 소유권을 확인합니다. 확인에 성공하면 정리 프롬프트나 수동 Sync 없이 resolver 파일을 유지합니다. 제한 시간이 지나도 소유권 확인에 실패하면(다른 프로세스가 계속 포트를 점유하는 경우 포함) 기존 정리 프롬프트를 표시합니다. 로컬 DNS 프로필이 없으면 즉시 정리합니다. 백그라운드 대기 중에는 manager와 Sync 잠금을 해제하며, 정리 직전에 프로필과 소유권을 다시 확인합니다.
 - **해결책:** `~/.clusterdeck/dns/agent.err.log`를 확인합니다. 다른 프로세스가 15353 포트를 점유하고 있다면 포트를 확보하거나 LaunchAgent를 다시 시작합니다:
   ```bash
   launchctl kickstart -k gui/$(id -u)/com.clusterdeck.dns

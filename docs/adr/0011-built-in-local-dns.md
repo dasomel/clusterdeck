@@ -138,3 +138,7 @@ Decision:
 - **Reservation:** both `clusterdeck.internal` and the legacy `clusterdeck.local` (and everything under them) are reserved, so a user cannot approve either as a zone.
 - **Migration:** the hosts block is emitted with the new names only (no dual emission). Legacy `.clusterdeck.local` lines in an existing block are dropped, not preserved as endpoints. `plan_changes_for_port` already removes marker-owned resolver files whose zone is no longer desired, so the old `/etc/resolver/<label>.clusterdeck.local` files go on the next apply (one admin prompt); unowned files are never touched.
 - **Breaking:** bookmarks, SSH configs and scripts using the old names must be updated. Downgrading below this version recreates the `.local` zones.
+
+## Amendment 2026-11-15: startup ownership grace (D4 amended, #150)
+
+At app startup, when any profile uses local DNS, retry the ownership gate for up to 30 seconds at roughly 500 ms intervals, reloading status each time. This tolerates LaunchAgent login delays and stale session PIDs. Wait outside the manager and command lane locks, then re-check ownership and profiles under the locks before cleanup. Persistent failure still uses the existing removal plan; with no local DNS profiles, cleanup remains immediate.
