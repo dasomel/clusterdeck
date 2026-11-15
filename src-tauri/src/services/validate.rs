@@ -313,6 +313,27 @@ pub fn profile_dns_label(profile_id: &str) -> Option<String> {
     (!trimmed.is_empty()).then_some(trimmed)
 }
 
+/// Sink validator for Kubernetes DNS-1123 labels (`namespace`, `Service`, and `Secret` names
+/// passed to `kubectl auth can-i get secret/<name> -n <ns>` and `kubectl get secret <name> -n <ns>`
+/// per ADR-0014 D3/D5): 1..=63 characters, lowercase ASCII alphanumeric or `'-'`, starting and
+/// ending with an alphanumeric character.
+pub fn is_safe_k8s_dns_label(s: &str) -> bool {
+    if s.is_empty() || s.len() > 63 {
+        return false;
+    }
+    let bytes = s.as_bytes();
+    let first = bytes[0];
+    let last = bytes[bytes.len() - 1];
+    if !(first.is_ascii_lowercase() || first.is_ascii_digit())
+        || !(last.is_ascii_lowercase() || last.is_ascii_digit())
+    {
+        return false;
+    }
+    bytes
+        .iter()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -690,5 +711,26 @@ mod tests {
             profile_dns_label(&"a".repeat(64)).map(|l| l.len()),
             Some(63)
         );
+    }
+
+    #[test]
+    fn is_safe_k8s_dns_label_boundary_cases() {
+        assert!(is_safe_k8s_dns_label("a"));
+        assert!(is_safe_k8s_dns_label("9"));
+        assert!(is_safe_k8s_dns_label("argocd"));
+        assert!(is_safe_k8s_dns_label("argocd-initial-admin-secret"));
+        assert!(is_safe_k8s_dns_label("kube-prom-stack-grafana"));
+        assert!(is_safe_k8s_dns_label(&"a".repeat(63)));
+        assert!(!is_safe_k8s_dns_label(""));
+        assert!(!is_safe_k8s_dns_label(&"a".repeat(64)));
+        assert!(!is_safe_k8s_dns_label("-leading"));
+        assert!(!is_safe_k8s_dns_label("trailing-"));
+        assert!(!is_safe_k8s_dns_label("-"));
+        assert!(!is_safe_k8s_dns_label("UpperCase"));
+        assert!(!is_safe_k8s_dns_label("with_underscore"));
+        assert!(!is_safe_k8s_dns_label("with.dot"));
+        assert!(!is_safe_k8s_dns_label("ns/name"));
+        assert!(!is_safe_k8s_dns_label("--context=evil"));
+        assert!(!is_safe_k8s_dns_label("bad\nlabel"));
     }
 }

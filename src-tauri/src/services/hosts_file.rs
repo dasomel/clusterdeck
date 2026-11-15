@@ -233,12 +233,14 @@ mod tests {
                 ip: "192.168.77.200".into(),
                 source: "apisix".into(),
                 resource_name: "analytics/trino".into(),
+                ..Default::default()
             },
             DiscoveredEndpoint {
                 host: "grafana.local.beluga.internal".into(),
                 ip: "192.168.77.200".into(),
                 source: "ingress".into(),
                 resource_name: "monitoring/grafana".into(),
+                ..Default::default()
             },
         ];
         let block = render_hosts_block_with_endpoints(&p, &endpoints).unwrap();
@@ -255,6 +257,7 @@ mod tests {
             ip: "192.168.77.200".into(),
             source: "apisix".into(),
             resource_name: "bad".into(),
+            ..Default::default()
         }];
         assert!(render_hosts_block_with_endpoints(&p, &bad_endpoints).is_err());
 
@@ -263,6 +266,7 @@ mod tests {
             ip: "192.168.77.200\n127.0.0.1 evil.com".into(),
             source: "apisix".into(),
             resource_name: "bad".into(),
+            ..Default::default()
         }];
         assert!(render_hosts_block_with_endpoints(&p, &bad_ip_endpoints).is_err());
     }

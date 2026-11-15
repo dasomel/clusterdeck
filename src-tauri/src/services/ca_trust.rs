@@ -1422,12 +1422,14 @@ mod tests {
                 ip: "192.168.77.200".to_string(),
                 source: "apisix".to_string(),
                 resource_name: "platform-system/argocd".to_string(),
+                ..Default::default()
             },
             DiscoveredEndpoint {
                 host: "sso.local.beluga.internal".to_string(),
                 ip: "192.168.77.200".to_string(),
                 source: "apisix".to_string(),
                 resource_name: "iam/keycloak".to_string(),
+                ..Default::default()
             },
         ];
         let temp_kc = std::env::temp_dir().join("test-ca-trust-dummy-kc.yaml");
@@ -1539,12 +1541,14 @@ mod tests {
                 ip: "192.168.77.10".to_string(),
                 source: "ingress".to_string(),
                 resource_name: "apps/web".to_string(),
+                ..Default::default()
             },
             DiscoveredEndpoint {
                 host: "apisix.example.internal".to_string(),
                 ip: "192.168.77.200".to_string(),
                 source: "apisix".to_string(),
                 resource_name: "platform-system/argocd".to_string(),
+                ..Default::default()
             },
         ];
         let temp_kc = std::env::temp_dir().join("test-ca-trust-dummy-kc-fp-collapse.yaml");
@@ -1720,12 +1724,14 @@ mod tests {
                 ip: "192.168.77.200".to_string(),
                 source: "apisix".to_string(),
                 resource_name: "platform-system/argocd".to_string(),
+                ..Default::default()
             },
             DiscoveredEndpoint {
                 host: "forbidden.example.internal".to_string(),
                 ip: "192.168.77.201".to_string(),
                 source: "apisix".to_string(),
                 resource_name: "restricted-ns/secret-app".to_string(),
+                ..Default::default()
             },
         ];
         let temp_kc = std::env::temp_dir().join("test-ca-trust-dummy-kc-5.yaml");
@@ -1836,6 +1842,7 @@ mod tests {
             ip: "192.168.77.200".to_string(),
             source: "apisix".to_string(),
             resource_name: "platform-system/argocd".to_string(),
+            ..Default::default()
         }];
         let temp_kc = std::env::temp_dir().join("test-ca-trust-dummy-kc-san-mismatch.yaml");
         let _ = std::fs::write(&temp_kc, "dummy");
@@ -1867,6 +1874,7 @@ mod tests {
             ip: "192.168.77.200".to_string(),
             source: "apisix".to_string(),
             resource_name: "platform-system/argocd".to_string(),
+            ..Default::default()
         }];
         let temp_kc = std::env::temp_dir().join("test-ca-trust-dummy-kc-san-match.yaml");
         let _ = std::fs::write(&temp_kc, "dummy");

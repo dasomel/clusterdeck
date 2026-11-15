@@ -7,6 +7,7 @@ import type {
   DiscoveredEndpoint,
   DiscoveredHost,
   DiscoveredLocalHost,
+  EndpointLoginOption,
   EnvironmentProfileResult,
   HostStageResult,
   HostsFileStatus,
@@ -20,6 +21,7 @@ import type {
   ManagedProfileKubeconfig,
   MergeKubeconfigResult,
   Profile,
+  RevealedEndpointLogin,
   ScanEndpointsResult,
   SuggestedDnsZones,
   SyncHostsResult,
@@ -112,4 +114,13 @@ export const api = {
     invoke<Inventory>('discover_inventory', { demo }),
   createProfileFromEnvironment: (environment: string) =>
     invoke<EnvironmentProfileResult>('create_profile_from_environment', { environment }),
+  endpointLoginOptions: (profileId: string) =>
+    invoke<EndpointLoginOption[]>('endpoint_login_options', { profileId }),
+  checkEndpointLogin: (profileId: string, endpointId: string) =>
+    invoke<EndpointLoginOption>('check_endpoint_login', { profileId, endpointId }),
+  revealEndpointLogin: (profileId: string, endpointId: string) =>
+    invoke<RevealedEndpointLogin>('reveal_endpoint_login', { profileId, endpointId }),
+  clipboardChangeCount: () => invoke<number>('clipboard_change_count'),
+  clearClipboardIfChangeCount: (expected: number) =>
+    invoke<boolean>('clear_clipboard_if_change_count', { expected }),
 };

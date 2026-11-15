@@ -700,6 +700,8 @@ pub async fn connect_profile(
         errors.push(e);
     }
 
+    cache_off_mode_connect_endpoints(&paths, &current_profile, &discovery_res).await;
+
     match crate::commands::local_dns::SystemDns::resolve() {
         Ok(dns) => {
             let discovery = discovery_res.as_ref().map_err(|e| e.as_str());
@@ -738,6 +740,24 @@ pub async fn connect_profile(
         endpoints,
         errors,
     })
+}
+
+async fn cache_off_mode_connect_endpoints(
+    paths: &ClusterDeckPaths,
+    profile: &Profile,
+    discovery: &Result<crate::services::k8s_endpoints::DiscoveryResult, String>,
+) {
+    if profile.host_mapping == crate::services::config::HostMapping::Off {
+        if let Ok(discovered) = discovery {
+            let _guard = crate::commands::local_dns::lock_lane().await;
+            let _ = crate::commands::local_dns::update_endpoint_cache(
+                &paths.endpoints_cache_file(),
+                &profile.id,
+                &discovered.endpoints,
+                Some(&discovered.succeeded_kinds),
+            );
+        }
+    }
 }
 
 /// Every discovery kind as owned strings: a total discovery failure is "all kinds failed".
@@ -945,10 +965,15 @@ pub fn merge_discovered_endpoints(
                     && !merged.iter().any(|ep| ep.host == host)
                 {
                     merged.push(crate::services::k8s_endpoints::DiscoveredEndpoint {
+                        id: crate::services::k8s_endpoints::DiscoveredEndpoint::compute_id(
+                            "cached", "", host,
+                        ),
                         host: host.to_string(),
                         ip: ip.to_string(),
                         source: "cached".to_string(),
                         resource_name: String::new(),
+                        backend_service: None,
+                        backend_upstream: None,
                     });
                 }
             }
@@ -1333,6 +1358,52 @@ mod tests {
             trusted_cas: Vec::new(),
             local_runtime: None,
         }
+    }
+
+    #[tokio::test]
+    async fn off_mode_connect_replaces_successful_kinds_and_preserves_failed_kinds() {
+        use crate::commands::local_dns::{cached_endpoints, update_endpoint_cache};
+        use crate::services::k8s_endpoints::DiscoveryResult;
+
+        let paths = tunnel_test_paths("off-cache");
+        let profile = profile_with_hosts(vec![]);
+        let endpoint = |source: &str, host: &str| DiscoveredEndpoint {
+            id: host.into(),
+            host: host.into(),
+            ip: "192.0.2.10".into(),
+            source: source.into(),
+            resource_name: "ns/service".into(),
+            backend_service: None,
+            backend_upstream: None,
+        };
+        let old = endpoint("ingress", "old.example.test");
+        let retained = endpoint("service", "retained.example.test");
+        let fresh = endpoint("ingress", "fresh.example.test");
+        let cache = paths.endpoints_cache_file();
+        for partial in [false, true] {
+            update_endpoint_cache(&cache, &profile.id, &[old.clone(), retained.clone()], None)
+                .unwrap();
+            let discovery = DiscoveryResult {
+                endpoints: vec![fresh.clone()],
+                succeeded_kinds: if partial {
+                    vec!["ingress".into()]
+                } else {
+                    all_discovery_kinds()
+                },
+                failed_kinds: if partial {
+                    vec!["service".into()]
+                } else {
+                    vec![]
+                },
+                errors_by_kind: vec![],
+            };
+            cache_off_mode_connect_endpoints(&paths, &profile, &Ok(discovery)).await;
+            let cached = cached_endpoints(&cache, &profile.id);
+            assert!(cached.contains(&fresh));
+            assert!(!cached.contains(&old));
+            assert_eq!(cached.contains(&retained), partial);
+        }
+        std::fs::remove_dir_all(&paths.base).unwrap();
     }
 
     #[test]
