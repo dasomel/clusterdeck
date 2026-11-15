@@ -62,6 +62,14 @@ pub fn resolve_cli_path(bin: &str) -> Result<PathBuf, String> {
         }
         return Err(format!("'{bin}' executable not found"));
     }
+    // The kubeconfig-credential curl fallback exists because macOS Local Network Privacy exempts
+    // Apple's curl; a Homebrew curl earlier in SEARCH_PATHS would be blocked like kubectl is.
+    if bin == "curl" {
+        let system_curl = std::path::Path::new("/usr/bin/curl");
+        if system_curl.is_file() {
+            return Ok(system_curl.to_path_buf());
+        }
+    }
     if bin == "vmrun" {
         let mac_vmrun =
             std::path::Path::new("/Applications/VMware Fusion.app/Contents/Library/vmrun");

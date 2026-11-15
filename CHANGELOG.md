@@ -6,6 +6,10 @@ The format follows the principles of Keep a Changelog and uses semantic versioni
 
 ## [Unreleased]
 
+### Added
+
+- Reveal initial-admin login credentials on demand for discovered cluster endpoints backed by known services (`argocd-server`, `<release>-grafana` / `grafana`, `keycloak`, `harbor-core` / `harbor`, `gitea-http`, `superset`), gated by the user's own Kubernetes RBAC (`kubectl auth can-i`) with kubeconfig impersonation refused and a 60-second in-memory/clipboard lifetime (#161, [ADR-0014](docs/adr/0014-service-login-credentials.md))
+
 ## [0.7.1] - 2026-11-16
 
 ### Fixed

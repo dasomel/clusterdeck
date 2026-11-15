@@ -74,10 +74,39 @@ export type VerificationResult = {
 };
 
 export type DiscoveredEndpoint = {
+  id?: string;
   host: string;
   ip: string;
   source: string;
   resource_name: string;
+  backend_service?: string | null;
+  backend_upstream?: string | null;
+};
+
+export type LoginErrorCode =
+  | 'forbidden_caller'
+  | 'forbidden'
+  | 'not_found'
+  | 'backend_mismatch'
+  | 'unsupported_service'
+  | 'impersonation_refused'
+  | 'timeout'
+  | 'kubectl_failed';
+
+export type EndpointLoginOption = {
+  endpoint_id: string;
+  namespace: string;
+  service_name: string;
+  secret_name: string;
+};
+
+export type RevealedEndpointLogin = {
+  endpoint_id: string;
+  namespace: string;
+  service_name: string;
+  secret_name: string;
+  username: string | null;
+  password: string;
 };
 
 export type ScanEndpointsResult = {

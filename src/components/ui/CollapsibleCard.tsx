@@ -8,6 +8,7 @@ type CollapsibleCardProps = {
   /** Header controls that stay visible while the card is collapsed. */
   actions?: ReactNode;
   defaultOpen?: boolean;
+  onToggle?: (open: boolean) => void;
   style?: CSSProperties;
   children: ReactNode;
 };
@@ -41,6 +42,7 @@ export default function CollapsibleCard({
   title,
   actions,
   defaultOpen = true,
+  onToggle,
   style,
   children,
 }: CollapsibleCardProps) {
@@ -54,6 +56,7 @@ export default function CollapsibleCard({
     const next = !open;
     setOpen(next);
     writeStored(id, next);
+    onToggle?.(next);
   };
 
   return (

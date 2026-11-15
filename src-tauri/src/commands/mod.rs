@@ -1,5 +1,6 @@
 pub mod app;
 pub mod ca_trust;
+pub mod clipboard;
 pub mod connection;
 pub mod discovery;
 pub mod inventory;
@@ -7,3 +8,4 @@ pub mod kube_import;
 pub mod local_dns;
 pub mod local_runtime;
 pub mod profiles;
+pub mod service_login;

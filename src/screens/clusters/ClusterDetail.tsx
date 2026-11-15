@@ -147,6 +147,7 @@ export default function ClusterDetail({
       content: (
         <EndpointsTab
           profile={profile}
+          isVisible={isVisible && activeTab === 'endpoints'}
           lastResult={lastResult}
           hostsStatus={endpoints.hostsStatus}
           discoveringEndpoints={endpoints.discoveringEndpoints}

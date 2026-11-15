@@ -294,6 +294,7 @@ mod tests {
             ip: ip.into(),
             source: "ingress".into(),
             resource_name: "ns/app".into(),
+            ..Default::default()
         }
     }
 

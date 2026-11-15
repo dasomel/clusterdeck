@@ -299,6 +299,7 @@ mod test_support {
             ip: ip.into(),
             source: "ingress".into(),
             resource_name: "ns/app".into(),
+            ..Default::default()
         }
     }
 }
@@ -698,12 +699,14 @@ async fn concurrent_reapply_ordering_last_request_wins() {
         ip: "192.0.2.11".into(),
         source: "ingress".into(),
         resource_name: "ing1".into(),
+        ..Default::default()
     }];
     let ep2 = vec![DiscoveredEndpoint {
         host: "second.lab.example.internal".into(),
         ip: "192.0.2.22".into(),
         source: "ingress".into(),
         resource_name: "ing2".into(),
+        ..Default::default()
     }];
 
     let env1 = f.env();
@@ -935,6 +938,7 @@ async fn local_dns_to_hosts_switch() {
         ip: "192.0.2.33".into(),
         source: "ingress".into(),
         resource_name: "ing".into(),
+        ..Default::default()
     }];
     sync_local_dns_profile(&paths, &f.env(), &f.hosts, &old, Ok(ep))
         .await
@@ -1036,6 +1040,7 @@ async fn sync_racing_delete_does_not_reinsert_into_cache() {
         ip: "192.0.2.33".into(),
         source: "ingress".into(),
         resource_name: "ing".into(),
+        ..Default::default()
     }];
 
     // Profile "cka" does NOT exist in store

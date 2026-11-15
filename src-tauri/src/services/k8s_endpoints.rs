@@ -7,15 +7,70 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::services::process::CommandRunner;
-use crate::services::validate::{is_safe_gateway_address, is_safe_host_domain, is_safe_ip_address};
+use crate::services::process::{CommandLimits, CommandRunner};
+use crate::services::service_login::lookup_service_login;
+use crate::services::validate::{
+    is_safe_gateway_address, is_safe_host_domain, is_safe_ip_address, is_safe_k8s_dns_label,
+};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiscoveredEndpoint {
+    #[serde(default)]
+    pub id: String,
     pub host: String,
     pub ip: String,
     pub source: String, // "apisix", "ingress", "istio", "gateway-api", "service"
     pub resource_name: String, // e.g. "analytics/trino"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_service: Option<String>, // "<ns>/<service>", resolved Service namespace (ADR-0014 D2)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_upstream: Option<String>, // "<route namespace>/<ApisixUpstream name>"
+}
+
+impl DiscoveredEndpoint {
+    pub fn compute_id(source: &str, resource_name: &str, host: &str) -> String {
+        format!("{source}:{resource_name}:{host}")
+    }
+
+    pub fn endpoint_id(&self) -> String {
+        if self.id.is_empty() {
+            Self::compute_id(&self.source, &self.resource_name, &self.host)
+        } else {
+            self.id.clone()
+        }
+    }
+}
+
+/// Resolves the same-namespace `<ns>/<service>` backend reference for a route/ingress/service
+/// rule (ADR-0014 D2). When a single rule routes multiple paths to different Services (e.g.
+/// Harbor `/` -> `harbor-portal` and `/api/` -> `harbor-core`), prefers the unique Service that
+/// matches the D2 login registry; if two distinct D2 services appear on the same host rule,
+/// returns `None` rather than guessing.
+fn select_backend_service<S: AsRef<str>>(ns: &str, services: &[S]) -> Option<String> {
+    if !is_safe_k8s_dns_label(ns) {
+        return None;
+    }
+    let mut valid = Vec::new();
+    for svc in services {
+        let name = svc.as_ref().trim();
+        if is_safe_k8s_dns_label(name) && !valid.iter().any(|existing: &String| existing == name) {
+            valid.push(name.to_string());
+        }
+    }
+    match valid.len() {
+        0 => None,
+        1 => Some(format!("{ns}/{}", valid[0])),
+        _ => {
+            let mut login_matches = valid
+                .iter()
+                .filter(|name| lookup_service_login(name).is_some());
+            match (login_matches.next(), login_matches.next()) {
+                (Some(unique), None) => Some(format!("{ns}/{unique}")),
+                (Some(_), Some(_)) => None,
+                (None, _) => Some(format!("{ns}/{}", valid[0])),
+            }
+        }
+    }
 }
 
 pub(crate) fn decode_base64(input: &str) -> Option<Vec<u8>> {
@@ -60,6 +115,22 @@ fn stderr_says_not_found(stderr: &str) -> bool {
     stderr.contains("(NotFound)")
         || stderr.contains("the server doesn't have a resource type")
         || stderr.contains("the server could not find the requested resource")
+}
+
+/// kubectl relayed a real API server verdict on stderr, so a second transport cannot improve it.
+pub(crate) fn stderr_is_api_answer(stderr: &str) -> bool {
+    stderr_says_not_found(stderr)
+        || stderr_says_unauthorized(stderr)
+        || ["Forbidden", "forbidden"]
+            .iter()
+            .any(|w| stderr.contains(w))
+}
+
+/// A 401 reaches kubectl's stderr as either `(Unauthorized)` or, for the plain-text form,
+/// `You must be logged in to the server (the server has asked for the client to provide
+/// credentials)` -- both are the server's verdict on the credential curl would present too.
+pub(crate) fn stderr_says_unauthorized(stderr: &str) -> bool {
+    stderr.contains("Unauthorized") || stderr.contains("You must be logged in to the server")
 }
 
 pub(crate) fn is_valid_k8s_list(val: &serde_json::Value) -> bool {
@@ -191,7 +262,89 @@ pub(crate) async fn curl_k8s_api(
         .map_err(|e| format!("failed to read kubeconfig: {e}"))?;
     let value: serde_yaml::Value =
         serde_yaml::from_str(&raw).map_err(|e| format!("failed to parse kubeconfig yaml: {e}"))?;
+    let value = pin_current_context(value)?;
+    curl_k8s_api_value(runner, &value, api_path, CurlOptions::default()).await
+}
 
+/// `curl_k8s_api` with the child bounded (time and output), for large optional lookups.
+pub(crate) async fn curl_k8s_api_bounded(
+    runner: &dyn CommandRunner,
+    kubeconfig_path: &Path,
+    api_path: &str,
+    limits: CommandLimits,
+) -> Result<String, String> {
+    let raw = std::fs::read_to_string(kubeconfig_path)
+        .map_err(|e| format!("failed to read kubeconfig: {e}"))?;
+    let value: serde_yaml::Value =
+        serde_yaml::from_str(&raw).map_err(|e| format!("failed to parse kubeconfig yaml: {e}"))?;
+    let value = pin_current_context(value)?;
+    let options = CurlOptions {
+        post_json: None,
+        limits: Some(limits),
+    };
+    curl_k8s_api_value(runner, &value, api_path, options).await
+}
+
+/// Reduces a kubeconfig to the `current-context`'s cluster and user so `curl_k8s_api_value`'s
+/// first-entry lookup matches what kubectl would use. Fails closed when kubectl's choice cannot
+/// be reproduced: an unresolvable `current-context`, or no `current-context` with anything but
+/// exactly one cluster and one user, would make curl present another cluster's credential.
+fn pin_current_context(value: serde_yaml::Value) -> Result<serde_yaml::Value, String> {
+    let named = |list: &str, name: &str| {
+        value
+            .get(list)?
+            .as_sequence()?
+            .iter()
+            .find(|e| e.get("name").and_then(|n| n.as_str()) == Some(name))
+            .cloned()
+    };
+    let count = |list: &str| {
+        value
+            .get(list)
+            .and_then(|l| l.as_sequence())
+            .map_or(0, |l| l.len())
+    };
+    let Some(current) = value.get("current-context").and_then(|c| c.as_str()) else {
+        return if count("clusters") == 1 && count("users") == 1 {
+            Ok(value)
+        } else {
+            Err("kubeconfig has no current-context and is ambiguous".to_string())
+        };
+    };
+    let pinned = (|| {
+        let ctx = named("contexts", current)?;
+        let ctx = ctx.get("context")?;
+        let cluster = named("clusters", ctx.get("cluster")?.as_str()?)?;
+        let user = named("users", ctx.get("user")?.as_str()?)?;
+        let mut map = serde_yaml::Mapping::new();
+        map.insert(
+            "clusters".into(),
+            serde_yaml::Value::Sequence(vec![cluster]),
+        );
+        map.insert("users".into(), serde_yaml::Value::Sequence(vec![user]));
+        Some(serde_yaml::Value::Mapping(map))
+    })();
+    pinned.ok_or_else(|| "kubeconfig current-context cannot be resolved".to_string())
+}
+
+/// Extras for `curl_k8s_api_value`. Defaults reproduce the legacy unbounded GET.
+#[derive(Clone, Default)]
+pub(crate) struct CurlOptions<'a> {
+    /// A JSON body switches the request to POST (SelfSubjectAccessReview; no secret inside).
+    pub post_json: Option<&'a str>,
+    /// Bounds the child (time and output); callers whose response can carry secret data set it.
+    pub limits: Option<CommandLimits>,
+}
+
+/// `curl_k8s_api` on an already-parsed kubeconfig, which must hold exactly the cluster and
+/// user to use as the first entries of `clusters`/`users` (callers pinning a context pass a
+/// minified copy so the first entry is the pinned one).
+pub(crate) async fn curl_k8s_api_value(
+    runner: &dyn CommandRunner,
+    value: &serde_yaml::Value,
+    api_path: &str,
+    options: CurlOptions<'_>,
+) -> Result<String, String> {
     let server_url = match value
         .get("clusters")
         .and_then(|c| c.get(0))
@@ -216,6 +369,9 @@ pub(crate) async fn curl_k8s_api(
         .and_then(|v| v.as_str());
     let token = user_obj
         .and_then(|u| u.get("token"))
+        .and_then(|v| v.as_str());
+    let token_file = user_obj
+        .and_then(|u| u.get("tokenFile"))
         .and_then(|v| v.as_str());
 
     let cert_path = user_obj
@@ -267,11 +423,16 @@ pub(crate) async fn curl_k8s_api(
         .unwrap_or_default()
         .as_nanos();
     let seq = TEMP_FILE_SEQ.fetch_add(1, Ordering::Relaxed);
-    let temp_cert = std::env::temp_dir().join(format!("cd_tmp_cert_{now_nanos}_{seq}.crt"));
-    let temp_key = std::env::temp_dir().join(format!("cd_tmp_key_{now_nanos}_{seq}.key"));
-    let temp_ca = std::env::temp_dir().join(format!("cd_tmp_ca_{now_nanos}_{seq}.crt"));
+    let temp = |prefix: &str, ext: &str| {
+        std::env::temp_dir().join(format!("cd_tmp_{prefix}_{now_nanos}_{seq}.{ext}"))
+    };
+    // Dropped on every return path, so a failed write never leaves credentials behind.
+    let mut temp_files = TempFiles(Vec::new());
 
+    // `-q` must be the first argument: it keeps a user's ~/.curlrc (insecure, trace, extra
+    // headers) from altering a request that carries cluster credentials.
     let mut curl_args = vec![
+        "-q".to_string(),
         "-s".to_string(),
         "--connect-timeout".to_string(),
         "5".to_string(),
@@ -283,40 +444,61 @@ pub(crate) async fn curl_k8s_api(
     // the same LAN as these frequently-local clusters) intercept this call, harvest the client
     // cert/bearer token sent below, and return spoofed cluster data -- this fallback is reachable
     // whenever kubectl fails or is absent (e.g. macOS Sequoia Local Network Privacy), not a rare
-    // path. If the kubeconfig has no CA data at all, fall back to curl's system trust store
-    // (still no `-k`) rather than disabling verification -- a cluster with a real self-signed CA
-    // and no CA data on file should fail closed, not connect insecurely.
+    // path. A kubeconfig CA that cannot be decoded/written fails closed: silently falling back
+    // to the system trust store would validate against a different root set than kubectl does.
+    // Only a kubeconfig with no CA at all uses the system store (still no `-k`).
     if let Some(data) = ca_data {
-        if let Some(bytes) = decode_base64(data) {
-            if write_owner_only_file(&temp_ca, &bytes).is_ok() {
-                curl_args.push("--cacert".to_string());
-                curl_args.push(temp_ca.to_string_lossy().to_string());
-            }
-        }
+        let bytes = decode_base64(data).ok_or("kubeconfig CA data is not valid base64")?;
+        let path = temp("ca", "crt");
+        temp_files.0.push(path.clone());
+        write_owner_only_file(&path, &bytes)
+            .map_err(|e| format!("failed to stage kubeconfig CA: {e}"))?;
+        curl_args.push("--cacert".to_string());
+        curl_args.push(path.to_string_lossy().to_string());
     } else if let Some(path) = ca_path {
         curl_args.push("--cacert".to_string());
         curl_args.push(path.to_string());
     }
 
     if let (Some(c_data), Some(k_data)) = (cert_data, key_data) {
-        if let (Some(c_bytes), Some(k_bytes)) = (decode_base64(c_data), decode_base64(k_data)) {
-            if write_owner_only_file(&temp_cert, &c_bytes).is_ok()
-                && write_owner_only_file(&temp_key, &k_bytes).is_ok()
-            {
-                curl_args.push("--cert".to_string());
-                curl_args.push(temp_cert.to_string_lossy().to_string());
-                curl_args.push("--key".to_string());
-                curl_args.push(temp_key.to_string_lossy().to_string());
-            }
-        }
+        let (c_bytes, k_bytes) = decode_base64(c_data)
+            .zip(decode_base64(k_data))
+            .ok_or("kubeconfig client certificate/key is not valid base64")?;
+        let (cert, key) = (temp("cert", "crt"), temp("key", "key"));
+        temp_files.0.extend([cert.clone(), key.clone()]);
+        write_owner_only_file(&cert, &c_bytes)
+            .and_then(|()| write_owner_only_file(&key, &k_bytes))
+            .map_err(|e| format!("failed to stage kubeconfig client credentials: {e}"))?;
+        curl_args.push("--cert".to_string());
+        curl_args.push(cert.to_string_lossy().to_string());
+        curl_args.push("--key".to_string());
+        curl_args.push(key.to_string_lossy().to_string());
     } else if let (Some(c_path), Some(k_path)) = (cert_path, key_path) {
         curl_args.push("--cert".to_string());
         curl_args.push(c_path.to_string());
         curl_args.push("--key".to_string());
         curl_args.push(k_path.to_string());
-    } else if let Some(t) = token {
-        curl_args.push("-H".to_string());
-        curl_args.push(format!("Authorization: Bearer {t}"));
+    } else {
+        // tokenFile wins over an inline token, as in client-go, so curl and kubectl present the
+        // same identity.
+        let file_token = match token_file {
+            Some(path) => Some(
+                std::fs::read_to_string(path)
+                    .map_err(|e| format!("failed to read kubeconfig tokenFile: {e}"))?
+                    .trim()
+                    .to_string(),
+            ),
+            None => None,
+        };
+        if let Some(t) = file_token.as_deref().or(token) {
+            // A header file keeps the bearer token out of argv (visible to `ps`).
+            let path = temp("hdr", "txt");
+            temp_files.0.push(path.clone());
+            write_owner_only_file(&path, format!("Authorization: Bearer {t}\n").as_bytes())
+                .map_err(|e| format!("failed to stage authorization header: {e}"))?;
+            curl_args.push("-H".to_string());
+            curl_args.push(format!("@{}", path.to_string_lossy()));
+        }
     }
 
     if let Some(mapping) = connect_to {
@@ -324,14 +506,21 @@ pub(crate) async fn curl_k8s_api(
         curl_args.push(mapping);
     }
 
+    if let Some(body) = options.post_json {
+        curl_args.extend(
+            ["-X", "POST", "-H", "Content-Type: application/json", "-d"].map(str::to_string),
+        );
+        curl_args.push(body.to_string());
+    }
+
     curl_args.push(target_url);
 
-    let res = runner.run("curl", &curl_args).await;
+    let res = match options.limits.clone() {
+        Some(limits) => runner.run_bounded("curl", &curl_args, limits).await,
+        None => runner.run("curl", &curl_args).await,
+    };
 
-    // Unconditional: a failed key write must not leave the cert/key/CA (or a partial one) behind.
-    let _ = std::fs::remove_file(&temp_cert);
-    let _ = std::fs::remove_file(&temp_key);
-    let _ = std::fs::remove_file(&temp_ca);
+    drop(temp_files);
 
     let output = res.map_err(|e| format!("curl execution failed: {e}"))?;
     if !output.success {
@@ -344,6 +533,17 @@ pub(crate) async fn curl_k8s_api(
     }
 
     Ok(output.stdout)
+}
+
+/// Owner-only temp files holding credential material, removed when dropped.
+struct TempFiles(Vec<std::path::PathBuf>);
+
+impl Drop for TempFiles {
+    fn drop(&mut self) {
+        for path in &self.0 {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 pub struct ServiceDiscoveryInfo {
@@ -399,14 +599,24 @@ pub fn parse_services(val: &serde_json::Value) -> ServiceDiscoveryInfo {
                                         .get("external-dns.alpha.kubernetes.io/hostname")
                                         .and_then(|h| h.as_str())
                                     {
+                                        let resource_name = format!("{ns}/{name}");
+                                        let backend_service = select_backend_service(ns, &[name]);
                                         for h in hostname.split(',') {
                                             let trimmed = h.trim();
                                             if is_safe_host_domain(trimmed) {
+                                                let host = trimmed.to_string();
                                                 endpoints.push(DiscoveredEndpoint {
-                                                    host: trimmed.to_string(),
+                                                    id: DiscoveredEndpoint::compute_id(
+                                                        "service",
+                                                        &resource_name,
+                                                        &host,
+                                                    ),
+                                                    host,
                                                     ip: ip.to_string(),
                                                     source: "service".to_string(),
-                                                    resource_name: format!("{ns}/{name}"),
+                                                    resource_name: resource_name.clone(),
+                                                    backend_service: backend_service.clone(),
+                                                    backend_upstream: None,
                                                 });
                                             }
                                         }
@@ -476,6 +686,11 @@ pub fn parse_ingresses(
             _ => continue,
         };
 
+        let default_backend_svc = item
+            .get("spec")
+            .and_then(|s| s.get("defaultBackend").or_else(|| s.get("backend")))
+            .and_then(extract_ingress_backend_service_name);
+
         if let Some(rules) = item
             .get("spec")
             .and_then(|s| s.get("rules"))
@@ -484,11 +699,34 @@ pub fn parse_ingresses(
             for rule in rules {
                 if let Some(host) = rule.get("host").and_then(|h| h.as_str()) {
                     if is_safe_host_domain(host) {
+                        let mut rule_services: Vec<&str> = Vec::new();
+                        if let Some(paths) = rule
+                            .get("http")
+                            .and_then(|h| h.get("paths"))
+                            .and_then(|p| p.as_array())
+                        {
+                            for path_item in paths {
+                                if let Some(svc_name) = path_item
+                                    .get("backend")
+                                    .and_then(extract_ingress_backend_service_name)
+                                {
+                                    rule_services.push(svc_name);
+                                }
+                            }
+                        }
+                        if rule_services.is_empty() {
+                            if let Some(def_svc) = default_backend_svc {
+                                rule_services.push(def_svc);
+                            }
+                        }
                         endpoints.push(DiscoveredEndpoint {
+                            id: DiscoveredEndpoint::compute_id("ingress", &resource_name, host),
                             host: host.to_string(),
                             ip: chosen_ip.clone(),
                             source: "ingress".to_string(),
                             resource_name: resource_name.clone(),
+                            backend_service: select_backend_service(ns, &rule_services),
+                            backend_upstream: None,
                         });
                     }
                 }
@@ -499,8 +737,100 @@ pub fn parse_ingresses(
     endpoints
 }
 
+fn extract_ingress_backend_service_name(backend: &serde_json::Value) -> Option<&str> {
+    backend
+        .get("service")
+        .and_then(|s| s.get("name"))
+        .and_then(|n| n.as_str())
+        .or_else(|| backend.get("serviceName").and_then(|n| n.as_str()))
+}
+
+fn extract_apisix_rule_services(rule: &serde_json::Value) -> Vec<String> {
+    let mut svcs = Vec::new();
+    if let Some(backends) = rule.get("backends").and_then(|b| b.as_array()) {
+        for b in backends {
+            if let Some(name) = b.get("serviceName").and_then(|n| n.as_str()) {
+                svcs.push(name.to_string());
+            }
+        }
+    }
+    if let Some(name) = rule
+        .get("backend")
+        .and_then(|b| b.get("serviceName"))
+        .and_then(|n| n.as_str())
+    {
+        svcs.push(name.to_string());
+    }
+    svcs
+}
+
+// D2 (2026-11-16): the Secret belongs to the Service traffic reaches, even across
+// namespaces. Only exact in-cluster Service DNS proves that binding; accepting arbitrary
+// domains would guess a Secret. Cost: custom DNS suffixes get no login; escape: amend D2.
+pub(crate) fn apisix_upstream_service(upstream: &serde_json::Value) -> Option<String> {
+    let nodes = upstream.get("spec")?.get("externalNodes")?.as_array()?;
+    let mut target = None;
+    for node in nodes {
+        if node.get("type")?.as_str()? != "Domain" {
+            return None;
+        }
+        let labels: Vec<_> = node.get("name")?.as_str()?.split('.').collect();
+        match labels.as_slice() {
+            [svc, ns, "svc"] | [svc, ns, "svc", "cluster", "local"]
+                if is_safe_k8s_dns_label(svc) && is_safe_k8s_dns_label(ns) =>
+            {
+                let service = format!("{ns}/{svc}");
+                if target.as_ref().is_some_and(|old| old != &service) {
+                    return None;
+                }
+                target = Some(service);
+            }
+            _ => return None,
+        }
+    }
+    target
+}
+
+type ApisixBackend = (String, Option<String>);
+
+fn apisix_rule_backend(
+    rule: &serde_json::Value,
+    ns: &str,
+    upstreams: &serde_json::Value,
+) -> Option<ApisixBackend> {
+    let mut targets = Vec::new();
+    let mut upstream_ref = None;
+    if let Some(service) = select_backend_service(ns, &extract_apisix_rule_services(rule)) {
+        targets.push(service);
+    }
+    if let Some(refs) = rule.get("upstreams") {
+        for reference in refs.as_array()? {
+            let name = reference.get("name")?.as_str()?;
+            if !is_safe_k8s_dns_label(ns) || !is_safe_k8s_dns_label(name) {
+                return None;
+            }
+            let upstream = upstreams.get("items")?.as_array()?.iter().find(|item| {
+                item["metadata"]["namespace"].as_str() == Some(ns)
+                    && item["metadata"]["name"].as_str() == Some(name)
+            })?;
+            let reference = format!("{ns}/{name}");
+            if upstream_ref.as_ref().is_some_and(|old| old != &reference) {
+                return None;
+            }
+            upstream_ref = Some(reference);
+            targets.push(apisix_upstream_service(upstream)?);
+        }
+    }
+    let first = targets.first()?;
+    targets
+        .iter()
+        .all(|t| t == first)
+        .then(|| (first.clone(), upstream_ref))
+}
+
 pub fn parse_apisix_routes(
     val: &serde_json::Value,
+    upstreams: &serde_json::Value,
     service_ips: &HashMap<String, String>,
     fallback_ip: Option<&str>,
 ) -> Vec<DiscoveredEndpoint> {
@@ -538,47 +868,27 @@ pub fn parse_apisix_routes(
             .unwrap_or_default();
         let resource_name = format!("{ns}/{name}");
 
-        let mut hosts = Vec::new();
+        let mut hosts: Vec<(String, Vec<Option<ApisixBackend>>)> = Vec::new();
 
         if let Some(spec) = item.get("spec") {
-            // Check http rules
-            if let Some(http_rules) = spec.get("http").and_then(|h| h.as_array()) {
-                for rule in http_rules {
-                    if let Some(match_obj) = rule.get("match") {
-                        if let Some(h_list) = match_obj.get("hosts").and_then(|h| h.as_array()) {
+            for section in ["http", "stream", "tcp"] {
+                if let Some(rules) = spec.get(section).and_then(|r| r.as_array()) {
+                    for rule in rules {
+                        let rule_svcs = vec![apisix_rule_backend(rule, ns, upstreams)];
+                        if let Some(h_list) = rule
+                            .get("match")
+                            .and_then(|m| m.get("hosts"))
+                            .and_then(|h| h.as_array())
+                        {
                             for h in h_list {
                                 if let Some(host_str) = h.as_str() {
-                                    hosts.push(host_str.to_string());
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Check stream rules
-            if let Some(stream_rules) = spec.get("stream").and_then(|s| s.as_array()) {
-                for rule in stream_rules {
-                    if let Some(match_obj) = rule.get("match") {
-                        if let Some(h_list) = match_obj.get("hosts").and_then(|h| h.as_array()) {
-                            for h in h_list {
-                                if let Some(host_str) = h.as_str() {
-                                    hosts.push(host_str.to_string());
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Check tcp rules
-            if let Some(tcp_rules) = spec.get("tcp").and_then(|t| t.as_array()) {
-                for rule in tcp_rules {
-                    if let Some(match_obj) = rule.get("match") {
-                        if let Some(h_list) = match_obj.get("hosts").and_then(|h| h.as_array()) {
-                            for h in h_list {
-                                if let Some(host_str) = h.as_str() {
-                                    hosts.push(host_str.to_string());
+                                    if let Some((_, existing_svcs)) =
+                                        hosts.iter_mut().find(|(eh, _)| eh == host_str)
+                                    {
+                                        existing_svcs.extend(rule_svcs.clone());
+                                    } else {
+                                        hosts.push((host_str.to_string(), rule_svcs.clone()));
+                                    }
                                 }
                             }
                         }
@@ -587,13 +897,52 @@ pub fn parse_apisix_routes(
             }
         }
 
-        for host in hosts {
+        for (host, host_svcs) in hosts {
             if is_safe_host_domain(&host) {
+                let backend_service = host_svcs
+                    .iter()
+                    .map(|binding| binding.as_ref().map(|(service, _)| service.clone()))
+                    .collect::<Option<Vec<_>>>()
+                    .and_then(|mut targets| {
+                        targets.dedup();
+                        match targets.as_slice() {
+                            [] => None,
+                            [only] => Some(only.clone()),
+                            _ => {
+                                // Preserve namespace-local multi-path selection (e.g. Harbor
+                                // portal/core); cross-namespace targets must be unambiguous.
+                                let names: Option<Vec<_>> = targets
+                                    .iter()
+                                    .map(|t| t.strip_prefix(&format!("{ns}/")))
+                                    .collect();
+                                select_backend_service(ns, &names?)
+                            }
+                        }
+                    });
+                let mut refs = host_svcs
+                    .iter()
+                    .flatten()
+                    .filter(|(service, _)| Some(service) == backend_service.as_ref())
+                    .filter_map(|(_, reference)| reference.clone())
+                    .collect::<Vec<_>>();
+                refs.sort();
+                refs.dedup();
+                // D2: one live upstream read proves the cached binding. Cost: ambiguous
+                // upstream aliases get no login; escape: rescan with one upstream per backend.
+                let backend_service = if refs.len() > 1 {
+                    None
+                } else {
+                    backend_service
+                };
+                let backend_upstream = refs.pop();
                 endpoints.push(DiscoveredEndpoint {
+                    id: DiscoveredEndpoint::compute_id("apisix", &resource_name, &host),
                     host,
                     ip: chosen_ip.to_string(),
                     source: "apisix".to_string(),
                     resource_name: resource_name.clone(),
+                    backend_service,
+                    backend_upstream,
                 });
             }
         }
@@ -649,10 +998,13 @@ pub fn parse_istio_virtual_services(
                     // Filter out wildcard and cluster-internal single labels (e.g. "my-svc")
                     if host_str.contains('.') && is_safe_host_domain(host_str) {
                         endpoints.push(DiscoveredEndpoint {
+                            id: DiscoveredEndpoint::compute_id("istio", &resource_name, host_str),
                             host: host_str.to_string(),
                             ip: chosen_ip.to_string(),
                             source: "istio".to_string(),
                             resource_name: resource_name.clone(),
+                            backend_service: None,
+                            backend_upstream: None,
                         });
                     }
                 }
@@ -693,6 +1045,8 @@ pub fn parse_gateway_httproutes(
             .unwrap_or_default();
         let resource_name = format!("{ns}/{name}");
 
+        let backend_service = extract_gateway_httproute_backend_service(item.get("spec"), ns);
+
         if let Some(hostnames) = item
             .get("spec")
             .and_then(|s| s.get("hostnames"))
@@ -702,10 +1056,17 @@ pub fn parse_gateway_httproutes(
                 if let Some(host_str) = h.as_str() {
                     if is_safe_host_domain(host_str) {
                         endpoints.push(DiscoveredEndpoint {
+                            id: DiscoveredEndpoint::compute_id(
+                                "gateway-api",
+                                &resource_name,
+                                host_str,
+                            ),
                             host: host_str.to_string(),
                             ip: chosen_ip.to_string(),
                             source: "gateway-api".to_string(),
                             resource_name: resource_name.clone(),
+                            backend_service: backend_service.clone(),
+                            backend_upstream: None,
                         });
                     }
                 }
@@ -714,6 +1075,40 @@ pub fn parse_gateway_httproutes(
     }
 
     endpoints
+}
+
+fn extract_gateway_httproute_backend_service(
+    spec: Option<&serde_json::Value>,
+    route_ns: &str,
+) -> Option<String> {
+    let rules = spec?.get("rules")?.as_array()?;
+    let mut svcs = Vec::new();
+    for rule in rules {
+        let Some(backend_refs) = rule.get("backendRefs").and_then(|b| b.as_array()) else {
+            continue;
+        };
+        for bref in backend_refs {
+            // D2/D5 same-namespace rule: ignore cross-namespace backendRefs so a tenant route
+            // cannot reference another namespace's Service/Secret.
+            if let Some(ref_ns) = bref.get("namespace").and_then(|n| n.as_str()) {
+                if !ref_ns.is_empty() && ref_ns != route_ns {
+                    continue;
+                }
+            }
+            let kind = bref
+                .get("kind")
+                .and_then(|k| k.as_str())
+                .unwrap_or("Service");
+            let group = bref.get("group").and_then(|g| g.as_str()).unwrap_or("");
+            if kind != "Service" || (!group.is_empty() && group != "core") {
+                continue;
+            }
+            if let Some(svc_name) = bref.get("name").and_then(|n| n.as_str()) {
+                svcs.push(svc_name.to_string());
+            }
+        }
+    }
+    select_backend_service(route_ns, &svcs)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -849,11 +1244,86 @@ pub async fn discover_cluster_endpoints_detailed(
         )
         .await;
         match reliable_targets(res) {
-            Ok(Some(apisix_val)) if is_valid_k8s_list(&apisix_val) => (
-                Some("apisix".to_string()),
-                None,
-                parse_apisix_routes(&apisix_val, &svc_info.service_ips, effective_fallback_ip),
-            ),
+            Ok(Some(apisix_val)) if is_valid_k8s_list(&apisix_val) => {
+                // Fetch once only when a route references an ApisixUpstream. A failed
+                // optional lookup removes login bindings, never the discovered endpoints.
+                let needs_upstreams = apisix_val["items"].as_array().unwrap().iter().any(|item| {
+                    ["http", "stream", "tcp"].iter().any(|section| {
+                        item["spec"][section].as_array().is_some_and(|rules| {
+                            rules.iter().any(|rule| rule.get("upstreams").is_some())
+                        })
+                    })
+                });
+                let mut upstreams = serde_json::json!({"items": []});
+                let mut failure = None;
+                if needs_upstreams {
+                    let args = vec![
+                        "--kubeconfig".to_string(),
+                        kubeconfig_path.to_string_lossy().to_string(),
+                        "get".to_string(),
+                        "--raw".to_string(),
+                        "/apis/apisix.apache.org/v2/apisixupstreams".to_string(),
+                    ];
+                    let limits = CommandLimits {
+                        timeout: std::time::Duration::from_secs(10),
+                        max_output_bytes: 2 * 1024 * 1024,
+                    };
+                    let mut result = runner.run_bounded("kubectl", &args, limits.clone()).await;
+                    // macOS Local Network Privacy blocks kubectl inside the app bundle while
+                    // system curl is exempt (same fallback as query_k8s_api_json).
+                    // An API answer relayed on stderr (Forbidden, NotFound, Unauthorized) is
+                    // authoritative; only transport failures are retried.
+                    let transport_failure = match &result {
+                        Ok(output) => !output.success && !stderr_is_api_answer(&output.stderr),
+                        Err(_) => true,
+                    };
+                    if transport_failure {
+                        result = curl_k8s_api_bounded(
+                            runner,
+                            kubeconfig_path,
+                            "/apis/apisix.apache.org/v2/apisixupstreams",
+                            limits,
+                        )
+                        .await
+                        .map(|stdout| {
+                            crate::services::process::CommandOutput {
+                                stdout,
+                                stderr: String::new(),
+                                success: true,
+                            }
+                        });
+                    }
+                    match result {
+                        Ok(output) if output.success => {
+                            match serde_json::from_str::<serde_json::Value>(&output.stdout) {
+                                Ok(value) if is_valid_k8s_list(&value) => upstreams = value,
+                                _ => {
+                                    failure = Some((
+                                        "apisix".to_string(),
+                                        "malformed ApisixUpstream list".to_string(),
+                                    ))
+                                }
+                            }
+                        }
+                        _ => {
+                            failure = Some((
+                                "apisix".to_string(),
+                                "ApisixUpstream lookup failed".to_string(),
+                            ))
+                        }
+                    }
+                }
+                (
+                    Some("apisix".to_string()),
+                    failure,
+                    parse_apisix_routes(
+                        &apisix_val,
+                        &upstreams,
+                        &svc_info.service_ips,
+                        effective_fallback_ip,
+                    ),
+                )
+            }
             Ok(Some(_)) => (
                 None,
                 Some((
@@ -1121,7 +1591,8 @@ mod tests {
             "192.168.77.200".into(),
         );
 
-        let endpoints = parse_apisix_routes(&val, &svc_ips, None);
+        let endpoints =
+            parse_apisix_routes(&val, &serde_json::json!({"items": []}), &svc_ips, None);
         assert_eq!(endpoints.len(), 2);
         assert_eq!(endpoints[0].host, "trino.local.beluga.internal");
         assert_eq!(endpoints[0].ip, "192.168.77.200");
@@ -1284,6 +1755,44 @@ mod tests {
                 success: true,
             })
         }
+    }
+
+    #[tokio::test]
+    async fn curl_k8s_api_fails_closed_on_undecodable_ca_and_runs_without_rc_or_argv_token() {
+        let dir = std::env::temp_dir();
+        let write = |name: &str, body: &str| {
+            let p = dir.join(format!("{name}-{}.yaml", std::process::id()));
+            std::fs::write(&p, body).unwrap();
+            p
+        };
+        let bad_ca = write(
+            "cd-test-bad-ca",
+            "clusters:\n- cluster: {server: 'https://192.0.2.50:6443', certificate-authority-data: '!!notbase64!!'}\nusers:\n- user: {token: secret-tok}\n",
+        );
+        let runner = ArgCapturingRunner {
+            captured_args: std::sync::Mutex::new(None),
+        };
+        let err = curl_k8s_api(&runner, &bad_ca, "/api").await.unwrap_err();
+        assert!(err.contains("CA"), "{err}");
+        assert!(
+            runner.captured_args.lock().unwrap().is_none(),
+            "curl must not run"
+        );
+
+        let ok = write(
+            "cd-test-q",
+            "current-context: b\ncontexts:\n- name: a\n  context: {cluster: ca, user: ua}\n- name: b\n  context: {cluster: cb, user: ub}\nclusters:\n- name: ca\n  cluster: {server: 'https://192.0.2.1:6443'}\n- name: cb\n  cluster: {server: 'https://192.0.2.2:6443'}\nusers:\n- name: ua\n  user: {token: tok-a}\n- name: ub\n  user: {token: tok-b}\n",
+        );
+        curl_k8s_api(&runner, &ok, "/api").await.unwrap();
+        let args = runner.captured_args.lock().unwrap().clone().unwrap();
+        assert_eq!(args[0], "-q");
+        assert!(
+            !args.join(" ").contains("tok-"),
+            "token must stay out of argv"
+        );
+        assert_eq!(args.last().unwrap(), "https://192.0.2.2:6443/api");
+        let _ = std::fs::remove_file(bad_ca);
+        let _ = std::fs::remove_file(ok);
     }
 
     #[tokio::test]
@@ -1617,5 +2126,433 @@ mod tests {
         let eps = discover_with_gateway(Some("203.0.113.10\nevil")).await;
         assert!(eps.iter().all(|e| e.ip != "203.0.113.10\nevil"));
         assert!(eps.iter().any(|e| e.ip == "192.0.2.200"));
+    }
+
+    #[test]
+    fn parsers_extract_backend_service_and_ignore_cross_namespace_gateway_refs() {
+        let svc_val: serde_json::Value = serde_json::from_str(
+            r#"{
+                "items": [{
+                    "metadata": {
+                        "name": "argocd-server",
+                        "namespace": "argocd",
+                        "annotations": { "external-dns.alpha.kubernetes.io/hostname": "argocd.local.internal" }
+                    },
+                    "spec": { "type": "LoadBalancer" },
+                    "status": { "loadBalancer": { "ingress": [{ "ip": "192.0.2.10" }] } }
+                }]
+            }"#,
+        )
+        .unwrap();
+        let svc_eps = parse_services(&svc_val).endpoints;
+        assert_eq!(svc_eps.len(), 1);
+        assert_eq!(
+            svc_eps[0].backend_service.as_deref(),
+            Some("argocd/argocd-server")
+        );
+        assert_eq!(
+            svc_eps[0].id,
+            "service:argocd/argocd-server:argocd.local.internal"
+        );
+
+        let ing_val: serde_json::Value = serde_json::from_str(
+            r#"{
+                "items": [{
+                    "metadata": { "name": "harbor-ingress", "namespace": "harbor" },
+                    "spec": {
+                        "rules": [{
+                            "host": "harbor.local.internal",
+                            "http": {
+                                "paths": [
+                                    { "path": "/", "backend": { "service": { "name": "harbor-portal" } } },
+                                    { "path": "/api/", "backend": { "service": { "name": "harbor-core" } } }
+                                ]
+                            }
+                        }]
+                    }
+                }]
+            }"#,
+        )
+        .unwrap();
+        let ing_eps = parse_ingresses(&ing_val, Some("192.0.2.10"));
+        assert_eq!(ing_eps.len(), 1);
+        assert_eq!(
+            ing_eps[0].backend_service.as_deref(),
+            Some("harbor/harbor-core")
+        );
+
+        let apisix_val: serde_json::Value = serde_json::from_str(
+            r#"{
+                "items": [{
+                    "metadata": { "name": "grafana-route", "namespace": "monitoring" },
+                    "spec": {
+                        "http": [{
+                            "match": { "hosts": ["grafana.local.internal"] },
+                            "backends": [{ "serviceName": "kube-prom-grafana" }]
+                        }]
+                    }
+                }]
+            }"#,
+        )
+        .unwrap();
+        let apisix_eps = parse_apisix_routes(
+            &apisix_val,
+            &serde_json::json!({"items": []}),
+            &HashMap::new(),
+            Some("192.0.2.10"),
+        );
+        assert_eq!(apisix_eps.len(), 1);
+        assert_eq!(
+            apisix_eps[0].backend_service.as_deref(),
+            Some("monitoring/kube-prom-grafana")
+        );
+
+        let gw_val: serde_json::Value = serde_json::from_str(
+            r#"{
+                "items": [
+                    {
+                        "metadata": { "name": "kc-route", "namespace": "iam" },
+                        "spec": {
+                            "hostnames": ["keycloak.local.internal"],
+                            "rules": [{ "backendRefs": [{ "name": "keycloak" }] }]
+                        }
+                    },
+                    {
+                        "metadata": { "name": "cross-ns-route", "namespace": "tenant" },
+                        "spec": {
+                            "hostnames": ["spoof.local.internal"],
+                            "rules": [{ "backendRefs": [{ "name": "argocd-server", "namespace": "argocd" }] }]
+                        }
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+        let gw_eps = parse_gateway_httproutes(&gw_val, Some("192.0.2.10"));
+        assert_eq!(gw_eps.len(), 2);
+        assert_eq!(gw_eps[0].backend_service.as_deref(), Some("iam/keycloak"));
+        assert_eq!(gw_eps[1].backend_service, None);
+
+        // Legacy endpoints.json entry without `id` or `backend_service` deserializes cleanly.
+        let legacy: DiscoveredEndpoint = serde_json::from_str(
+            r#"{"host":"old.local.internal","ip":"192.0.2.10","source":"ingress","resource_name":"ns/ing"}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.backend_service, None);
+        assert_eq!(legacy.backend_upstream, None);
+        assert_eq!(legacy.endpoint_id(), "ingress:ns/ing:old.local.internal");
+    }
+    #[test]
+    fn apisix_upstream_external_nodes_require_exact_service_dns() {
+        use serde_json::json;
+        for name in [
+            "argocd-server.argocd.svc",
+            "argocd-server.argocd.svc.cluster.local",
+        ] {
+            assert_eq!(
+                apisix_upstream_service(&json!({"spec": {"externalNodes": [
+                    {"type": "Domain", "name": name, "port": 80}
+                ]}}))
+                .as_deref(),
+                Some("argocd/argocd-server")
+            );
+        }
+        let invalid = [
+            json!([]),
+            json!([{"type": "IP", "name": "192.0.2.1"}]),
+            json!([{"type": "Domain", "name": "argocd-server.argocd.svc.evil.com"}]),
+            json!([{"type": "Domain", "name": "argocd-server.argocd.svc"},
+                {"type": "Domain", "name": "grafana.monitoring.svc"}]),
+            json!([{"type": "Domain", "name": "argocd-server.argocd.svc"},
+                {"type": "IP", "name": "192.0.2.1"}]),
+            json!([{"type": "Domain", "name": "Argo.argocd.svc"}]),
+            json!([{"type": "Domain", "name": "argo.bad_ns.svc"}]),
+            json!([{"type": "Domain", "name": "-argo.argocd.svc"}]),
+            json!([{"type": "Domain", "name": "argo.argocd.svc.cluster.local."}]),
+            json!([{"type": "Domain", "name": "192.0.2.1"}]),
+            json!([{"type": "Domain", "name": format!("{}.argocd.svc", "a".repeat(64))}]),
+        ];
+        for nodes in invalid {
+            assert_eq!(
+                apisix_upstream_service(&json!({"spec": {"externalNodes": nodes}})),
+                None
+            );
+        }
+        let node = json!({"type": "Domain", "name": "argocd-server.argocd.svc"});
+        assert_eq!(
+            apisix_upstream_service(&json!({"spec": {"externalNodes": [node, node]}})).as_deref(),
+            Some("argocd/argocd-server")
+        );
+    }
+
+    #[test]
+    fn apisix_service_name_multi_path_keeps_namespace_local_registry_selection() {
+        let routes = serde_json::json!({"items": [{
+            "metadata": {"namespace": "devtools", "name": "registry"},
+            "spec": {"http": [
+                {"match": {"hosts": ["registry.example.test"]}, "backends": [{"serviceName": "harbor-portal"}]},
+                {"match": {"hosts": ["registry.example.test"]}, "backends": [{"serviceName": "harbor-core"}]}
+            ]}
+        }]});
+        let eps = parse_apisix_routes(
+            &routes,
+            &serde_json::json!({"items": []}),
+            &HashMap::new(),
+            Some("192.0.2.10"),
+        );
+        assert_eq!(
+            eps[0].backend_service.as_deref(),
+            Some("devtools/harbor-core")
+        );
+    }
+
+    struct UpstreamRunner {
+        upstream_namespace: &'static str,
+        fail: bool,
+        calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl CommandRunner for UpstreamRunner {
+        async fn run(
+            &self,
+            bin: &str,
+            args: &[String],
+        ) -> Result<crate::services::process::CommandOutput, String> {
+            assert_eq!(bin, "kubectl");
+            let path = args.last().unwrap();
+            self.calls.lock().unwrap().push(path.clone());
+            let val = match path.as_str() {
+                "/apis/apisix.apache.org/v2/apisixroutes" => serde_json::json!({"items": [{
+                    "metadata": {"namespace": "platform-system", "name": "admin-route"},
+                    "spec": {"http": [{"match": {"hosts": ["admin.example.test"]},
+                        "upstreams": [{"name": "admin-upstream"}]}]}
+                }]}),
+                "/apis/apisix.apache.org/v2/apisixupstreams" => {
+                    if self.fail {
+                        return Err("lookup unavailable".into());
+                    }
+                    serde_json::json!({"items": [{
+                        "metadata": {"namespace": self.upstream_namespace, "name": "admin-upstream"},
+                        "spec": {"externalNodes": [{"type": "Domain", "name": "argocd-server.argocd.svc.cluster.local", "port": 80}]}
+                    }]})
+                }
+                _ => serde_json::json!({"items": []}),
+            };
+            Ok(crate::services::process::CommandOutput {
+                stdout: val.to_string(),
+                stderr: String::new(),
+                success: true,
+            })
+        }
+
+        async fn run_bounded(
+            &self,
+            bin: &str,
+            args: &[String],
+            limits: CommandLimits,
+        ) -> Result<crate::services::process::CommandOutput, String> {
+            assert_eq!(limits.timeout, std::time::Duration::from_secs(10));
+            assert_eq!(limits.max_output_bytes, 2 * 1024 * 1024);
+            self.run(bin, args).await
+        }
+    }
+
+    #[tokio::test]
+    async fn discovery_apisix_upstream_binds_login_to_service_namespace() {
+        for (namespace, fail, resolves) in [
+            ("platform-system", false, true),
+            ("other", false, false),
+            ("platform-system", true, false),
+        ] {
+            let runner = UpstreamRunner {
+                upstream_namespace: namespace,
+                fail,
+                calls: Default::default(),
+            };
+            let result = discover_cluster_endpoints_detailed(
+                &runner,
+                Path::new("unused-fixture"),
+                Some("192.0.2.10"),
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.endpoints.len(), 1);
+            let ep = &result.endpoints[0];
+            assert_eq!(ep.resource_name, "platform-system/admin-route");
+            let options =
+                crate::services::service_login::endpoint_login_options_for_slice(&result.endpoints);
+            if resolves {
+                assert_eq!(ep.backend_service.as_deref(), Some("argocd/argocd-server"));
+                assert_eq!(
+                    ep.backend_upstream.as_deref(),
+                    Some("platform-system/admin-upstream")
+                );
+                assert_eq!(options.len(), 1);
+                assert_eq!(options[0].namespace, "argocd");
+                assert_eq!(options[0].secret_name, "argocd-initial-admin-secret");
+            } else {
+                assert_eq!(ep.backend_service, None);
+                assert!(options.is_empty());
+            }
+            assert_eq!(result.failed_kinds.contains(&"apisix".to_string()), fail);
+            assert_eq!(
+                runner
+                    .calls
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|p| p.ends_with("/apisixupstreams"))
+                    .count(),
+                1
+            );
+        }
+    }
+
+    /// kubectl cannot reach the API server (macOS Local Network Privacy in the app bundle);
+    /// only system curl can answer, using the kubeconfig's own CA and token.
+    struct LnpUpstreamRunner {
+        inner: UpstreamRunner,
+        curl_calls: std::sync::Mutex<Vec<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl CommandRunner for LnpUpstreamRunner {
+        async fn run(
+            &self,
+            bin: &str,
+            args: &[String],
+        ) -> Result<crate::services::process::CommandOutput, String> {
+            if bin == "curl" {
+                self.curl_calls.lock().unwrap().push(args.to_vec());
+                let url = args.last().unwrap().clone();
+                let path = url.strip_prefix("https://192.0.2.50:6443").unwrap();
+                let mut kubectl_args = args.to_vec();
+                kubectl_args.push(path.to_string());
+                return self.inner.run("kubectl", &kubectl_args).await;
+            }
+            if args.last().unwrap().ends_with("/apisixupstreams") {
+                return Err("kubectl: dial tcp: no route to host".into());
+            }
+            self.inner.run(bin, args).await
+        }
+    }
+
+    struct Real401Runner {
+        inner: UpstreamRunner,
+        curl_calls: std::sync::Mutex<usize>,
+    }
+
+    #[async_trait::async_trait]
+    impl CommandRunner for Real401Runner {
+        async fn run(
+            &self,
+            bin: &str,
+            args: &[String],
+        ) -> Result<crate::services::process::CommandOutput, String> {
+            if bin == "curl" {
+                *self.curl_calls.lock().unwrap() += 1;
+            }
+            if args.last().unwrap().ends_with("/apisixupstreams") {
+                return Ok(crate::services::process::CommandOutput {
+                    stdout: String::new(),
+                    stderr: "error: You must be logged in to the server (the server has asked for the client to provide credentials)".into(),
+                    success: false,
+                });
+            }
+            self.inner.run(bin, args).await
+        }
+    }
+
+    #[test]
+    fn real_kubectl_401_message_is_an_api_answer() {
+        assert!(stderr_is_api_answer(
+            "error: You must be logged in to the server (the server has asked for the client to provide credentials)"
+        ));
+    }
+
+    #[tokio::test]
+    async fn upstream_fallback_does_not_retry_real_kubectl_401_through_curl() {
+        let kubeconfig = std::env::temp_dir().join(format!(
+            "clusterdeck-401-upstream-{}.yaml",
+            std::process::id()
+        ));
+        std::fs::write(
+            &kubeconfig,
+            "clusters:\n- name: c\n  cluster:\n    server: https://192.0.2.50:6443\nusers:\n- name: u\n  user:\n    token: fake-test-token\n",
+        )
+        .unwrap();
+        let runner = Real401Runner {
+            inner: UpstreamRunner {
+                upstream_namespace: "platform-system",
+                fail: false,
+                calls: Default::default(),
+            },
+            curl_calls: Default::default(),
+        };
+        let result =
+            discover_cluster_endpoints_detailed(&runner, &kubeconfig, Some("192.0.2.10"), None)
+                .await
+                .unwrap();
+        let _ = std::fs::remove_file(&kubeconfig);
+        assert!(result.failed_kinds.contains(&"apisix".to_string()));
+        assert_eq!(*runner.curl_calls.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn pin_current_context_fails_closed_when_unresolvable() {
+        let yaml = |s: &str| serde_yaml::from_str::<serde_yaml::Value>(s).unwrap();
+        // current-context names a missing context: curl must not fall back to clusters[0].
+        assert!(pin_current_context(yaml(
+            "current-context: gone\ncontexts: []\nclusters:\n- name: a\n  cluster: {server: 'https://192.0.2.1'}\nusers:\n- name: a\n  user: {token: t}\n"
+        ))
+        .is_err());
+        // No current-context and more than one cluster: ambiguous.
+        assert!(
+            pin_current_context(yaml("clusters:\n- name: a\n- name: b\nusers:\n- name: a\n"))
+                .is_err()
+        );
+        // No current-context but exactly one cluster and one user: unambiguous.
+        assert!(pin_current_context(yaml("clusters:\n- name: a\nusers:\n- name: a\n")).is_ok());
+    }
+
+    #[tokio::test]
+    async fn discovery_upstream_list_falls_back_to_curl_when_kubectl_fails() {
+        let kubeconfig = std::env::temp_dir().join(format!(
+            "clusterdeck-lnp-upstream-{}.yaml",
+            std::process::id()
+        ));
+        std::fs::write(
+            &kubeconfig,
+            "clusters:\n- name: c\n  cluster:\n    server: https://192.0.2.50:6443\nusers:\n- name: u\n  user:\n    token: fake-test-token\n",
+        )
+        .unwrap();
+        let runner = LnpUpstreamRunner {
+            inner: UpstreamRunner {
+                upstream_namespace: "platform-system",
+                fail: false,
+                calls: Default::default(),
+            },
+            curl_calls: Default::default(),
+        };
+        let result =
+            discover_cluster_endpoints_detailed(&runner, &kubeconfig, Some("192.0.2.10"), None)
+                .await
+                .unwrap();
+        let _ = std::fs::remove_file(&kubeconfig);
+        assert_eq!(
+            result.endpoints[0].backend_service.as_deref(),
+            Some("argocd/argocd-server")
+        );
+        assert!(!result.failed_kinds.contains(&"apisix".to_string()));
+        let curls = runner.curl_calls.lock().unwrap();
+        assert!(curls
+            .iter()
+            .any(|a| a.last().unwrap().ends_with("/apisixupstreams")));
+        assert!(curls
+            .iter()
+            .flatten()
+            .all(|a| a != "-k" && a != "--insecure"));
     }
 }

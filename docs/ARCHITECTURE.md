@@ -392,6 +392,17 @@ verifies the API server's TLS certificate using `--cacert` against the kubeconfi
 `certificate-authority-data`/`certificate-authority` when present, or curl's system trust store
 otherwise — it never passes `-k`/`--insecure`.
 
+During endpoint discovery, Ingress, APISIX (`ApisixRoute`), Gateway API (`HTTPRoute`), and Service
+parsers also record the resolved `backend_service` (`<ns>/<service>`) and a stable
+`endpoint_id`. APISIX upstreams may resolve an exact in-cluster Service DNS target across
+namespaces; login Secrets belong to that Service's namespace (ADR-0014 D2). For services matching the static convention registry in `services/service_login.rs`
+(`argocd-server`, `<release>-grafana` / `grafana`, `keycloak`, `harbor-core` / `harbor`,
+`gitea-http`, `superset`), the Endpoints tab offers an on-demand **Reveal login** action gated by
+the user's own Kubernetes RBAC (`kubectl auth can-i get secret/<name> -n <ns>`, refusing
+kubeconfig impersonation fields). Revealed credentials are held only in local component state for
+at most 60 seconds and are never persisted or logged. See
+[ADR-0014](adr/0014-service-login-credentials.md).
+
 ## 16. Private CA Local Trust
 
 `services/ca_trust.rs` and `commands/ca_trust.rs` resolve the Kubernetes `Secret` backing a

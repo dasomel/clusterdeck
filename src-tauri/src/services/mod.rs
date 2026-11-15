@@ -1,4 +1,5 @@
 pub mod ca_trust;
+pub mod clipboard;
 pub mod config;
 pub mod discovery;
 pub mod hosts_file;
@@ -13,6 +14,7 @@ pub mod paths;
 pub mod process;
 pub mod profile_document;
 pub mod resolver_files;
+pub mod service_login;
 pub mod ssh;
 pub mod ssh_config;
 pub mod state;

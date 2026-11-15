@@ -17,9 +17,16 @@ import Pill from '../../components/ui/Pill';
 import Tag from '../../components/ui/Tag';
 import CopyButton from '../../components/ui/CopyButton';
 import EmptyState from '../../components/ui/EmptyState';
+import {
+  EndpointLoginButton,
+  EndpointLoginPanel,
+  getEndpointId,
+  useEndpointLogins,
+} from './EndpointLoginControls';
 
 type EndpointsTabProps = {
   profile: Profile;
+  isVisible: boolean;
   lastResult: ConnectionResult | null;
   hostsStatus: HostsFileStatus | null;
   discoveringEndpoints: boolean;
@@ -54,6 +61,7 @@ function dnsConflictText(c: DnsConflict): string {
 
 export default function EndpointsTab({
   profile,
+  isVisible,
   lastResult,
   hostsStatus,
   discoveringEndpoints,
@@ -72,6 +80,7 @@ export default function EndpointsTab({
 }: EndpointsTabProps) {
   const isSynced = hostsStatus?.is_synced ?? false;
   const endpoints = lastResult?.endpoints ?? [];
+  const loginState = useEndpointLogins(profile.id, endpoints, isVisible);
   const conflicts = hostsStatus?.conflicts ?? [];
   const canResolve = hasBlockingConflicts(groupBlockingConflicts(conflicts, profile.id));
   const isLocalDns = profile.host_mapping === 'local_dns';
@@ -507,6 +516,7 @@ export default function EndpointsTab({
       {/* Discovered Cluster Endpoints */}
       <CollapsibleCard
         id="endpoints.discovered"
+        onToggle={loginState.handleCardToggle}
         style={{ padding: '14px 16px' }}
         title={
           <span style={{ fontSize: '11px', fontWeight: 600, color: 'var(--text-tertiary)', textTransform: 'uppercase' }}>
@@ -517,8 +527,16 @@ export default function EndpointsTab({
 
         {endpoints.length > 0 ? (
           <div className="host-list">
-            {endpoints.map((ep) => (
-              <div className="host-row" key={`${ep.source}-${ep.host}`}>
+            {endpoints.map((ep) => {
+              const endpointId = getEndpointId(ep);
+              const loginOption = loginState.optionsById[endpointId];
+              const isRevealed = loginState.revealed?.endpoint_id === endpointId;
+              const errorMsg =
+                loginState.errorByEndpoint?.endpointId === endpointId
+                  ? loginState.errorByEndpoint.message
+                  : null;
+              return (
+              <div className="host-row" key={endpointId}>
                 <div>
                   <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
                     <span className="host-name mono" style={{ fontSize: '12px' }}>{ep.host}</span>
@@ -595,6 +613,21 @@ export default function EndpointsTab({
                       </>
                     )}
                   </div>
+                  {(isRevealed || errorMsg) && (
+                    <EndpointLoginPanel
+                      revealed={isRevealed ? loginState.revealed : null}
+                      errorMessage={errorMsg}
+                      passwordVisible={loginState.passwordVisible}
+                      copiedPassword={loginState.copiedPassword}
+                      clipboardNote={loginState.clipboardNote}
+                      onTogglePassword={() =>
+                        loginState.setPasswordVisible(!loginState.passwordVisible)
+                      }
+                      onCopyPassword={loginState.handleCopyPassword}
+                      onCopyUsername={loginState.handleCopyUsername}
+                      onClose={loginState.clearRevealedState}
+                    />
+                  )}
                 </div>
                 <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
                   {isLocalDns &&
@@ -619,6 +652,15 @@ export default function EndpointsTab({
                           Approve {zone}
                         </button>
                       ))}
+                  {loginOption && (
+                    <EndpointLoginButton
+                      option={loginOption}
+                      permission={loginState.permissionsById[endpointId] ?? 'unknown'}
+                      loading={loginState.loadingEndpointId === endpointId}
+                      isRevealed={isRevealed}
+                      onClick={() => loginState.handleRevealClick(loginOption)}
+                    />
+                  )}
                   <CopyButton text={ep.host} title={`Copy ${ep.host}`} />
                   <button
                     type="button"
@@ -632,7 +674,8 @@ export default function EndpointsTab({
                   </button>
                 </div>
               </div>
-            ))}
+            );
+            })}
           </div>
         ) : (
           <EmptyState

@@ -100,6 +100,11 @@ pub fn run() {
             commands::local_dns::local_dns_status,
             commands::local_dns::local_dns_disable,
             commands::local_dns::suggest_dns_zones,
+            commands::service_login::endpoint_login_options,
+            commands::service_login::check_endpoint_login,
+            commands::service_login::reveal_endpoint_login,
+            commands::clipboard::clipboard_change_count,
+            commands::clipboard::clear_clipboard_if_change_count,
         ])
         .build(tauri::generate_context!())
         .expect("error while building ClusterDeck")
