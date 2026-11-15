@@ -42,6 +42,8 @@ pub struct ManagerEnv<'a> {
     pub status_timeout: Duration,
     pub status_poll: Duration,
     pub protect_resolver: bool,
+    pub startup_grace: Duration,
+    pub startup_poll: Duration,
 }
 
 impl<'a> ManagerEnv<'a> {
@@ -61,6 +63,8 @@ impl<'a> ManagerEnv<'a> {
             status_timeout: STATUS_WAIT,
             status_poll: STATUS_POLL,
             protect_resolver: false,
+            startup_grace: Duration::from_secs(30),
+            startup_poll: Duration::from_millis(500),
         }
     }
 }
@@ -819,31 +823,59 @@ pub async fn refresh_binary(env: &ManagerEnv<'_>) -> Result<bool, String> {
     Ok(changed)
 }
 
+async fn startup_ownership_ok(env: &ManagerEnv<'_>) -> bool {
+    let Ok(status) = load_status(&env.paths.status) else {
+        return false;
+    };
+    let Ok(uid) = agent::current_uid(env.runner).await else {
+        return false;
+    };
+    agent::ownership_ok(env.runner, uid, env.port, &status)
+        .await
+        .unwrap_or(false)
+}
+
+/// Read-only grace phase; callers must release the command lane before waiting here.
+pub async fn wait_for_startup_ownership(env: &ManagerEnv<'_>) -> bool {
+    // D1 (#150): login can precede the LaunchAgent bind or status PID update. Cost: up to
+    // 30s of background polling, without manager/lane locks so Sync can recover the agent.
+    // Escape hatch: inject a zero grace for immediate cleanup; persistent squatters still
+    // take the existing removal path, with a fresh ownership check under the manager lock.
+    tokio::time::timeout(env.startup_grace, async {
+        loop {
+            if startup_ownership_ok(env).await {
+                return true;
+            }
+            tokio::time::sleep(env.startup_poll).await;
+        }
+    })
+    .await
+    .unwrap_or(false)
+}
+
 /// App-start cleanup: removes only OUR marker files when no profile uses local DNS or when the
 /// agent does not own the port. Never starts the agent; unowned files are never touched.
 pub async fn startup_sweep(
     env: &ManagerEnv<'_>,
     any_profile_uses_local_dns: bool,
 ) -> Result<SweepResult, String> {
+    if any_profile_uses_local_dns
+        && !env.startup_grace.is_zero()
+        && wait_for_startup_ownership(env).await
+    {
+        return Ok(SweepResult {
+            skipped_owned: true,
+            ..SweepResult::default()
+        });
+    }
     let _guard = MANAGER_MUTEX.lock().await;
     let mut result = SweepResult::default();
     // Abort before any change when the directory cannot be listed.
     let listing = read_resolver_listing(env.resolver_dir)?;
 
-    if any_profile_uses_local_dns {
-        let owned = match load_status(&env.paths.status) {
-            Ok(status) => match agent::current_uid(env.runner).await {
-                Ok(uid) => agent::ownership_ok(env.runner, uid, env.port, &status)
-                    .await
-                    .unwrap_or(false),
-                Err(_) => false,
-            },
-            Err(_) => false,
-        };
-        if owned {
-            result.skipped_owned = true;
-            return Ok(result);
-        }
+    if any_profile_uses_local_dns && startup_ownership_ok(env).await {
+        result.skipped_owned = true;
+        return Ok(result);
     }
 
     let plan = removal_plan(env, &listing);
@@ -896,6 +928,7 @@ mod tests {
     struct Behaviour {
         selftest: Result<CommandOutput, String>,
         loaded: bool,
+        startup_failures: usize,
         responder_alive: bool,
         responder_pid: u32,
         launchctl_pid: u32,
@@ -943,6 +976,7 @@ mod tests {
                 b: StdMutex::new(Behaviour {
                     selftest: ok("clusterdeck-dns-responder-ok v1\n"),
                     loaded: false,
+                    startup_failures: 0,
                     responder_alive: true,
                     responder_pid: PID,
                     launchctl_pid: PID,
@@ -1125,6 +1159,10 @@ mod tests {
                             } else {
                                 fail("not loaded")
                             }
+                        }
+                        "print" if b.startup_failures > 0 => {
+                            b.startup_failures -= 1;
+                            fail("not ready")
                         }
                         "print" if b.loaded => ok(&format!("{{\n\tpid = {}\n}}", b.launchctl_pid)),
                         "print" => fail("not found"),
@@ -1692,6 +1730,7 @@ mod tests {
         .unwrap();
 
         let res = startup_sweep(&f.env(), false).await.unwrap();
+        assert_eq!(f.count("id"), 0, "no profile means no ownership polling");
         assert_eq!(res.removed, vec!["ours.example.internal"]);
         assert_eq!(f.count("osascript"), 1);
         assert_eq!(f.count("launchctl bootstrap"), 0);
@@ -1701,6 +1740,66 @@ mod tests {
         // Nothing of ours left: no further prompt.
         startup_sweep(&f.env(), false).await.unwrap();
         assert_eq!(f.count("osascript"), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn startup_grace_preserves_files_when_ownership_recovers() {
+        let f = Fake::new();
+        f.put_marker_file("lab.example.internal", "prof-a");
+        write_status(
+            &f.paths.status,
+            StatusFile {
+                generation: 1,
+                loaded_at: "t".into(),
+                error: None,
+                pid: PID,
+                instance: "inst".into(),
+            },
+        )
+        .unwrap();
+        f.set(|b| {
+            b.loaded = true;
+            b.startup_failures = 2;
+        });
+
+        let result = startup_sweep(&f.env(), true).await.unwrap();
+        assert!(result.skipped_owned && result.removed.is_empty());
+        assert!(f.resolver.join("lab.example.internal").exists());
+        assert_eq!(f.count("osascript"), 0);
+        assert_eq!(f.count("launchctl print"), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn startup_grace_reloads_missing_or_stale_status() {
+        for stale in [false, true] {
+            let f = Fake::new();
+            f.put_marker_file("lab.example.internal", "prof-a");
+            f.set(|b| b.loaded = true);
+            let mut status = StatusFile {
+                generation: 1,
+                loaded_at: "t".into(),
+                error: None,
+                pid: PID + 1,
+                instance: "previous-session".into(),
+            };
+            if stale {
+                write_status(&f.paths.status, status.clone()).unwrap();
+            }
+            let mut env = f.env();
+            env.startup_grace = Duration::from_secs(2);
+            env.startup_poll = Duration::from_millis(100);
+            let start = tokio::time::Instant::now();
+            let (result, ()) = tokio::join!(startup_sweep(&env, true), async {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                status.pid = PID;
+                status.instance = "new-session".into();
+                write_status(&f.paths.status, status).unwrap();
+            });
+            assert!(result.unwrap().skipped_owned);
+            assert_eq!(start.elapsed(), Duration::from_millis(200));
+            assert!(f.resolver.join("lab.example.internal").exists());
+            assert_eq!(f.count("osascript"), 0);
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -1722,7 +1821,14 @@ mod tests {
         // Squatter on UDP: our file is removed, agent is not (re)started.
         f.set(|b| b.udp_pid = 999);
         let boots = f.count("launchctl bootstrap");
-        let res = startup_sweep(&f.env(), true).await.unwrap();
+        let mut env = f.env();
+        env.startup_grace = Duration::from_secs(2);
+        env.startup_poll = Duration::from_millis(100);
+        let start = tokio::time::Instant::now();
+        let res = startup_sweep(&env, true).await.unwrap();
+        assert!(start.elapsed() >= env.startup_grace);
+        assert!(!f.resolver.join("lab.example.internal").exists());
+        assert_eq!(f.count("osascript"), prompts + 1);
         assert_eq!(res.removed, vec!["lab.example.internal"]);
         assert_eq!(f.count("launchctl bootstrap"), boots);
     }
