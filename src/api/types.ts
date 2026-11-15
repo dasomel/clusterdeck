@@ -95,6 +95,9 @@ export type LoginErrorCode =
 
 export type EndpointLoginOption = {
   endpoint_id: string;
+  route_namespace: string;
+  route_resource: string;
+  host: string;
   namespace: string;
   service_name: string;
   secret_name: string;
@@ -102,6 +105,9 @@ export type EndpointLoginOption = {
 
 export type RevealedEndpointLogin = {
   endpoint_id: string;
+  route_namespace: string;
+  route_resource: string;
+  host: string;
   namespace: string;
   service_name: string;
   secret_name: string;

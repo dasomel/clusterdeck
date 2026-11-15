@@ -382,7 +382,11 @@ async fn apisix_cross_namespace_reveal_checks_and_reads_service_namespace() {
         );
         let result = reveal_endpoint_login_with_deps(&runner, &paths, "lab", &ep.id).await;
         if permitted {
-            assert_eq!(result.unwrap().namespace, "argocd");
+            let revealed = result.unwrap();
+            assert_eq!(revealed.namespace, "argocd");
+            assert_eq!(revealed.route_namespace, "platform-system");
+            assert_eq!(revealed.route_resource, "platform-system/route");
+            assert_eq!(revealed.host, "admin.example.test");
         } else {
             assert_eq!(result.unwrap_err(), LoginErrorCode::Forbidden);
         }
@@ -545,6 +549,9 @@ async fn can_i_no_returns_forbidden_without_invoking_get_secret_and_errors_never
 fn response_debug_redacts_username_and_password() {
     let response = RevealedEndpointLogin {
         endpoint_id: "endpoint".into(),
+        route_namespace: "ns".into(),
+        route_resource: "ns/route".into(),
+        host: "grafana.example.test".into(),
         namespace: "ns".into(),
         service_name: "grafana".into(),
         secret_name: "grafana".into(),
@@ -774,4 +781,27 @@ async fn live_backend_checks_reject_external_name_missing_and_changed_upstream_b
             std::fs::remove_dir_all(paths.base).unwrap();
         }
     }
+}
+
+#[test]
+fn options_expose_route_namespace_so_cross_binding_is_detectable() {
+    let mk = |route: &str, backend: &str| DiscoveredEndpoint {
+        id: format!("apisix:{route}:h.example.test"),
+        host: "h.example.test".into(),
+        ip: "192.0.2.10".into(),
+        source: "apisix".into(),
+        resource_name: route.into(),
+        backend_service: Some(backend.into()),
+        backend_upstream: None,
+    };
+    let opts = endpoint_login_options_for_slice(&[
+        mk("platform-system/route", "argocd/argocd-server"),
+        mk("argocd/route", "argocd/argocd-server"),
+    ]);
+    assert_eq!(opts.len(), 2);
+    assert_eq!(opts[0].route_namespace, "platform-system");
+    assert_eq!(opts[0].route_resource, "platform-system/route");
+    assert_eq!(opts[0].host, "h.example.test");
+    assert_ne!(opts[0].route_namespace, opts[0].namespace);
+    assert_eq!(opts[1].route_namespace, opts[1].namespace);
 }

@@ -330,7 +330,11 @@ export function EndpointLoginButton({
       className="secondary-button compact-btn"
       onClick={onClick}
       disabled={loading || permission !== 'permitted'}
-      title={`Read admin login from ${option.namespace}/${option.secret_name} (auto-clears after 60s)`}
+      title={`Read admin login from ${option.namespace}/${option.secret_name} (auto-clears after 60s)${
+        option.route_namespace !== option.namespace
+          ? ` — cross-namespace route ${option.route_resource}: whoever controls namespace ${option.route_namespace} controls this route`
+          : ''
+      }`}
     >
       {loading ? <RefreshCw size={10} className="spin" /> : <KeyRound size={10} />}
       {isRevealed ? `Hide login (${option.service_name})` : `Reveal login (${option.service_name})`}
@@ -451,6 +455,15 @@ export function EndpointLoginPanel({
           </button>
         </div>
       </div>
+      {revealed.route_namespace !== revealed.namespace && (
+        <div role="alert" style={{ fontSize: '11px', color: 'var(--warning)' }}>
+          Cross-namespace route: <span className="mono">{revealed.route_resource}</span> (host{' '}
+          <span className="mono">{revealed.host}</span>) forwards to Service{' '}
+          <span className="mono">{revealed.namespace}/{revealed.service_name}</span>. Whoever controls
+          namespace <span className="mono">{revealed.route_namespace}</span> controls this route — only
+          sign in if you trust it.
+        </div>
+      )}
       {clipboardNote && (
         <div style={{ fontSize: '11px', color: 'var(--text-tertiary)' }}>{clipboardNote}</div>
       )}

@@ -95,6 +95,11 @@ pub struct ServiceLoginSpec {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EndpointLoginOption {
     pub endpoint_id: String,
+    // Non-secret route provenance from the stored endpoint (never frontend input);
+    // lets the UI warn when the route namespace differs from the Service namespace.
+    pub route_namespace: String,
+    pub route_resource: String,
+    pub host: String,
     pub namespace: String,
     pub service_name: String,
     pub secret_name: String,
@@ -103,6 +108,9 @@ pub struct EndpointLoginOption {
 #[derive(Clone, PartialEq, Eq, Serialize)]
 pub struct RevealedEndpointLogin {
     pub endpoint_id: String,
+    pub route_namespace: String,
+    pub route_resource: String,
+    pub host: String,
     pub namespace: String,
     pub service_name: String,
     pub secret_name: String,
@@ -114,6 +122,9 @@ impl fmt::Debug for RevealedEndpointLogin {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RevealedEndpointLogin")
             .field("endpoint_id", &self.endpoint_id)
+            .field("route_namespace", &self.route_namespace)
+            .field("route_resource", &self.route_resource)
+            .field("host", &self.host)
             .field("namespace", &self.namespace)
             .field("service_name", &self.service_name)
             .field("secret_name", &self.secret_name)
@@ -223,6 +234,14 @@ fn resolve_endpoint_target(
     Ok((ns.to_string(), service_name.to_string(), spec))
 }
 
+// resolve_endpoint_target already validated this as a safe DNS label.
+fn route_namespace(ep: &DiscoveredEndpoint) -> String {
+    ep.resource_name
+        .split_once('/')
+        .map(|(ns, _)| ns.to_string())
+        .unwrap_or_default()
+}
+
 pub fn endpoint_login_options_for_slice(
     endpoints: &[DiscoveredEndpoint],
 ) -> Vec<EndpointLoginOption> {
@@ -232,6 +251,9 @@ pub fn endpoint_login_options_for_slice(
             let (namespace, service_name, spec) = resolve_endpoint_target(ep).ok()?;
             Some(EndpointLoginOption {
                 endpoint_id: ep.endpoint_id(),
+                route_namespace: route_namespace(ep),
+                route_resource: ep.resource_name.clone(),
+                host: ep.host.clone(),
                 namespace,
                 service_name,
                 secret_name: spec.secret_name,
@@ -355,6 +377,9 @@ pub async fn check_endpoint_login_with_deps(
     .await?;
     Ok(EndpointLoginOption {
         endpoint_id: ep.endpoint_id(),
+        route_namespace: route_namespace(ep),
+        route_resource: ep.resource_name.clone(),
+        host: ep.host.clone(),
         namespace,
         service_name,
         secret_name: spec.secret_name,
@@ -439,6 +464,9 @@ pub async fn reveal_endpoint_login_with_deps(
 
     Ok(RevealedEndpointLogin {
         endpoint_id: ep.endpoint_id(),
+        route_namespace: route_namespace(ep),
+        route_resource: ep.resource_name.clone(),
+        host: ep.host.clone(),
         namespace,
         service_name,
         secret_name: spec.secret_name,
