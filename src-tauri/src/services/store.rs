@@ -520,7 +520,7 @@ profiles:
         let paths = temp_paths("local-runtime-roundtrip");
         let profile = Profile {
             id: "colima-default".into(),
-            name: "Colima Local".into(),
+            name: "default (Colima)".into(),
             hosts: vec![],
             bastion: None,
             bootstrap: BootstrapPolicy::default(),

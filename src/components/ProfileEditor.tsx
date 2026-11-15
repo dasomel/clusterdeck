@@ -26,7 +26,7 @@ const deriveBaseId = (provider: string, projectName: string) =>
   `${provider.toLowerCase()}-${projectName}`.replace(/[^a-z0-9_-]/g, '-');
 
 const deriveFormattedName = (provider: string, projectName: string) =>
-  projectName === 'default' ? `${provider} Local` : `${projectName} (${provider})`;
+  `${projectName} (${provider})`;
 
 const toLocalRuntimeSource = (host: DiscoveredLocalHost): LocalRuntimeSource | null => {
   if (host.provider !== 'Colima' && host.provider !== 'Lima') return null;
