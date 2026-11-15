@@ -6,9 +6,21 @@ The format follows the principles of Keep a Changelog and uses semantic versioni
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-11-15
+
 ### Added
 
-- Check for newer stable releases at launch and from **ClusterDeck → Check for Updates…** in the macOS menu bar; open available releases in the browser for manual installation (#145, [ADR-0013](docs/adr/0013-update-check.md))
+- Check for newer stable releases at launch and from **ClusterDeck → Check for Updates…** in the macOS menu bar; open available releases in the browser for manual installation. The launch check is one unauthenticated GET to the GitHub Releases API with no user or infrastructure identifiers (#145, #146, [ADR-0013](docs/adr/0013-update-check.md))
+- Collapse and expand every panel card (cluster facts, hosts, name resolution, node aliases, discovered endpoints, CAs, kubeconfig source, local runtimes); header actions such as Scan and Sync stay visible while collapsed, and the open/closed state is remembered per card (#152)
+- Guided real-Mac verification script for the local DNS lifecycle, `scripts/verify-local-dns-lifecycle.sh` (#95, #149)
+
+### Fixed
+
+- Keep local DNS working after a reboot or login: the app could start before the DNS LaunchAgent bound its port, so the startup check removed every ClusterDeck `/etc/resolver` file (behind an admin prompt) and nothing restored them once the agent came up. Startup now waits up to 30 s for the agent before treating it as dead, without blocking a user Sync; a genuine port squatter is still cleaned up (#150, #151)
+
+### Changed
+
+- Documentation refreshed for 0.6.x behaviour (#147, #148)
 
 ## [0.6.1] - 2026-11-05
 
