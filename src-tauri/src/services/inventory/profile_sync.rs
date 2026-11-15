@@ -100,7 +100,7 @@ pub async fn build_target(
         return Ok(Target {
             vagrant_project_dir: None,
             id: format!("colima-{}", slug(&first.name)),
-            name: format!("Colima {}", first.name),
+            name: format!("{} (Colima)", first.name),
             hosts,
             local_runtime: Some(LocalRuntimeSource {
                 provider: crate::services::local_runtime_lifecycle::LocalRuntimeProvider::Colima,

@@ -584,7 +584,7 @@ mod tests {
     fn validate_profile_rejects_unsafe_local_runtime_instance_and_accepts_safe_one() {
         let mut profile = Profile {
             id: "colima-default".into(),
-            name: "Colima Local".into(),
+            name: "default (Colima)".into(),
             hosts: vec![Host {
                 name: "colima-vm".into(),
                 address: "127.0.0.1".into(),
