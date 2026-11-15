@@ -7,6 +7,7 @@ import ProfileList from './ProfileList';
 import ClusterDetail from './ClusterDetail';
 import ProfileEditor from '../../components/ProfileEditor';
 import ConfirmModal from '../../components/ConfirmModal';
+import StatusDock from '../../components/layout/StatusDock';
 import EmptyState from '../../components/ui/EmptyState';
 
 type ClustersScreenProps = {
@@ -101,7 +102,17 @@ export default function ClustersScreen({
         onDelete={(p) => setProfileToDelete(p)}
       />
 
-      <main style={{ flex: 1, minWidth: 0, height: '100%', overflow: 'hidden' }}>
+      <main
+        style={{
+          flex: 1,
+          minWidth: 0,
+          height: '100%',
+          overflow: 'hidden',
+          display: 'flex',
+          flexDirection: 'column',
+        }}
+      >
+        <StatusDock />
         {editorState.open ? (
           <div style={{ height: '100%', overflowY: 'auto', padding: '20px 24px' }}>
             <div style={{ marginBottom: '12px', fontSize: '12px', color: 'var(--text-tertiary)' }}>

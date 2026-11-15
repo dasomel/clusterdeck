@@ -228,6 +228,7 @@ export function useEndpoints(
       const groups = groupBlockingConflicts(res.conflicts ?? [], profile.id);
       if (hasBlockingConflicts(groups)) setConflictGroups(groups);
     } catch (err) {
+      void loadDnsStatus();
       pushStatus('error', 'Sync Hosts failed', [String(err)]);
     } finally {
       setSyncingHosts(false);
