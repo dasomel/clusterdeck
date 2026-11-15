@@ -191,7 +191,8 @@ pub(crate) async fn prepare_binary(
     if !output.success {
         return Err(refusal("non-zero exit status"));
     }
-    if output.stdout != format!("{SELFTEST_TOKEN}\n") {
+    // D2 (#154): SystemRunner trims stdout; normalize here so runner whitespace handling is irrelevant.
+    if output.stdout.trim() != SELFTEST_TOKEN {
         return Err(refusal("unexpected stdout token"));
     }
     Ok(Some(src))
@@ -459,6 +460,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ensure_binary_system_runner_copies_newline_token() {
+        let home = tmp_home("real-token");
+        let src = home.join("current-exe");
+        let dest = home.join("clusterdeck-dns");
+        let script = format!("#!/bin/sh\nprintf '%s\\n' '{SELFTEST_TOKEN}'\nexit 0\n");
+        std::fs::write(&src, &script).unwrap();
+        std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(&dest, b"previous responder").unwrap();
+
+        let result = ensure_binary(&crate::services::process::SystemRunner, &src, &dest).await;
+        let copied = std::fs::read(&dest).unwrap();
+        std::fs::remove_dir_all(home).unwrap();
+        assert_eq!(result, Ok(true));
+        assert_eq!(copied, script.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn ensure_binary_system_runner_rejects_wrong_token_without_writing() {
+        let home = tmp_home("real-wrong-token");
+        let src = home.join("current-exe");
+        let dest = home.join("clusterdeck-dns");
+        std::fs::write(&src, "#!/bin/sh\nprintf '%s\\n' 'wrong token'\nexit 0\n").unwrap();
+        std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(&dest, b"previous responder").unwrap();
+        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let result = ensure_binary(&crate::services::process::SystemRunner, &src, &dest).await;
+        let contents = std::fs::read(&dest).unwrap();
+        let mode = std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777;
+        std::fs::remove_dir_all(home).unwrap();
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("self-test failed (unexpected stdout token)"),
+            "{err}"
+        );
+        assert_eq!(contents, b"previous responder");
+        assert_eq!(mode, 0o600);
+    }
+
+    #[tokio::test]
     async fn ensure_binary_copies_only_when_hash_differs_and_sets_0755() {
         struct SelfTestRunner;
         #[async_trait::async_trait]
@@ -469,7 +510,7 @@ mod tests {
                 _: &[String],
             ) -> Result<crate::services::process::CommandOutput, String> {
                 Ok(crate::services::process::CommandOutput {
-                    stdout: format!("{SELFTEST_TOKEN}\n"),
+                    stdout: SELFTEST_TOKEN.to_string(),
                     stderr: String::new(),
                     success: true,
                 })

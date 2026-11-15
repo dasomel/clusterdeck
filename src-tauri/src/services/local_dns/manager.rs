@@ -974,7 +974,7 @@ mod tests {
                 log: StdMutex::new(Vec::new()),
                 scripts: StdMutex::new(Vec::new()),
                 b: StdMutex::new(Behaviour {
-                    selftest: ok("clusterdeck-dns-responder-ok v1\n"),
+                    selftest: ok("clusterdeck-dns-responder-ok v1"),
                     loaded: false,
                     startup_failures: 0,
                     responder_alive: true,
@@ -2192,11 +2192,11 @@ mod tests {
         for response in [
             fail("Unrecognized option: dns-responder-selftest"),
             Ok(CommandOutput {
-                stdout: "clusterdeck-dns-responder-ok v1\n".into(),
+                stdout: "clusterdeck-dns-responder-ok v1".into(),
                 stderr: String::new(),
                 success: false,
             }),
-            ok("wrong token\n"),
+            ok("wrong token"),
             ok("clusterdeck-dns-responder-ok v1\nextra"),
             Err("self-test timed out".into()),
         ] {
