@@ -12,6 +12,7 @@ import {
 } from '../../api/tauri';
 import { groupBlockingConflicts, hasBlockingConflicts } from '../../lib/hostsConflicts';
 import { NODE_ALIAS_DOMAIN } from '../../lib/nodeAlias';
+import CollapsibleCard from '../../components/ui/CollapsibleCard';
 import Pill from '../../components/ui/Pill';
 import Tag from '../../components/ui/Tag';
 import CopyButton from '../../components/ui/CopyButton';
@@ -236,9 +237,11 @@ export default function EndpointsTab({
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
       {/* Hosts file controls strip */}
-      <div className="panel-card" style={{ padding: '12px 16px' }}>
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '10px' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+      <CollapsibleCard
+        id="endpoints.resolution"
+        style={{ padding: '12px 16px' }}
+        title={
+          <>
             <span style={{ fontSize: '13px', fontWeight: 600 }}>Name resolution</span>
             <Pill variant={profile.host_mapping === 'off' ? 'idle' : 'ok'}>{modeLabel}</Pill>
             {isLocalDns ? (
@@ -254,8 +257,9 @@ export default function EndpointsTab({
                 {isSynced ? '/etc/hosts Synced' : 'Not in /etc/hosts'}
               </Pill>
             )}
-          </div>
-
+          </>
+        }
+        actions={
           <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
             <button
               type="button"
@@ -293,7 +297,8 @@ export default function EndpointsTab({
               {isLocalDns ? 'Sync to local DNS' : 'Sync to /etc/hosts'}
             </button>
           </div>
-        </div>
+        }
+      >
 
         {isLocalDns ? (
           <>
@@ -416,13 +421,18 @@ export default function EndpointsTab({
             )}
           </div>
         )}
-      </div>
+      </CollapsibleCard>
 
       {/* Node FQDNs */}
-      <div className="panel-card" style={{ padding: '14px 16px' }}>
-        <div style={{ fontSize: '11px', fontWeight: 600, color: 'var(--text-tertiary)', textTransform: 'uppercase', marginBottom: '8px' }}>
-          Node Host Aliases (*.{profile.id}.{NODE_ALIAS_DOMAIN})
-        </div>
+      <CollapsibleCard
+        id="endpoints.nodeAliases"
+        style={{ padding: '14px 16px' }}
+        title={
+          <span style={{ fontSize: '11px', fontWeight: 600, color: 'var(--text-tertiary)', textTransform: 'uppercase' }}>
+            Node Host Aliases (*.{profile.id}.{NODE_ALIAS_DOMAIN})
+          </span>
+        }
+      >
         <div className="host-list">
           {profile.hosts.map((host) => {
             const fqdn = `${host.name}.${profile.id}.${NODE_ALIAS_DOMAIN}`;
@@ -492,15 +502,18 @@ export default function EndpointsTab({
             </div>
           )}
         </div>
-      </div>
+      </CollapsibleCard>
 
       {/* Discovered Cluster Endpoints */}
-      <div className="panel-card" style={{ padding: '14px 16px' }}>
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
+      <CollapsibleCard
+        id="endpoints.discovered"
+        style={{ padding: '14px 16px' }}
+        title={
           <span style={{ fontSize: '11px', fontWeight: 600, color: 'var(--text-tertiary)', textTransform: 'uppercase' }}>
             Discovered Ingress / Gateway Endpoints ({endpoints.length})
           </span>
-        </div>
+        }
+      >
 
         {endpoints.length > 0 ? (
           <div className="host-list">
@@ -638,7 +651,7 @@ export default function EndpointsTab({
             }
           />
         )}
-      </div>
+      </CollapsibleCard>
     </div>
   );
 }

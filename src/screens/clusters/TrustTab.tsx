@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { CircleAlert } from 'lucide-react';
 import type { DiscoveredCaView } from '../../api/tauri';
+import CollapsibleCard from '../../components/ui/CollapsibleCard';
 import Pill from '../../components/ui/Pill';
 import EmptyState from '../../components/ui/EmptyState';
 import ConfirmModal from '../../components/ConfirmModal';
@@ -25,12 +26,15 @@ export default function TrustTab({
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
-      <div className="panel-card" style={{ padding: '14px 16px' }}>
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
+      <CollapsibleCard
+        id="trust.cas"
+        style={{ padding: '14px 16px' }}
+        title={
           <span style={{ fontSize: '11px', fontWeight: 600, color: 'var(--text-tertiary)', textTransform: 'uppercase' }}>
             Cluster Certificate Authorities ({caViews.length})
           </span>
-        </div>
+        }
+      >
 
         {caViews.length > 0 ? (
           <div className="host-list">
@@ -113,7 +117,7 @@ export default function TrustTab({
             description="Certificate authority discovery runs automatically after connecting or scanning endpoints."
           />
         )}
-      </div>
+      </CollapsibleCard>
 
       {trustTarget && (
         <ConfirmModal

@@ -1,8 +1,9 @@
 import { useState, useEffect, useCallback } from 'react';
-import { Server, Play, Square, RotateCw, Terminal, Link2, Copy, ChevronDown, ChevronRight, RefreshCw } from 'lucide-react';
+import { Server, Play, Square, RotateCw, Terminal, Link2, Copy, RefreshCw } from 'lucide-react';
 import { api, type DiscoveredLocalHost, type LocalRuntimeLifecycleProvider } from '../../api/tauri';
 import { useStatus } from '../../state/StatusContext';
 import { gib } from '../../lib/format';
+import CollapsibleCard from '../../components/ui/CollapsibleCard';
 import Pill from '../../components/ui/Pill';
 import Tag from '../../components/ui/Tag';
 import ConfirmModal from '../../components/ConfirmModal';
@@ -11,7 +12,6 @@ export default function LocalRuntimePanel({ isVisible = true }: { isVisible?: bo
   const { pushStatus } = useStatus();
   const [localHosts, setLocalHosts] = useState<DiscoveredLocalHost[]>([]);
   const [loading, setLoading] = useState(false);
-  const [expanded, setExpanded] = useState(true);
   const [busyInstanceKeys, setBusyInstanceKeys] = useState<Set<string>>(new Set());
   const [lifecycleConfirm, setLifecycleConfirm] = useState<{
     action: 'stop' | 'restart';
@@ -115,34 +115,31 @@ export default function LocalRuntimePanel({ isVisible = true }: { isVisible?: bo
   };
 
   return (
-    <div className="panel-card" style={{ padding: '14px 16px' }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-        <button
-          type="button"
-          style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer', background: 'none', border: 'none', padding: 0, color: 'inherit', textAlign: 'left' }}
-          onClick={() => setExpanded(!expanded)}
-          aria-expanded={expanded}
-        >
-          {expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-          <Server size={14} />
-          <span style={{ fontSize: '13px', fontWeight: 600 }}>Local Runtimes ({localHosts.length})</span>
-        </button>
-
-        <button
-          type="button"
-          className="icon-button"
-          style={{ width: '24px', height: '24px' }}
-          title="Refresh local runtimes"
-          aria-label="Refresh local runtimes"
-          onClick={reload}
-          disabled={loading}
-        >
-          <RefreshCw size={13} className={loading ? 'spin' : ''} />
-        </button>
-      </div>
-
-      {expanded && (
-        <div style={{ marginTop: '10px' }}>
+    <>
+      <CollapsibleCard
+        id="infrastructure.localRuntimes"
+        style={{ padding: '14px 16px' }}
+        title={
+          <>
+            <Server size={14} />
+            <span style={{ fontSize: '13px', fontWeight: 600 }}>Local Runtimes ({localHosts.length})</span>
+          </>
+        }
+        actions={
+          <button
+            type="button"
+            className="icon-button"
+            style={{ width: '24px', height: '24px' }}
+            title="Refresh local runtimes"
+            aria-label="Refresh local runtimes"
+            onClick={reload}
+            disabled={loading}
+          >
+            <RefreshCw size={13} className={loading ? 'spin' : ''} />
+          </button>
+        }
+      >
+        <div>
           <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginBottom: '10px' }}>
             Discovery for Colima, Lima, and Vagrant. Colima/Lima instances support Start/Stop/Restart, VM shell, and Docker/kube context access.
           </div>
@@ -259,7 +256,7 @@ export default function LocalRuntimePanel({ isVisible = true }: { isVisible?: bo
             </div>
           )}
         </div>
-      )}
+      </CollapsibleCard>
 
       {lifecycleConfirm && (
         <ConfirmModal
@@ -281,6 +278,6 @@ export default function LocalRuntimePanel({ isVisible = true }: { isVisible?: bo
           onCancel={() => setLifecycleConfirm(null)}
         />
       )}
-    </div>
+    </>
   );
 }

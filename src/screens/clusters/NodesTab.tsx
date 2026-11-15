@@ -1,6 +1,7 @@
 import { Terminal } from 'lucide-react';
 import type { ConnectionResult, HostsFileStatus, Profile } from '../../api/tauri';
 import DefinitionList, { type DefinitionItem } from '../../components/ui/DefinitionList';
+import CollapsibleCard from '../../components/ui/CollapsibleCard';
 import Pill from '../../components/ui/Pill';
 import Tag from '../../components/ui/Tag';
 import CopyButton from '../../components/ui/CopyButton';
@@ -31,19 +32,27 @@ export default function NodesTab({ profile, lastResult, hostsStatus, onOpenSsh }
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
-      <div className="panel-card" style={{ padding: '12px 16px' }}>
-        <div style={{ fontSize: '11px', fontWeight: 600, color: 'var(--text-tertiary)', textTransform: 'uppercase', marginBottom: '8px' }}>
-          Cluster facts
-        </div>
+      <CollapsibleCard
+        id="nodes.facts"
+        style={{ padding: '12px 16px' }}
+        title={
+          <span style={{ fontSize: '11px', fontWeight: 600, color: 'var(--text-tertiary)', textTransform: 'uppercase' }}>
+            Cluster facts
+          </span>
+        }
+      >
         <DefinitionList items={facts} />
-      </div>
+      </CollapsibleCard>
 
-      <div className="panel-card" style={{ padding: '14px 16px' }}>
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '10px' }}>
+      <CollapsibleCard
+        id="nodes.hosts"
+        style={{ padding: '14px 16px' }}
+        title={
           <span style={{ fontSize: '13px', fontWeight: 600, color: 'var(--text-primary)' }}>
             Hosts ({profile.hosts.length + (profile.bastion ? 1 : 0)})
           </span>
-        </div>
+        }
+      >
 
         <div className="host-list">
           {profile.bastion && (
@@ -103,7 +112,7 @@ export default function NodesTab({ profile, lastResult, hostsStatus, onOpenSsh }
             );
           })}
         </div>
-      </div>
+      </CollapsibleCard>
     </div>
   );
 }

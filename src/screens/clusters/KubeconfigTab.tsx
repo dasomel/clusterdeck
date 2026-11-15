@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { FolderOpen, FilePlus, RefreshCw, ExternalLink } from 'lucide-react';
 import { api, type Profile } from '../../api/tauri';
 import DefinitionList, { type DefinitionItem } from '../../components/ui/DefinitionList';
+import CollapsibleCard from '../../components/ui/CollapsibleCard';
 import EmptyState from '../../components/ui/EmptyState';
 
 type KubeconfigTabProps = {
@@ -64,10 +65,15 @@ export default function KubeconfigTab({ profile, merging, onMerge, onManage }: K
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
-      <div className="panel-card" style={{ padding: '14px 16px' }}>
-        <div style={{ fontSize: '11px', fontWeight: 600, color: 'var(--text-tertiary)', textTransform: 'uppercase', marginBottom: '8px' }}>
-          Profile Kubeconfig Source
-        </div>
+      <CollapsibleCard
+        id="kubeconfig.source"
+        style={{ padding: '14px 16px' }}
+        title={
+          <span style={{ fontSize: '11px', fontWeight: 600, color: 'var(--text-tertiary)', textTransform: 'uppercase' }}>
+            Profile Kubeconfig Source
+          </span>
+        }
+      >
         <DefinitionList items={items} />
 
         <div style={{ marginTop: '16px', paddingTop: '12px', borderTop: '1px solid var(--border)', display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '10px' }}>
@@ -98,7 +104,7 @@ export default function KubeconfigTab({ profile, merging, onMerge, onManage }: K
             </button>
           </div>
         </div>
-      </div>
+      </CollapsibleCard>
     </div>
   );
 }
