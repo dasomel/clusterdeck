@@ -1,6 +1,5 @@
 import type { ReactNode } from 'react';
-import StatusBanner from '../StatusBanner';
-import { useStatus } from '../../state/StatusContext';
+import StatusDock from './StatusDock';
 
 type ScreenHeaderProps = {
   title: string;
@@ -9,8 +8,6 @@ type ScreenHeaderProps = {
 };
 
 export default function ScreenHeader({ title, actions, meta }: ScreenHeaderProps) {
-  const { statusMessage, clearStatus } = useStatus();
-
   return (
     <>
       <header className="screen-header">
@@ -21,11 +18,7 @@ export default function ScreenHeader({ title, actions, meta }: ScreenHeaderProps
         {actions && <div className="screen-header-actions">{actions}</div>}
       </header>
 
-      {statusMessage && (
-        <div className="screen-status-dock">
-          <StatusBanner message={statusMessage} onDismiss={clearStatus} />
-        </div>
-      )}
+      <StatusDock />
     </>
   );
 }
