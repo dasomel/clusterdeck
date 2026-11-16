@@ -98,6 +98,7 @@ pub fn apply(
             host_mapping: crate::services::config::HostMapping::Off,
             approved_dns_zones: Vec::new(),
             gateway_address: None,
+            sso_username_template: None,
             trusted_cas: vec![],
             local_runtime: t.local_runtime.clone(),
         };
@@ -183,6 +184,7 @@ mod tests {
             host_mapping: crate::services::config::HostMapping::Off,
             approved_dns_zones: Vec::new(),
             gateway_address: None,
+            sso_username_template: None,
             trusted_cas: vec![],
             local_runtime: None,
         }];
@@ -234,6 +236,7 @@ mod tests {
             host_mapping: crate::services::config::HostMapping::Off,
             approved_dns_zones: Vec::new(),
             gateway_address: None,
+            sso_username_template: None,
             trusted_cas: vec![],
             local_runtime: None,
         }

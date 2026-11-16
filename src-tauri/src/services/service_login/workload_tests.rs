@@ -135,6 +135,7 @@ fn endpoint(ns: &str, svc: &str) -> DiscoveredEndpoint {
         resource_name: format!("{ns}/{svc}-ing"),
         backend_service: Some(format!("{ns}/{svc}")),
         backend_upstream: None,
+        sso_oidc: false,
     }
 }
 
@@ -184,9 +185,9 @@ async fn grafana_secret_comes_from_the_workload_env_and_label_shows_it() {
     let res = reveal("wl-grafana", "monitoring", "prom-grafana", &runner)
         .await
         .unwrap();
-    assert_eq!(res.secret_name, "grafana-secrets");
-    assert_eq!(res.username.as_deref(), Some("gadmin"));
-    assert_eq!(res.password.expose_for_test(), "fake-pw");
+    assert_eq!(res.groups[0].secret_name, "grafana-secrets");
+    assert_eq!(res.account().username.as_deref(), Some("gadmin"));
+    assert_eq!(res.account().password.expose_for_test(), "fake-pw");
     // can-i runs on the resolved Secret, and the static one is never touched.
     let calls = runner.calls();
     assert!(calls
@@ -198,7 +199,7 @@ async fn grafana_secret_comes_from_the_workload_env_and_label_shows_it() {
     // P1-2: the Secret actually GET is the one reported back to the UI.
     assert!(secret_calls(&runner)
         .iter()
-        .any(|c| c.contains(&format!("secret {} ", res.secret_name))));
+        .any(|c| c.contains(&format!("secret {} ", res.groups[0].secret_name))));
     let pod_call = calls
         .iter()
         .find(|a| a.iter().any(|x| x.contains("/pods?")))
@@ -243,8 +244,8 @@ async fn no_pod_or_forbidden_pods_fall_back_to_the_static_secret() {
         let res = reveal("wl-fallback", "monitoring", "prom-grafana", &runner)
             .await
             .unwrap();
-        assert_eq!(res.secret_name, "prom-grafana");
-        assert_eq!(res.password.expose_for_test(), "static-pw");
+        assert_eq!(res.groups[0].secret_name, "prom-grafana");
+        assert_eq!(res.account().password.expose_for_test(), "static-pw");
     }
 }
 
@@ -260,7 +261,7 @@ async fn literal_password_is_ignored_but_literal_username_is_accepted() {
     let res = reveal("wl-lit-pw", "monitoring", "prom-grafana", &runner)
         .await
         .unwrap();
-    assert_eq!(res.password.expose_for_test(), "static-pw");
+    assert_eq!(res.account().password.expose_for_test(), "static-pw");
 
     let env = serde_json::json!([
         {"name": "GF_SECURITY_ADMIN_USER", "value": "literal-admin"},
@@ -276,8 +277,8 @@ async fn literal_password_is_ignored_but_literal_username_is_accepted() {
     let res = reveal("wl-lit-user", "monitoring", "prom-grafana", &runner)
         .await
         .unwrap();
-    assert_eq!(res.username.as_deref(), Some("literal-admin"));
-    assert_eq!(res.password.expose_for_test(), "fake-pw");
+    assert_eq!(res.account().username.as_deref(), Some("literal-admin"));
+    assert_eq!(res.account().password.expose_for_test(), "fake-pw");
 }
 
 #[tokio::test]
@@ -297,7 +298,7 @@ async fn unsafe_secret_name_or_key_from_the_pod_is_ignored() {
         let res = reveal("wl-unsafe", "monitoring", "prom-grafana", &runner)
             .await
             .unwrap();
-        assert_eq!(res.secret_name, "prom-grafana", "{name}/{key}");
+        assert_eq!(res.groups[0].secret_name, "prom-grafana", "{name}/{key}");
         for call in runner.calls() {
             assert!(!call
                 .iter()
@@ -339,17 +340,8 @@ async fn gitea_username_comes_from_the_workload_env() {
     let res = reveal("wl-gitea", "git", "gitea-http", &runner)
         .await
         .unwrap();
-    assert_eq!(res.username.as_deref(), Some("gitea_admin"));
-    assert_eq!(res.password.expose_for_test(), "fake-pw");
-}
-
-#[test]
-fn keycloak_service_no_longer_offers_a_login() {
-    let options = endpoint_login_options_for_slice(&[
-        endpoint("iam", "keycloak"),
-        endpoint("iam", "keycloak-service"),
-    ]);
-    assert!(options.is_empty());
+    assert_eq!(res.account().username.as_deref(), Some("gitea_admin"));
+    assert_eq!(res.account().password.expose_for_test(), "fake-pw");
 }
 
 #[tokio::test]
@@ -367,7 +359,7 @@ async fn pod_list_over_curl_keeps_the_encoded_selector_and_limit() {
     let res = reveal("wl-curl", "monitoring", "prom-grafana", &runner)
         .await
         .unwrap();
-    assert_eq!(res.secret_name, "grafana-secrets");
+    assert_eq!(res.groups[0].secret_name, "grafana-secrets");
     let urls = runner.curl_urls.lock().unwrap().clone();
     assert_eq!(urls.len(), 1, "{urls:?}");
     assert!(urls[0].ends_with(
@@ -396,7 +388,7 @@ async fn unready_terminating_or_ownerless_pods_are_skipped() {
         let res = reveal("wl-skip", "monitoring", "prom-grafana", &runner)
             .await
             .unwrap();
-        assert_eq!(res.secret_name, "prom-grafana");
+        assert_eq!(res.groups[0].secret_name, "prom-grafana");
         assert!(!runner
             .calls()
             .iter()
@@ -417,7 +409,7 @@ async fn disagreeing_pods_fall_back_to_the_static_secret_and_agreeing_pods_resol
     let res = reveal("wl-disagree", "monitoring", "prom-grafana", &runner)
         .await
         .unwrap();
-    assert_eq!(res.secret_name, "prom-grafana");
+    assert_eq!(res.groups[0].secret_name, "prom-grafana");
 
     let runner = WorkloadRunner::new(
         pods_of(vec![
@@ -432,7 +424,7 @@ async fn disagreeing_pods_fall_back_to_the_static_secret_and_agreeing_pods_resol
     let res = reveal("wl-agree", "monitoring", "prom-grafana", &runner)
         .await
         .unwrap();
-    assert_eq!(res.secret_name, "grafana-secrets");
+    assert_eq!(res.groups[0].secret_name, "grafana-secrets");
 }
 
 #[tokio::test]
@@ -452,8 +444,8 @@ async fn username_and_password_never_mix_across_containers() {
     let res = reveal("wl-mix", "monitoring", "prom-grafana", &runner)
         .await
         .unwrap();
-    assert_eq!(res.username.as_deref(), Some("gadmin"));
-    assert_eq!(res.password.expose_for_test(), "fake-pw");
+    assert_eq!(res.account().username.as_deref(), Some("gadmin"));
+    assert_eq!(res.account().password.expose_for_test(), "fake-pw");
 }
 
 #[tokio::test]
@@ -475,9 +467,9 @@ async fn username_secret_ref_into_the_static_secret_is_used_when_password_is_lit
     let res = reveal("wl-user-ref", "monitoring", "prom-grafana", &runner)
         .await
         .unwrap();
-    assert_eq!(res.secret_name, "prom-grafana");
-    assert_eq!(res.username.as_deref(), Some("static-admin"));
-    assert_eq!(res.password.expose_for_test(), "static-pw");
+    assert_eq!(res.groups[0].secret_name, "prom-grafana");
+    assert_eq!(res.account().username.as_deref(), Some("static-admin"));
+    assert_eq!(res.account().password.expose_for_test(), "static-pw");
 }
 
 #[tokio::test]

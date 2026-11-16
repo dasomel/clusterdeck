@@ -172,24 +172,17 @@ fn from_pod(pod: &serde_json::Value, env: &WorkloadEnv, base: &ResolvedLogin) ->
         .map_or_else(|| base.clone(), |(login, _)| login.clone())
 }
 
-/// Secret to read for `spec`: the one the backend workload references when it can be listed
-/// and matches, otherwise the static registry Secret. Every failure (forbidden, no pods,
-/// oversized, unsafe names) falls back silently; nothing from the pod spec is ever echoed.
-pub(super) async fn resolve(
+/// Qualified backend pods (at most `POD_LIST_LIMIT` listed) for a live Service, or `None` when
+/// the selector is unusable or the bounded read fails. Shared by the workload-derived Secret
+/// lookup and the SSO issuer probe so both obey one set of rules.
+pub(super) async fn qualified_pods(
     runner: &dyn CommandRunner,
     kubeconfig: &Path,
     context: &str,
     namespace: &str,
     service: &serde_json::Value,
-    spec: &ServiceLoginSpec,
-) -> ResolvedLogin {
-    let base = ResolvedLogin::from_static(spec);
-    let Some(env) = spec.workload_env else {
-        return base;
-    };
-    let Some(selector) = selector_string(service) else {
-        return base;
-    };
+) -> Option<Vec<serde_json::Value>> {
+    let selector = selector_string(service)?;
     let encoded = selector
         .replace('/', "%2F")
         .replace('=', "%3D")
@@ -198,7 +191,7 @@ pub(super) async fn resolve(
     let api_path = format!(
         "/api/v1/namespaces/{namespace}/pods?labelSelector={encoded}&limit={POD_LIST_LIMIT}"
     );
-    let Ok(pods) = get_json_limited(
+    let pods = get_json_limited(
         runner,
         kubeconfig,
         context,
@@ -207,18 +200,32 @@ pub(super) async fn resolve(
         POD_LIST_LIMITS,
     )
     .await
-    else {
+    .ok()?;
+    Some(
+        pods.get("items")
+            .and_then(|items| items.as_array())
+            .into_iter()
+            .flatten()
+            .filter(|pod| is_qualified(pod))
+            .cloned()
+            .collect(),
+    )
+}
+
+/// Secret to read for `spec`: the one the backend workload references when its qualified pods
+/// could be listed and agree, otherwise the static registry Secret. Every failure (forbidden,
+/// no pods, oversized, unsafe names) falls back silently; nothing from the pod spec is echoed.
+pub(super) fn resolve(
+    pods: Option<&[serde_json::Value]>,
+    spec: &ServiceLoginSpec,
+) -> ResolvedLogin {
+    let base = ResolvedLogin::from_static(spec);
+    let (Some(env), Some(pods)) = (spec.workload_env, pods) else {
         return base;
     };
     // Qualified pods that disagree (rollout, stray pod) make the workload unreliable: use the
     // static Secret rather than pick one.
-    let mut logins = pods
-        .get("items")
-        .and_then(|items| items.as_array())
-        .into_iter()
-        .flatten()
-        .filter(|pod| is_qualified(pod))
-        .map(|pod| from_pod(pod, &env, &base));
+    let mut logins = pods.iter().map(|pod| from_pod(pod, &env, &base));
     match logins.next() {
         Some(first) if logins.all(|other| other == first) => first,
         _ => base,

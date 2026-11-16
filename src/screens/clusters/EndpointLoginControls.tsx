@@ -15,8 +15,7 @@ export function getEndpointId(ep: DiscoveredEndpoint): string {
   return ep.id && ep.id.length > 0 ? ep.id : `${ep.source}:${ep.resource_name}:${ep.host}`;
 }
 
-function formatLoginError(code: string, option: EndpointLoginOption): string {
-  const secretRef = `${option.namespace}/${option.secret_name}`;
+function formatLoginError(code: string, secretRef: string, serviceName: string): string {
   switch (code.trim() as LoginErrorCode) {
     case 'forbidden':
       return `Your credentials for this cluster cannot read ${secretRef}`;
@@ -27,7 +26,7 @@ function formatLoginError(code: string, option: EndpointLoginOption): string {
     case 'backend_mismatch':
       return 'The service behind this endpoint changed; scan endpoints again';
     case 'unsupported_service':
-      return `Service ${option.service_name} does not have a supported login secret mapping`;
+      return `Service ${serviceName} does not have a supported login secret mapping`;
     case 'timeout':
       return `Timed out after 10s waiting for kubectl while reading ${secretRef}`;
     case 'kubectl_failed':
@@ -47,8 +46,9 @@ export function useEndpointLogins(
   const [permissionsById, setPermissionsById] = useState<Record<string, PermissionState>>({});
   const [loadingEndpointId, setLoadingEndpointId] = useState<string | null>(null);
   const [revealed, setRevealed] = useState<RevealedEndpointLogin | null>(null);
-  const [passwordVisible, setPasswordVisible] = useState(false);
-  const [copiedPassword, setCopiedPassword] = useState(false);
+  // Keys are `<group>:<account>`; a Set so each account's password is masked independently.
+  const [visibleKeys, setVisibleKeys] = useState<ReadonlySet<string>>(new Set());
+  const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const [clipboardNote, setClipboardNote] = useState<string | null>(null);
   const [errorByEndpoint, setErrorByEndpoint] = useState<{
     endpointId: string;
@@ -77,14 +77,14 @@ export function useEndpointLogins(
     clearRevealTimer();
     setLoadingEndpointId(null);
     setRevealed(null);
-    setPasswordVisible(false);
-    setCopiedPassword(false);
+    setVisibleKeys(new Set());
+    setCopiedKey(null);
     setClipboardNote(null);
     setErrorByEndpoint(null);
   }, [clearRevealTimer]);
 
   const endpointsKey = JSON.stringify(endpoints.map((ep) => [
-    getEndpointId(ep), ep.backend_service, ep.backend_upstream,
+    getEndpointId(ep), ep.backend_service, ep.backend_upstream, ep.sso_oidc,
   ]));
   const secretsKey = JSON.stringify(Object.values(optionsById).map((option) => [
     option.endpoint_id, option.namespace, option.service_name, option.secret_name,
@@ -189,8 +189,8 @@ export function useEndpointLogins(
       }
       clearRevealTimer();
       setRevealed(null);
-      setPasswordVisible(false);
-      setCopiedPassword(false);
+      setVisibleKeys(new Set());
+      setCopiedKey(null);
       setClipboardNote(null);
       setErrorByEndpoint(null);
 
@@ -211,7 +211,7 @@ export function useEndpointLogins(
           }
           setLoadingEndpointId(null);
           setRevealed(res);
-          setPasswordVisible(false);
+          setVisibleKeys(new Set());
           setPermissionsById((prev) => ({ ...prev, [option.endpoint_id]: 'permitted' }));
           revealTimerRef.current = window.setTimeout(() => {
             clearRevealedState();
@@ -233,18 +233,22 @@ export function useEndpointLogins(
           }
           setErrorByEndpoint({
             endpointId: option.endpoint_id,
-            message: formatLoginError(code, option),
+            message: formatLoginError(
+              code,
+              `${option.namespace}/${option.secret_name}`,
+              option.service_name,
+            ),
           });
         });
     },
     [profileId, revealed, clearRevealTimer, clearRevealedState],
   );
 
-  const handleCopyCredential = useCallback(async (secretToCopy: string, password = false) => {
+  const handleCopyCredential = useCallback(async (secretToCopy: string, key: string | null) => {
     try {
       await navigator.clipboard.writeText(secretToCopy);
-      if (password) setCopiedPassword(true);
-      window.setTimeout(() => setCopiedPassword(false), 1200);
+      if (key) setCopiedKey(key);
+      window.setTimeout(() => setCopiedKey(null), 1200);
       // WKWebView denies clipboard.readText, so "unchanged" is judged by the native pasteboard
       // change count; the secret itself never leaves the webview.
       let count: number | null = null;
@@ -272,27 +276,27 @@ export function useEndpointLogins(
     }
   }, []);
 
-  const handleCopyPassword = () => {
-    if (revealed) void handleCopyCredential(revealed.password, true);
-  };
-  const handleCopyUsername = () => {
-    if (revealed?.username != null) void handleCopyCredential(revealed.username);
-  };
+  const toggleVisible = useCallback((key: string) => {
+    setVisibleKeys((prev) => {
+      const next = new Set(prev);
+      if (!next.delete(key)) next.add(key);
+      return next;
+    });
+  }, []);
 
   return {
     optionsById,
     permissionsById,
     loadingEndpointId,
     revealed,
-    passwordVisible,
-    setPasswordVisible,
-    copiedPassword,
+    visibleKeys,
+    toggleVisible,
+    copiedKey,
     clipboardNote,
     errorByEndpoint,
     handleCardToggle,
     handleRevealClick,
-    handleCopyPassword,
-    handleCopyUsername,
+    handleCopyCredential,
     clearRevealedState,
   };
 }
@@ -332,7 +336,11 @@ export function EndpointLoginButton({
       className="secondary-button compact-btn"
       onClick={onClick}
       disabled={loading || permission !== 'permitted'}
-      title={`Read admin login from ${option.namespace}/${option.secret_name} (auto-clears after 60s)${
+      title={`Read login from ${option.namespace}/${option.secret_name}${
+        option.sso
+          ? ` and the Keycloak realm users (signs in via Keycloak${option.sso.realm ? `, realm ${option.sso.realm}` : ''})`
+          : ''
+      } (auto-clears after 60s)${
         option.route_namespace !== option.namespace
           ? ` — cross-namespace route ${option.route_resource}: whoever controls namespace ${option.route_namespace} controls this route`
           : ''
@@ -347,24 +355,22 @@ export function EndpointLoginButton({
 type EndpointLoginPanelProps = {
   revealed: RevealedEndpointLogin | null;
   errorMessage: string | null;
-  passwordVisible: boolean;
-  copiedPassword: boolean;
+  visibleKeys: ReadonlySet<string>;
+  copiedKey: string | null;
   clipboardNote: string | null;
-  onTogglePassword: () => void;
-  onCopyPassword: () => void;
-  onCopyUsername: () => void;
+  onToggleVisible: (key: string) => void;
+  onCopy: (value: string, key: string | null) => void;
   onClose: () => void;
 };
 
 export function EndpointLoginPanel({
   revealed,
   errorMessage,
-  passwordVisible,
-  copiedPassword,
+  visibleKeys,
+  copiedKey,
   clipboardNote,
-  onTogglePassword,
-  onCopyPassword,
-  onCopyUsername,
+  onToggleVisible,
+  onCopy,
   onClose,
 }: EndpointLoginPanelProps) {
   if (errorMessage) {
@@ -403,60 +409,88 @@ export function EndpointLoginPanel({
     >
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
         <span style={{ fontSize: '11px', color: 'var(--text-secondary)' }}>
-          Service <span className="mono">{revealed.namespace}/{revealed.service_name}</span> · Secret{' '}
-          <span className="mono">{revealed.namespace}/{revealed.secret_name}</span> · Auto-clears in 60s
+          Service <span className="mono">{revealed.namespace}/{revealed.service_name}</span> · Auto-clears in 60s
         </span>
-        <button
-          type="button"
-          className="secondary-button compact-btn"
-          onClick={onClose}
-        >
+        <button type="button" className="secondary-button compact-btn" onClick={onClose}>
           Close
         </button>
       </div>
-      <div style={{ display: 'flex', alignItems: 'center', gap: '12px', flexWrap: 'wrap' }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-          <span style={{ color: 'var(--text-secondary)' }}>Username:</span>
-          {revealed.username !== null ? (
-            <>
-              <span className="mono">{revealed.username}</span>
-              <button
-                type="button"
-                className="icon-button"
-                onClick={onCopyUsername}
-                title="Copy username"
-                aria-label="Copy username"
-              >
-                <Copy size={13} />
-              </button>
-            </>
-          ) : (
-            <span style={{ color: 'var(--text-tertiary)' }}>Not set in secret</span>
+      {revealed.groups.map((group, gi) => (
+        <div key={gi} style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+          <span style={{ fontSize: '11px', color: 'var(--text-secondary)' }}>
+            {group.label}
+            {group.namespace && (
+              <>
+                {' · Secret '}
+                <span className="mono">{group.namespace}/{group.secret_name}</span>
+              </>
+            )}
+          </span>
+          {group.error && (
+            <span style={{ fontSize: '11px', color: 'var(--warning)' }}>
+              {formatLoginError(
+                group.error,
+                `${group.namespace || 'keycloak'}/${group.secret_name}`,
+                revealed.service_name,
+              )}
+            </span>
           )}
+          {group.accounts.map((account, ai) => {
+            const key = `${gi}:${ai}`;
+            const visible = visibleKeys.has(key);
+            return (
+              <div key={key} style={{ display: 'flex', alignItems: 'center', gap: '12px', flexWrap: 'wrap' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                  <span style={{ color: 'var(--text-secondary)' }}>Username:</span>
+                  {account.username !== null ? (
+                    <>
+                      <span className="mono">{account.username}</span>
+                      {account.key !== null && account.key !== account.username && (
+                        <span style={{ fontSize: '10px', color: 'var(--text-tertiary)' }}>
+                          key: {account.key}
+                        </span>
+                      )}
+                      <button
+                        type="button"
+                        className="icon-button"
+                        onClick={() => onCopy(account.username as string, null)}
+                        title="Copy username"
+                        aria-label={`Copy username ${account.username}`}
+                      >
+                        <Copy size={13} />
+                      </button>
+                    </>
+                  ) : (
+                    <span style={{ color: 'var(--text-tertiary)' }}>Not set in secret</span>
+                  )}
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                  <span style={{ color: 'var(--text-secondary)' }}>Password:</span>
+                  <span className="mono">{visible ? account.password : '••••••••••••'}</span>
+                  <button
+                    type="button"
+                    className="secondary-button compact-btn"
+                    onClick={() => onToggleVisible(key)}
+                    title={visible ? 'Hide password' : 'Reveal password'}
+                  >
+                    {visible ? <EyeOff size={10} /> : <Eye size={10} />}
+                    {visible ? 'Hide' : 'Reveal'}
+                  </button>
+                  <button
+                    type="button"
+                    className="secondary-button compact-btn"
+                    onClick={() => onCopy(account.password, key)}
+                    title="Copy password to clipboard"
+                  >
+                    {copiedKey === key ? <Check size={10} /> : <Copy size={10} />}
+                    {copiedKey === key ? 'Copied' : 'Copy'}
+                  </button>
+                </div>
+              </div>
+            );
+          })}
         </div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-          <span style={{ color: 'var(--text-secondary)' }}>Password:</span>
-          <span className="mono">{passwordVisible ? revealed.password : '••••••••••••'}</span>
-          <button
-            type="button"
-            className="secondary-button compact-btn"
-            onClick={onTogglePassword}
-            title={passwordVisible ? 'Hide password' : 'Reveal password'}
-          >
-            {passwordVisible ? <EyeOff size={10} /> : <Eye size={10} />}
-            {passwordVisible ? 'Hide' : 'Reveal'}
-          </button>
-          <button
-            type="button"
-            className="secondary-button compact-btn"
-            onClick={onCopyPassword}
-            title="Copy password to clipboard"
-          >
-            {copiedPassword ? <Check size={10} /> : <Copy size={10} />}
-            {copiedPassword ? 'Copied' : 'Copy'}
-          </button>
-        </div>
-      </div>
+      ))}
       {revealed.route_namespace !== revealed.namespace && (
         <div role="alert" style={{ fontSize: '11px', color: 'var(--warning)' }}>
           Cross-namespace route: <span className="mono">{revealed.route_resource}</span> (host{' '}

@@ -82,6 +82,9 @@ export default function ProfileEditor({ initial, onClose, onSaved, onDeleteReque
   const [gatewayAddress, setGatewayAddress] = useState(
     initial?.gateway_address ?? ''
   );
+  const [ssoUsernameTemplate, setSsoUsernameTemplate] = useState(
+    initial?.sso_username_template ?? ''
+  );
   const [localRuntime, setLocalRuntime] = useState<LocalRuntimeSource | null>(
     initial?.local_runtime ?? null
   );
@@ -375,6 +378,7 @@ export default function ProfileEditor({ initial, onClose, onSaved, onDeleteReque
       host_mapping: hostMapping,
       approved_dns_zones: initial?.approved_dns_zones ?? [],
       gateway_address: gatewayAddress.trim() || null,
+      sso_username_template: ssoUsernameTemplate.trim() || null,
       trusted_cas: initial?.trusted_cas ?? [],
       local_runtime: localRuntime,
     };
@@ -860,6 +864,20 @@ export default function ProfileEditor({ initial, onClose, onSaved, onDeleteReque
                 Applies to the endpoint list and, when /etc/hosts management is on, to the hosts entries (independent of that setting). IP that discovered ingress/gateway endpoints map to, for example a cloud load balancer in front of private nodes. Leave empty to use the cluster's own load balancer or control-plane address.
               </p>
             </div>
+          </div>
+
+          <div className="form-section">
+            <label className="form-label">SSO username template (optional)</label>
+            <input
+              className="form-input mono"
+              value={ssoUsernameTemplate}
+              onChange={(e) => setSsoUsernameTemplate(e.target.value)}
+              placeholder="{key}"
+              spellCheck={false}
+            />
+            <p className="form-helper">
+              How Keycloak realm usernames are derived from the keys of the keycloak-user-passwords Secret in Reveal login. Must contain {'{key}'} once; letters, digits and . _ @ - only. Leave empty for {'{key}'} (username = key). Example: beluga-{'{key}'} when the realm federates users under a prefix.
+            </p>
           </div>
         </div>
 

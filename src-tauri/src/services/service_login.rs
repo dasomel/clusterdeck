@@ -2,15 +2,10 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::time::Duration;
 
-use crate::commands::local_dns::cached_endpoints;
 use crate::services::config::Profile;
-use crate::services::k8s_endpoints::{decode_base64, DiscoveredEndpoint};
-use crate::services::paths::ClusterDeckPaths;
-use crate::services::process::{CommandLimits, CommandRunner};
-use crate::services::store;
-use crate::services::validate::{
-    is_safe_k8s_dns_label, is_safe_profile_id, is_safe_ssh_identifier,
-};
+use crate::services::k8s_endpoints::DiscoveredEndpoint;
+use crate::services::process::CommandLimits;
+use crate::services::validate::{is_safe_k8s_dns_label, is_safe_ssh_identifier};
 
 pub const KUBECTL_LOGIN_TIMEOUT: Duration = Duration::from_secs(10);
 pub const KUBECTL_LOGIN_MAX_OUTPUT_BYTES: usize = 64 * 1024;
@@ -94,6 +89,14 @@ pub struct ServiceLoginSpec {
     pub workload_env: Option<WorkloadEnv>,
 }
 
+/// Non-secret SSO evidence: the endpoint signs in through Keycloak (ADR-0014 SSO amendment).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SsoHint {
+    /// Realm from a literal `...ISSUER` env on the backend pod; `None` when only the APISIX
+    /// `openid-connect` plugin is known.
+    pub realm: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EndpointLoginOption {
     pub endpoint_id: String,
@@ -104,10 +107,43 @@ pub struct EndpointLoginOption {
     pub host: String,
     pub namespace: String,
     pub service_name: String,
+    /// First Secret the reveal reads (the endpoint's own admin Secret, else the realm users).
     pub secret_name: String,
+    #[serde(default)]
+    pub sso: Option<SsoHint>,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize)]
+pub struct LoginAccount {
+    pub label: String,
+    /// Secret data key a realm user came from, shown when the username differs (template).
+    pub key: Option<String>,
+    pub username: Option<String>,
+    pub password: SecretValue,
+}
+
+impl fmt::Debug for LoginAccount {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LoginAccount")
+            .field("label", &self.label)
+            .field("username", &"<redacted>")
+            .field("password", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Accounts from one source (own admin Secret, Keycloak admin, realm users). A failing source
+/// carries a fixed `error` code and no accounts so it never hides the other groups.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LoginGroup {
+    pub label: String,
+    pub namespace: String,
+    pub secret_name: String,
+    pub accounts: Vec<LoginAccount>,
+    pub error: Option<LoginErrorCode>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RevealedEndpointLogin {
     pub endpoint_id: String,
     pub route_namespace: String,
@@ -115,33 +151,31 @@ pub struct RevealedEndpointLogin {
     pub host: String,
     pub namespace: String,
     pub service_name: String,
-    pub secret_name: String,
-    pub username: Option<String>,
-    pub password: SecretValue,
+    pub groups: Vec<LoginGroup>,
 }
 
-impl fmt::Debug for RevealedEndpointLogin {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("RevealedEndpointLogin")
-            .field("endpoint_id", &self.endpoint_id)
-            .field("route_namespace", &self.route_namespace)
-            .field("route_resource", &self.route_resource)
-            .field("host", &self.host)
-            .field("namespace", &self.namespace)
-            .field("service_name", &self.service_name)
-            .field("secret_name", &self.secret_name)
-            .field("username", &"<redacted>")
-            .field("password", &"<redacted>")
-            .finish()
+#[cfg(test)]
+impl RevealedEndpointLogin {
+    /// The only account of a single-account (non-SSO) reveal.
+    pub fn account(&self) -> &LoginAccount {
+        assert_eq!(self.groups.len(), 1);
+        assert_eq!(self.groups[0].accounts.len(), 1);
+        &self.groups[0].accounts[0]
     }
 }
 
 mod backend;
+mod keycloak;
+mod plan;
 mod snapshot;
+mod sso_probe;
 mod transport;
 mod workload;
-use snapshot::KubeconfigSnapshot;
-use workload::{UserSource, WorkloadEnv};
+pub use plan::{
+    check_endpoint_login_with_deps, endpoint_login_options_with_deps,
+    reveal_endpoint_login_with_deps,
+};
+use workload::WorkloadEnv;
 
 /// D2 static registry mapping a Kubernetes Service name to its initial-admin Secret convention.
 /// Widening this table or adding user-defined mappings requires a follow-up ADR (ADR-0014 D2).
@@ -217,9 +251,9 @@ pub fn lookup_service_login(service_name: &str) -> Option<ServiceLoginSpec> {
     }
 }
 
-fn resolve_endpoint_target(
-    ep: &DiscoveredEndpoint,
-) -> Result<(String, String, ServiceLoginSpec), LoginErrorCode> {
+/// Validated `(namespace, service)` of the endpoint's stored backend. Says nothing about
+/// whether the Service has a known login; that is the plan's job.
+fn resolve_backend(ep: &DiscoveredEndpoint) -> Result<(String, String), LoginErrorCode> {
     let backend = ep
         .backend_service
         .as_deref()
@@ -240,14 +274,10 @@ fn resolve_endpoint_target(
     {
         return Err(LoginErrorCode::UnsupportedService);
     }
-    let spec = lookup_service_login(service_name).ok_or(LoginErrorCode::UnsupportedService)?;
-    if !is_safe_k8s_dns_label(&spec.secret_name) {
-        return Err(LoginErrorCode::UnsupportedService);
-    }
-    Ok((ns.to_string(), service_name.to_string(), spec))
+    Ok((ns.to_string(), service_name.to_string()))
 }
 
-// resolve_endpoint_target already validated this as a safe DNS label.
+// resolve_backend already validated this as a safe DNS label.
 fn route_namespace(ep: &DiscoveredEndpoint) -> String {
     ep.resource_name
         .split_once('/')
@@ -255,36 +285,68 @@ fn route_namespace(ep: &DiscoveredEndpoint) -> String {
         .unwrap_or_default()
 }
 
+fn option_for(
+    ep: &DiscoveredEndpoint,
+    namespace: String,
+    service_name: String,
+    secret_name: String,
+    sso: Option<SsoHint>,
+) -> EndpointLoginOption {
+    EndpointLoginOption {
+        endpoint_id: ep.endpoint_id(),
+        route_namespace: route_namespace(ep),
+        route_resource: ep.resource_name.clone(),
+        host: ep.host.clone(),
+        namespace,
+        service_name,
+        secret_name,
+        sso,
+    }
+}
+
+/// Options knowable without any cluster call: registry/Keycloak services, plus APISIX
+/// `openid-connect` routes when the profile has a Keycloak endpoint to take accounts from.
 pub fn endpoint_login_options_for_slice(
     endpoints: &[DiscoveredEndpoint],
 ) -> Vec<EndpointLoginOption> {
+    let has_keycloak = keycloak::find_keycloak_endpoint(endpoints, None).is_some();
     endpoints
         .iter()
         .filter_map(|ep| {
-            let (namespace, service_name, spec) = resolve_endpoint_target(ep).ok()?;
-            Some(EndpointLoginOption {
-                endpoint_id: ep.endpoint_id(),
-                route_namespace: route_namespace(ep),
-                route_resource: ep.resource_name.clone(),
-                host: ep.host.clone(),
-                namespace,
-                service_name,
-                secret_name: spec.secret_name,
+            let (namespace, service_name) = resolve_backend(ep).ok()?;
+            let sso = (ep.sso_oidc && has_keycloak).then_some(SsoHint { realm: None });
+            if keycloak::is_keycloak_service(&service_name) {
+                return Some(option_for(
+                    ep,
+                    namespace,
+                    service_name,
+                    keycloak::KEYCLOAK_ADMIN_SECRETS[0].to_string(),
+                    None,
+                ));
+            }
+            if let Some(spec) = lookup_service_login(&service_name) {
+                if !is_safe_k8s_dns_label(&spec.secret_name) {
+                    return None;
+                }
+                return Some(option_for(
+                    ep,
+                    namespace,
+                    service_name,
+                    spec.secret_name,
+                    sso,
+                ));
+            }
+            sso.map(|hint| {
+                option_for(
+                    ep,
+                    namespace,
+                    service_name,
+                    keycloak::REALM_USERS_SECRET.to_string(),
+                    Some(hint),
+                )
             })
         })
         .collect()
-}
-
-pub fn endpoint_login_options(
-    paths: &ClusterDeckPaths,
-    profile_id: &str,
-) -> Result<Vec<EndpointLoginOption>, LoginErrorCode> {
-    if !is_safe_profile_id(profile_id) {
-        return Err(LoginErrorCode::NotFound);
-    }
-    let _ = store::get_profile(paths, profile_id).map_err(|_| LoginErrorCode::NotFound)?;
-    let endpoints = cached_endpoints(&paths.endpoints_cache_file(), profile_id);
-    Ok(endpoint_login_options_for_slice(&endpoints))
 }
 
 fn resolve_context_and_check_impersonation(
@@ -350,162 +412,10 @@ fn resolve_context_and_check_impersonation(
     Ok(context)
 }
 
-pub async fn check_endpoint_login_with_deps(
-    runner: &dyn CommandRunner,
-    paths: &ClusterDeckPaths,
-    profile_id: &str,
-    endpoint_id: &str,
-) -> Result<EndpointLoginOption, LoginErrorCode> {
-    if !is_safe_profile_id(profile_id) || endpoint_id.is_empty() {
-        return Err(LoginErrorCode::NotFound);
-    }
-    let profile = store::get_profile(paths, profile_id).map_err(|_| LoginErrorCode::NotFound)?;
-    let kubeconfig_path = paths.kubeconfig_file(&profile.id);
-    let raw = std::fs::read(&kubeconfig_path).map_err(|_| LoginErrorCode::KubectlFailed)?;
-    let context = resolve_context_and_check_impersonation(&profile, &raw)?;
-    let snapshot = KubeconfigSnapshot::create(paths, &raw)?;
-    let kubeconfig_path = snapshot.path();
-    let endpoints = cached_endpoints(&paths.endpoints_cache_file(), profile_id);
-    let ep = endpoints
-        .iter()
-        .find(|e| e.endpoint_id() == endpoint_id)
-        .ok_or(LoginErrorCode::NotFound)?;
-    let (namespace, service_name, spec) = resolve_endpoint_target(ep)?;
-    let service = backend::validate_live_backend(
-        runner,
-        kubeconfig_path,
-        &context,
-        ep,
-        &namespace,
-        &service_name,
-    )
-    .await?;
-    let login = workload::resolve(
-        runner,
-        kubeconfig_path,
-        &context,
-        &namespace,
-        &service,
-        &spec,
-    )
-    .await;
-    transport::can_i_get_secret(
-        runner,
-        kubeconfig_path,
-        &context,
-        &namespace,
-        &login.secret_name,
-    )
-    .await?;
-    Ok(EndpointLoginOption {
-        endpoint_id: ep.endpoint_id(),
-        route_namespace: route_namespace(ep),
-        route_resource: ep.resource_name.clone(),
-        host: ep.host.clone(),
-        namespace,
-        service_name,
-        secret_name: login.secret_name,
-    })
-}
-
-pub async fn reveal_endpoint_login_with_deps(
-    runner: &dyn CommandRunner,
-    paths: &ClusterDeckPaths,
-    profile_id: &str,
-    endpoint_id: &str,
-) -> Result<RevealedEndpointLogin, LoginErrorCode> {
-    if !is_safe_profile_id(profile_id) || endpoint_id.is_empty() {
-        return Err(LoginErrorCode::NotFound);
-    }
-    let profile = store::get_profile(paths, profile_id).map_err(|_| LoginErrorCode::NotFound)?;
-    let kubeconfig_path = paths.kubeconfig_file(&profile.id);
-    let raw = std::fs::read(&kubeconfig_path).map_err(|_| LoginErrorCode::KubectlFailed)?;
-    let context = resolve_context_and_check_impersonation(&profile, &raw)?;
-    let snapshot = KubeconfigSnapshot::create(paths, &raw)?;
-    let kubeconfig_path = snapshot.path();
-    let endpoints = cached_endpoints(&paths.endpoints_cache_file(), profile_id);
-    let ep = endpoints
-        .iter()
-        .find(|e| e.endpoint_id() == endpoint_id)
-        .ok_or(LoginErrorCode::NotFound)?;
-    let (namespace, service_name, spec) = resolve_endpoint_target(ep)?;
-
-    let service = backend::validate_live_backend(
-        runner,
-        kubeconfig_path,
-        &context,
-        ep,
-        &namespace,
-        &service_name,
-    )
-    .await?;
-    let login = workload::resolve(
-        runner,
-        kubeconfig_path,
-        &context,
-        &namespace,
-        &service,
-        &spec,
-    )
-    .await;
-    transport::can_i_get_secret(
-        runner,
-        kubeconfig_path,
-        &context,
-        &namespace,
-        &login.secret_name,
-    )
-    .await?;
-
-    let api_path = format!(
-        "/api/v1/namespaces/{namespace}/secrets/{}",
-        login.secret_name
-    );
-    let val = transport::get_json(
-        runner,
-        kubeconfig_path,
-        &context,
-        &["secret", &login.secret_name, "-n", &namespace],
-        &api_path,
-    )
-    .await?;
-    let data = val
-        .get("data")
-        .and_then(|d| d.as_object())
-        .ok_or(LoginErrorCode::NotFound)?;
-
-    let raw_pw_b64 = data
-        .get(login.password_key.as_str())
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .ok_or(LoginErrorCode::NotFound)?;
-    let pw_bytes = decode_base64(raw_pw_b64).ok_or(LoginErrorCode::KubectlFailed)?;
-    let pw_str = String::from_utf8(pw_bytes).map_err(|_| LoginErrorCode::KubectlFailed)?;
-
-    let username = match &login.username {
-        UserSource::Fixed(u) => Some(u.clone()),
-        UserSource::SecretKey(k) => match data.get(k.as_str()).and_then(|v| v.as_str()) {
-            Some(b64) if !b64.is_empty() => {
-                let bytes = decode_base64(b64).ok_or(LoginErrorCode::KubectlFailed)?;
-                Some(String::from_utf8(bytes).map_err(|_| LoginErrorCode::KubectlFailed)?)
-            }
-            _ => None,
-        },
-    };
-
-    Ok(RevealedEndpointLogin {
-        endpoint_id: ep.endpoint_id(),
-        route_namespace: route_namespace(ep),
-        route_resource: ep.resource_name.clone(),
-        host: ep.host.clone(),
-        namespace,
-        service_name,
-        secret_name: login.secret_name,
-        username,
-        password: SecretValue::new(pw_str),
-    })
-}
-
+#[cfg(test)]
+use crate::services::{paths::ClusterDeckPaths, process::CommandRunner, store};
+#[cfg(test)]
+mod keycloak_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

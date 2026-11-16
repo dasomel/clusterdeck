@@ -34,7 +34,7 @@ const BACKUP_NAME: &str = "profiles.yaml.pre-local-dns.bak";
 /// Top-level keys of a profile body known to this version. MUST equal the serde field names
 /// of `ProfileBody` (guarded by a test): an editor save removes exactly these from the old raw
 /// map and inserts the new ones, so everything else (unknown, newer-version keys) survives.
-pub const KNOWN_KEYS: [&str; 11] = [
+pub const KNOWN_KEYS: [&str; 12] = [
     "name",
     "hosts",
     "bastion",
@@ -45,6 +45,7 @@ pub const KNOWN_KEYS: [&str; 11] = [
     "approved_dns_zones",
     "trusted_cas",
     "gateway_address",
+    "sso_username_template",
     "local_runtime",
 ];
 
@@ -74,6 +75,8 @@ pub(crate) struct ProfileBody {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     gateway_address: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    sso_username_template: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     local_runtime: Option<LocalRuntimeSource>,
 }
 
@@ -90,6 +93,7 @@ impl ProfileBody {
             approved_dns_zones: self.approved_dns_zones,
             trusted_cas: self.trusted_cas,
             gateway_address: self.gateway_address,
+            sso_username_template: self.sso_username_template,
             local_runtime: self.local_runtime,
         }
     }
@@ -106,6 +110,7 @@ impl ProfileBody {
             approved_dns_zones: p.approved_dns_zones.clone(),
             trusted_cas: p.trusted_cas.clone(),
             gateway_address: p.gateway_address.clone(),
+            sso_username_template: p.sso_username_template.clone(),
             local_runtime: p.local_runtime.clone(),
         }
     }

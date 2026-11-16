@@ -1816,6 +1816,7 @@ users:
             host_mapping: crate::services::config::HostMapping::Off,
             approved_dns_zones: Vec::new(),
             gateway_address: None,
+            sso_username_template: None,
             trusted_cas: Vec::new(),
             local_runtime: None,
         };
@@ -1895,6 +1896,7 @@ users:
             host_mapping: crate::services::config::HostMapping::Off,
             approved_dns_zones: Vec::new(),
             gateway_address: None,
+            sso_username_template: None,
             trusted_cas: Vec::new(),
             local_runtime: None,
         }
@@ -2171,6 +2173,7 @@ users:
             host_mapping: crate::services::config::HostMapping::Off,
             approved_dns_zones: Vec::new(),
             gateway_address: None,
+            sso_username_template: None,
             trusted_cas: Vec::new(),
             local_runtime: None,
         };
@@ -2423,6 +2426,7 @@ users:
             host_mapping: crate::services::config::HostMapping::Off,
             approved_dns_zones: Vec::new(),
             gateway_address: None,
+            sso_username_template: None,
             trusted_cas: Vec::new(),
             local_runtime: None,
         };
@@ -2512,6 +2516,7 @@ users:
             host_mapping: crate::services::config::HostMapping::Off,
             approved_dns_zones: Vec::new(),
             gateway_address: None,
+            sso_username_template: None,
             trusted_cas: Vec::new(),
             local_runtime: None,
         };
@@ -3146,6 +3151,7 @@ users:
             host_mapping: crate::services::config::HostMapping::Off,
             approved_dns_zones: Vec::new(),
             gateway_address: None,
+            sso_username_template: None,
             trusted_cas: Vec::new(),
             local_runtime: None,
         };
@@ -3250,6 +3256,7 @@ users:
             host_mapping: crate::services::config::HostMapping::Off,
             approved_dns_zones: Vec::new(),
             gateway_address: None,
+            sso_username_template: None,
             trusted_cas: Vec::new(),
             local_runtime: None,
         };
@@ -3288,6 +3295,7 @@ users:
             host_mapping: crate::services::config::HostMapping::Off,
             approved_dns_zones: Vec::new(),
             gateway_address: None,
+            sso_username_template: None,
             trusted_cas: Vec::new(),
             local_runtime: None,
         };
@@ -3465,6 +3473,7 @@ users:
             host_mapping: crate::services::config::HostMapping::Off,
             approved_dns_zones: Vec::new(),
             gateway_address: None,
+            sso_username_template: None,
             trusted_cas: Vec::new(),
             local_runtime: None,
         };
@@ -3583,6 +3592,7 @@ users:
             host_mapping: crate::services::config::HostMapping::Off,
             approved_dns_zones: Vec::new(),
             gateway_address: None,
+            sso_username_template: None,
             trusted_cas: Vec::new(),
             local_runtime: None,
         };

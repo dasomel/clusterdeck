@@ -47,6 +47,7 @@ export type Profile = {
   host_mapping: HostMapping;
   approved_dns_zones?: string[];
   gateway_address?: string | null;
+  sso_username_template?: string | null;
   trusted_cas: TrustedCa[];
   local_runtime?: LocalRuntimeSource | null;
 };
@@ -81,6 +82,7 @@ export type DiscoveredEndpoint = {
   resource_name: string;
   backend_service?: string | null;
   backend_upstream?: string | null;
+  sso_oidc?: boolean;
 };
 
 export type LoginErrorCode =
@@ -93,6 +95,11 @@ export type LoginErrorCode =
   | 'timeout'
   | 'kubectl_failed';
 
+export type SsoHint = {
+  // Realm from the backend pod's issuer env; null when only the APISIX openid-connect plugin is known.
+  realm: string | null;
+};
+
 export type EndpointLoginOption = {
   endpoint_id: string;
   route_namespace: string;
@@ -101,6 +108,24 @@ export type EndpointLoginOption = {
   namespace: string;
   service_name: string;
   secret_name: string;
+  sso?: SsoHint | null;
+};
+
+export type LoginAccount = {
+  label: string;
+  // Secret data key of a realm user; shown when the template made the username differ.
+  key: string | null;
+  username: string | null;
+  password: string;
+};
+
+// One source of accounts; a failing source has `error` set and no accounts.
+export type LoginGroup = {
+  label: string;
+  namespace: string;
+  secret_name: string;
+  accounts: LoginAccount[];
+  error: LoginErrorCode | null;
 };
 
 export type RevealedEndpointLogin = {
@@ -110,9 +135,7 @@ export type RevealedEndpointLogin = {
   host: string;
   namespace: string;
   service_name: string;
-  secret_name: string;
-  username: string | null;
-  password: string;
+  groups: LoginGroup[];
 };
 
 export type ScanEndpointsResult = {

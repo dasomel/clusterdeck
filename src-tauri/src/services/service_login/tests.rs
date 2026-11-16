@@ -110,6 +110,7 @@ pub(super) fn seed_profile_and_endpoints(
         host_mapping: crate::services::config::HostMapping::Off,
         approved_dns_zones: Vec::new(),
         gateway_address: None,
+        sso_username_template: None,
         trusted_cas: Vec::new(),
         local_runtime: None,
     };
@@ -252,6 +253,7 @@ async fn reveal_endpoint_login_decodes_each_d2_service_and_handles_missing_gitea
             resource_name: format!("{ns}/{svc}-ing"),
             backend_service: Some(format!("{ns}/{svc}")),
             backend_upstream: None,
+            sso_oidc: false,
         };
         seed_profile_and_endpoints(
             &paths,
@@ -274,8 +276,16 @@ async fn reveal_endpoint_login_decodes_each_d2_service_and_handles_missing_gitea
         let res = reveal_endpoint_login_with_deps(&runner, &paths, "lab", &ep.id)
             .await
             .unwrap();
-        assert_eq!(res.username.as_deref(), expected_user, "service {svc}");
-        assert_eq!(res.password.expose_for_test(), expected_pw, "service {svc}");
+        assert_eq!(
+            res.account().username.as_deref(),
+            expected_user,
+            "service {svc}"
+        );
+        assert_eq!(
+            res.account().password.expose_for_test(),
+            expected_pw,
+            "service {svc}"
+        );
         let dbg = format!("{res:?}");
         assert!(
             !dbg.contains(expected_pw),
@@ -309,6 +319,7 @@ async fn impersonation_fields_are_refused_before_any_kubectl_call() {
             resource_name: "argocd/argocd-ing".to_string(),
             backend_service: Some("argocd/argocd-server".to_string()),
             backend_upstream: None,
+            sso_oidc: false,
         };
         seed_profile_and_endpoints(&paths, "lab", kc, vec![ep.clone()]);
         let runner = FakeLoginRunner::new(
@@ -343,6 +354,7 @@ async fn apisix_cross_namespace_reveal_checks_and_reads_service_namespace() {
         resource_name: "platform-system/route".into(),
         backend_service: Some("argocd/argocd-server".into()),
         backend_upstream: Some("platform-system/admin-upstream".into()),
+        sso_oidc: false,
     };
     seed_profile_and_endpoints(
         &paths,
@@ -401,6 +413,7 @@ async fn unknown_endpoint_id_and_cross_namespace_backend_make_zero_kubectl_calls
         resource_name: "tenant/route".to_string(),
         backend_service: Some("argocd/argocd-server".to_string()),
         backend_upstream: None,
+        sso_oidc: false,
     };
     let bad_label = DiscoveredEndpoint {
         id: "ingress:argocd/ing:bad.example.internal".to_string(),
@@ -410,6 +423,7 @@ async fn unknown_endpoint_id_and_cross_namespace_backend_make_zero_kubectl_calls
         resource_name: "argocd/ing".to_string(),
         backend_service: Some("argocd/--evil".to_string()),
         backend_upstream: None,
+        sso_oidc: false,
     };
     seed_profile_and_endpoints(
         &paths,
@@ -463,6 +477,7 @@ async fn can_i_no_returns_forbidden_without_invoking_get_secret_and_errors_never
         resource_name: "argocd/argocd-ing".to_string(),
         backend_service: Some("argocd/argocd-server".to_string()),
         backend_upstream: None,
+        sso_oidc: false,
     };
     seed_profile_and_endpoints(
         &paths,
@@ -537,9 +552,18 @@ fn response_debug_redacts_username_and_password() {
         host: "grafana.example.test".into(),
         namespace: "ns".into(),
         service_name: "grafana".into(),
-        secret_name: "grafana".into(),
-        username: Some("unique-test-user".into()),
-        password: SecretValue::new("unique-test-password".into()),
+        groups: vec![LoginGroup {
+            label: "Admin account".into(),
+            namespace: "ns".into(),
+            secret_name: "grafana".into(),
+            accounts: vec![LoginAccount {
+                label: "Admin account".into(),
+                key: None,
+                username: Some("unique-test-user".into()),
+                password: SecretValue::new("unique-test-password".into()),
+            }],
+            error: None,
+        }],
     };
     let debug = format!("{response:?}");
     assert!(!debug.contains("unique-test-user"));
@@ -596,6 +620,7 @@ async fn kubeconfig_snapshot_is_pinned_and_removed_after_success_and_failures() 
             resource_name: "monitoring/route".into(),
             backend_service: Some("monitoring/grafana".into()),
             backend_upstream: None,
+            sso_oidc: false,
         };
         let kubeconfig = clean_kubeconfig("lab-ctx");
         seed_profile_and_endpoints(&paths, "lab", &kubeconfig, vec![ep.clone()]);
@@ -674,6 +699,7 @@ async fn live_backend_checks_reject_external_name_missing_and_changed_upstream_b
                 resource_name: "platform-system/route".into(),
                 backend_service: Some("argocd/argocd-server".into()),
                 backend_upstream: Some("platform-system/admin-upstream".into()),
+                sso_oidc: false,
                 ..Default::default()
             };
             seed_profile_and_endpoints(
@@ -722,7 +748,10 @@ async fn live_backend_checks_reject_external_name_missing_and_changed_upstream_b
                 reveal_endpoint_login_with_deps(&runner, &paths, "lab", &ep.id)
                     .await
                     .map(|value| {
-                        assert_eq!(value.password.expose_for_test(), "fake-test-password");
+                        assert_eq!(
+                            value.account().password.expose_for_test(),
+                            "fake-test-password"
+                        );
                     })
             };
             if scenario == "unchanged" {
@@ -776,6 +805,7 @@ fn options_expose_route_namespace_so_cross_binding_is_detectable() {
         resource_name: route.into(),
         backend_service: Some(backend.into()),
         backend_upstream: None,
+        sso_oidc: false,
     };
     let opts = endpoint_login_options_for_slice(&[
         mk("platform-system/route", "argocd/argocd-server"),

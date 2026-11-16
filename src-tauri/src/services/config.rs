@@ -29,6 +29,12 @@ pub struct Profile {
     /// profile YAML round-trips unchanged. Must satisfy `validate::is_safe_ip_address`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gateway_address: Option<String>,
+    /// Username template for Keycloak realm users revealed from `keycloak-user-passwords`
+    /// (ADR-0014): `{key}` is the Secret data key, e.g. `beluga-{key}` when the realm federates
+    /// LDAP users under a prefix. `None` means `{key}`. Validated by
+    /// `validate::is_safe_sso_username_template`; skipped when unset so old YAML round-trips.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sso_username_template: Option<String>,
     /// Which local VM runtime this profile's host(s) came from, if created from a detected
     /// Colima/Lima instance. `#[serde(default, skip_serializing_if = "Option::is_none")]` so
     /// profile YAML persisted before this field existed still deserializes unchanged, and a
@@ -62,6 +68,8 @@ struct ProfileWire {
     #[serde(default)]
     gateway_address: Option<String>,
     #[serde(default)]
+    sso_username_template: Option<String>,
+    #[serde(default)]
     local_runtime: Option<LocalRuntimeSource>,
 }
 
@@ -78,6 +86,7 @@ impl From<ProfileWire> for Profile {
             approved_dns_zones: w.approved_dns_zones,
             trusted_cas: w.trusted_cas,
             gateway_address: w.gateway_address,
+            sso_username_template: w.sso_username_template,
             local_runtime: w.local_runtime,
         }
     }

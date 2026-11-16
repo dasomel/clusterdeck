@@ -12,7 +12,10 @@ pub async fn endpoint_login_options(
     require_main_caller(window.label())?;
     let paths =
         ClusterDeckPaths::resolve().map_err(|_| LoginErrorCode::KubectlFailed.to_string())?;
-    service_login::endpoint_login_options(&paths, &profile_id).map_err(|e| e.to_string())
+    let runner = SystemRunner;
+    service_login::endpoint_login_options_with_deps(&runner, &paths, &profile_id)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]

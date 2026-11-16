@@ -283,6 +283,7 @@ mod tests {
             host_mapping: mapping,
             approved_dns_zones: zones.iter().map(|z| z.to_string()).collect(),
             gateway_address: None,
+            sso_username_template: None,
             trusted_cas: Vec::new(),
             local_runtime: None,
         }

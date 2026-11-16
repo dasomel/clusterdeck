@@ -15,6 +15,16 @@ pub fn is_safe_ip_address(s: &str) -> bool {
     s.parse::<std::net::IpAddr>().is_ok()
 }
 
+/// `Profile.sso_username_template`: exactly one `{key}` placeholder, every other character from
+/// `[A-Za-z0-9._@-]`, at most 64 bytes. It only shapes a displayed username, never an argv.
+pub fn is_safe_sso_username_template(s: &str) -> bool {
+    s.len() <= 64
+        && s.matches("{key}").count() == 1
+        && s.replacen("{key}", "", 1)
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'@' | b'-'))
+}
+
 /// `Profile.gateway_address` must be a concrete IP: an unspecified address (`0.0.0.0`, `::`)
 /// parses as an IP but would map every endpoint hostname to "any host" in `/etc/hosts`.
 pub fn is_safe_gateway_address(s: &str) -> bool {
@@ -221,6 +231,11 @@ pub fn validate_profile(profile: &crate::services::config::Profile) -> Result<()
             return Err(format!("invalid gateway_address: {gateway}"));
         }
     }
+    if let Some(template) = &profile.sso_username_template {
+        if !is_safe_sso_username_template(template) {
+            return Err(format!("invalid sso_username_template: {template}"));
+        }
+    }
     if let Some(local_runtime) = &profile.local_runtime {
         // Same validator lifecycle actions use before embedding an instance name in
         // `colima`/`limactl` argv or an osascript string (services/local_runtime_lifecycle.rs) --
@@ -387,6 +402,7 @@ mod tests {
             host_mapping: crate::services::config::HostMapping::Off,
             approved_dns_zones: Vec::new(),
             gateway_address: None,
+            sso_username_template: None,
             trusted_cas: Vec::new(),
             local_runtime: None,
         };
@@ -422,6 +438,7 @@ mod tests {
             host_mapping: crate::services::config::HostMapping::Off,
             approved_dns_zones: Vec::new(),
             gateway_address: None,
+            sso_username_template: None,
             trusted_cas: Vec::new(),
             local_runtime: None,
         };
@@ -516,6 +533,7 @@ mod tests {
             host_mapping: crate::services::config::HostMapping::Off,
             approved_dns_zones: Vec::new(),
             gateway_address: None,
+            sso_username_template: None,
             trusted_cas: Vec::new(),
             local_runtime: None,
         };
@@ -631,6 +649,7 @@ mod tests {
             host_mapping: crate::services::config::HostMapping::Off,
             approved_dns_zones: Vec::new(),
             gateway_address: None,
+            sso_username_template: None,
             trusted_cas: Vec::new(),
             local_runtime: Some(crate::services::config::LocalRuntimeSource {
                 provider: crate::services::local_runtime_lifecycle::LocalRuntimeProvider::Colima,

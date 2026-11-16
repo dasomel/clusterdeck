@@ -6,6 +6,12 @@ The format follows the principles of Keep a Changelog and uses semantic versioni
 
 ## [Unreleased]
 
+### Added
+
+- Reveal login for SSO-protected apps: the Keycloak endpoint now lists its permanent admin (`keycloak-admin` / `keycloak-admin-credential`, never the bootstrap admin) and the realm users (`keycloak-user-passwords`), and endpoints that sign in via Keycloak (APISIX `openid-connect` route or a literal issuer env on the backend pod) show the same realm users next to their own admin login, with per-source error codes so one forbidden Secret does not hide the rest
+- SSO evidence now also comes from OAuth/OIDC env names on the backend pod and from a read-only HTTP probe of the app's login surface (NextAuth `/api/auth/providers`, or a redirect to a Keycloak realm), only when the cluster has exactly one Keycloak; a missing app admin Secret no longer hides the SSO accounts
+- Profile setting "SSO username template" (default `{key}`, e.g. `beluga-{key}`) so Keycloak realm users whose login name differs from the `keycloak-user-passwords` key (LDAP-federated realms) show the right username
+
 ## [0.8.1] - 2026-11-16
 
 ### Changed

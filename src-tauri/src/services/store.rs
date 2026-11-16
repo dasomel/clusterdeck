@@ -210,6 +210,7 @@ mod tests {
             host_mapping: crate::services::config::HostMapping::Hosts,
             approved_dns_zones: Vec::new(),
             gateway_address: None,
+            sso_username_template: None,
             trusted_cas: Vec::new(),
             local_runtime: None,
         };
@@ -233,6 +234,7 @@ mod tests {
             host_mapping: crate::services::config::HostMapping::Off,
             approved_dns_zones: Vec::new(),
             gateway_address: None,
+            sso_username_template: None,
             trusted_cas: Vec::new(),
             local_runtime: None,
         };
@@ -282,6 +284,7 @@ profiles:
             host_mapping: crate::services::config::HostMapping::Off,
             approved_dns_zones: Vec::new(),
             gateway_address: None,
+            sso_username_template: None,
             trusted_cas: Vec::new(),
             local_runtime: None,
         };
@@ -322,6 +325,7 @@ profiles:
             host_mapping: crate::services::config::HostMapping::Off,
             approved_dns_zones: Vec::new(),
             gateway_address: Some("203.0.113.10\n127.0.0.1 evil".into()),
+            sso_username_template: None,
             trusted_cas: Vec::new(),
             local_runtime: None,
         };
@@ -331,6 +335,79 @@ profiles:
             ..profile
         };
         assert!(upsert_profile(&paths, unspecified).is_err());
+    }
+
+    fn sso_template_profile(template: Option<&str>) -> Profile {
+        Profile {
+            id: "sso".into(),
+            name: "SSO".into(),
+            hosts: vec![],
+            bastion: None,
+            bootstrap: BootstrapPolicy::default(),
+            kubeconfig: None,
+            host_mapping: crate::services::config::HostMapping::Off,
+            approved_dns_zones: Vec::new(),
+            gateway_address: None,
+            sso_username_template: template.map(str::to_string),
+            trusted_cas: Vec::new(),
+            local_runtime: None,
+        }
+    }
+
+    #[test]
+    fn sso_username_template_roundtrips_and_is_omitted_when_none() {
+        let paths = temp_paths("sso-template");
+        upsert_profile(&paths, sso_template_profile(None)).unwrap();
+        let yaml = std::fs::read_to_string(paths.profiles_file()).unwrap();
+        assert!(!yaml.contains("sso_username_template"), "{yaml}");
+
+        upsert_profile(&paths, sso_template_profile(Some("beluga-{key}"))).unwrap();
+        let yaml = std::fs::read_to_string(paths.profiles_file()).unwrap();
+        assert!(
+            yaml.contains("sso_username_template: beluga-{key}"),
+            "{yaml}"
+        );
+        let loaded = get_profile(&paths, "sso").unwrap();
+        assert_eq!(
+            loaded.sso_username_template.as_deref(),
+            Some("beluga-{key}")
+        );
+        // Old YAML without the field loads as the default.
+        std::fs::write(
+            paths.profiles_file(),
+            "profiles:\n  old:\n    name: Old\n    hosts: []\n    manage_hosts_file: false\n",
+        )
+        .unwrap();
+        assert_eq!(
+            load_profiles(&paths).unwrap()[0].sso_username_template,
+            None
+        );
+    }
+
+    #[test]
+    fn upsert_profile_rejects_invalid_sso_username_templates() {
+        let paths = temp_paths("sso-template-invalid");
+        let too_long = format!("{}{{key}}", "a".repeat(60));
+        for bad in [
+            "",
+            "no-placeholder",
+            "{key}{key}",
+            "{key}-{key}",
+            "x {key}",
+            "{key}\n",
+            "a/{key}",
+            "{KEY}",
+            "{key",
+            too_long.as_str(),
+        ] {
+            assert!(
+                upsert_profile(&paths, sso_template_profile(Some(bad))).is_err(),
+                "{bad:?}"
+            );
+        }
+        for good in ["{key}", "beluga-{key}", "{key}@corp.example", "a.b_c-{key}"] {
+            upsert_profile(&paths, sso_template_profile(Some(good))).unwrap();
+        }
     }
 
     #[test]
@@ -346,6 +423,7 @@ profiles:
             host_mapping: crate::services::config::HostMapping::Off,
             approved_dns_zones: Vec::new(),
             gateway_address: None,
+            sso_username_template: None,
             trusted_cas: Vec::new(),
             local_runtime: None,
         };
@@ -365,6 +443,7 @@ profiles:
             host_mapping: crate::services::config::HostMapping::Off,
             approved_dns_zones: Vec::new(),
             gateway_address: None,
+            sso_username_template: None,
             trusted_cas: vec![crate::services::ca_trust::TrustedCa {
                 secret_ref: "platform-system/apisix-gateway-tls-secret".into(),
                 fingerprint_sha256:
@@ -428,6 +507,7 @@ profiles:
             host_mapping: crate::services::config::HostMapping::Off,
             approved_dns_zones: Vec::new(),
             gateway_address: None,
+            sso_username_template: None,
             trusted_cas: Vec::new(),
             local_runtime: None,
         };
@@ -461,6 +541,7 @@ profiles:
             host_mapping: crate::services::config::HostMapping::Off,
             approved_dns_zones: Vec::new(),
             gateway_address: None,
+            sso_username_template: None,
             trusted_cas: Vec::new(),
             local_runtime: None,
         };
@@ -528,6 +609,7 @@ profiles:
             host_mapping: crate::services::config::HostMapping::Off,
             approved_dns_zones: Vec::new(),
             gateway_address: None,
+            sso_username_template: None,
             trusted_cas: Vec::new(),
             local_runtime: Some(LocalRuntimeSource {
                 provider: crate::services::local_runtime_lifecycle::LocalRuntimeProvider::Colima,
@@ -555,6 +637,7 @@ profiles:
             host_mapping: crate::services::config::HostMapping::Off,
             approved_dns_zones: Vec::new(),
             gateway_address: None,
+            sso_username_template: None,
             trusted_cas: Vec::new(),
             local_runtime: None,
         }
