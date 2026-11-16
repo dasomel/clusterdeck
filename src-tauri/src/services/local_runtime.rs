@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::Path;
 
-use crate::services::process::CommandRunner;
+use crate::services::process::{CommandLimits, CommandRunner};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DiscoveredLocalHost {
@@ -183,7 +183,7 @@ async fn detect_colima(
         }
 
         let status = entry.status.unwrap_or_else(|| "Unknown".to_string());
-        let has_k8s = entry
+        let mut has_k8s = entry
             .runtime
             .as_deref()
             .map(|r| r.contains("k3s") || r.contains("kubernetes"))
@@ -213,6 +213,39 @@ async fn detect_colima(
                     user = u;
                 }
                 identity_file = parsed.identity_file;
+            }
+        }
+
+        // Issue #168: k3s installed inside the guest while Colima's own kubernetes is disabled
+        // leaves no "k3s" in the runtime string, so probe the running guest for its kubeconfig.
+        // Failure/timeout keeps the previous "no kubeconfig source" result.
+        if !has_k8s
+            && status == "Running"
+            && crate::services::validate::is_safe_ssh_identifier(&address)
+            && crate::services::validate::is_safe_ssh_identifier(&user)
+            && identity_file
+                .as_ref()
+                .map(|k| crate::services::validate::is_safe_ssh_identifier(k))
+                .unwrap_or(true)
+        {
+            let probe_host = crate::services::config::Host {
+                name: entry.name.clone(),
+                address: address.clone(),
+                port,
+                user: user.clone(),
+                identity_file: identity_file.clone(),
+                auth: crate::services::config::AuthMode::Key,
+            };
+            let probe_args = crate::services::ssh::build_ssh_target_args(
+                &probe_host,
+                None,
+                &["test -f /etc/rancher/k3s/k3s.yaml && echo HAS_K3S || true"],
+            );
+            if let Ok(res) = runner
+                .run_bounded("ssh", &probe_args, CommandLimits::default())
+                .await
+            {
+                has_k8s = res.success && res.stdout.contains("HAS_K3S");
             }
         }
 
@@ -1309,6 +1342,96 @@ K8S_VERSION="1.36" # k3s channel
                 assert!(!arg.contains("-oProxyCommand=evil"));
             }
         }
+    }
+
+    struct ColimaGuestProbeRunner {
+        colima_list: &'static str,
+        probe_stdout: Option<&'static str>,
+        calls: Mutex<Vec<(String, Vec<String>)>>,
+    }
+
+    #[async_trait]
+    impl CommandRunner for ColimaGuestProbeRunner {
+        async fn run(&self, bin: &str, args: &[String]) -> Result<CommandOutput, String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((bin.to_string(), args.to_vec()));
+            let ok = |stdout: &str| {
+                Ok(CommandOutput {
+                    stdout: stdout.into(),
+                    stderr: String::new(),
+                    success: true,
+                })
+            };
+            match (bin, args.first().map(|s| s.as_str())) {
+                ("colima", Some("list")) => ok(self.colima_list),
+                ("colima", Some("ssh-config")) => {
+                    ok("Host colima-beluga\n  User tester\n  Hostname 127.0.0.1\n  Port 56260\n")
+                }
+                ("ssh", _) => match self.probe_stdout {
+                    Some(out) => ok(out),
+                    None => Err("ssh failed".into()),
+                },
+                _ => Err(format!("unknown command {bin}")),
+            }
+        }
+    }
+
+    async fn colima_probe_case(
+        list: &'static str,
+        probe_stdout: Option<&'static str>,
+    ) -> (Vec<DiscoveredLocalHost>, usize) {
+        let runner = ColimaGuestProbeRunner {
+            colima_list: list,
+            probe_stdout,
+            calls: Mutex::new(Vec::new()),
+        };
+        let result = detect_colima(&runner, &HashSet::new()).await;
+        let ssh_calls = runner
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(bin, _)| bin == "ssh")
+            .count();
+        (result, ssh_calls)
+    }
+
+    #[tokio::test]
+    async fn detect_colima_probes_guest_k3s_when_runtime_lacks_it() {
+        let list = r#"{"name":"beluga","status":"Running","runtime":"containerd"}"#;
+        let (result, ssh_calls) = colima_probe_case(list, Some("HAS_K3S\n")).await;
+        assert_eq!(ssh_calls, 1);
+        assert_eq!(result[0].kube_context.as_deref(), Some("colima-beluga"));
+        assert_eq!(
+            result[0].kube_remote_path.as_deref(),
+            Some("/etc/rancher/k3s/k3s.yaml")
+        );
+    }
+
+    #[tokio::test]
+    async fn detect_colima_guest_probe_absent_or_failed_yields_no_kubeconfig() {
+        let list = r#"{"name":"beluga","status":"Running","runtime":"containerd"}"#;
+        for probe in [Some(""), None] {
+            let (result, ssh_calls) = colima_probe_case(list, probe).await;
+            assert_eq!(ssh_calls, 1);
+            assert_eq!(result[0].kube_context, None);
+            assert_eq!(result[0].kube_remote_path, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn detect_colima_skips_guest_probe_for_k3s_runtime_and_stopped_vm() {
+        let k3s = r#"{"name":"beluga","status":"Running","runtime":"docker+k3s"}"#;
+        let (result, ssh_calls) = colima_probe_case(k3s, Some("HAS_K3S")).await;
+        assert_eq!(ssh_calls, 0);
+        assert_eq!(result[0].kube_context.as_deref(), Some("colima-beluga"));
+
+        let stopped = r#"{"name":"beluga","status":"Stopped","runtime":"containerd"}"#;
+        let (result, ssh_calls) = colima_probe_case(stopped, Some("HAS_K3S")).await;
+        assert_eq!(ssh_calls, 0);
+        assert_eq!(result[0].kube_context, None);
     }
 
     #[tokio::test]
