@@ -134,7 +134,7 @@ export function useEndpointLogins(
         for (const opt of opts) {
           api
             .checkEndpointLogin(currentProfileId, opt.endpoint_id)
-            .then(() => {
+            .then((checked) => {
               if (
                 gen !== optionsGenRef.current ||
                 activeProfileIdRef.current !== currentProfileId ||
@@ -142,6 +142,8 @@ export function useEndpointLogins(
               ) {
                 return;
               }
+              // The backend resolves the real Secret from the workload; show that name.
+              setOptionsById((prev) => ({ ...prev, [opt.endpoint_id]: checked }));
               setPermissionsById((prev) => ({ ...prev, [opt.endpoint_id]: 'permitted' }));
             })
             .catch((err: unknown) => {

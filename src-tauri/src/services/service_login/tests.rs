@@ -148,7 +148,7 @@ pub(super) fn secret_json(entries: &[(&str, &str)]) -> String {
 }
 
 #[test]
-fn lookup_service_login_matches_all_six_d2_entries_and_rejects_unknown() {
+fn lookup_service_login_matches_the_d2_entries_and_rejects_unknown() {
     let argo = lookup_service_login("argocd-server").unwrap();
     assert_eq!(argo.secret_name, "argocd-initial-admin-secret");
     assert_eq!(argo.username, UsernameSource::Fixed("admin"));
@@ -162,12 +162,9 @@ fn lookup_service_login_matches_all_six_d2_entries_and_rejects_unknown() {
     }
     assert!(lookup_service_login("-grafana").is_none());
 
-    for svc in ["keycloak", "keycloak-service"] {
-        let kc = lookup_service_login(svc).unwrap();
-        assert_eq!(kc.secret_name, "keycloak-initial-admin");
-        assert_eq!(kc.username, UsernameSource::SecretKey("username"));
-        assert_eq!(kc.password_key, "password");
-    }
+    // The Keycloak bootstrap admin is temporary and usually deleted, so it is not offered.
+    assert!(lookup_service_login("keycloak").is_none());
+    assert!(lookup_service_login("keycloak-service").is_none());
 
     for svc in ["harbor-core", "harbor"] {
         let h = lookup_service_login(svc).unwrap();
@@ -210,20 +207,6 @@ async fn reveal_endpoint_login_decodes_each_d2_service_and_handles_missing_gitea
             ],
             Some("graf-admin"),
             "fake-graf-pw",
-        ),
-        (
-            "iam",
-            "keycloak",
-            vec![("username", "kc-admin"), ("password", "fake-kc-pw")],
-            Some("kc-admin"),
-            "fake-kc-pw",
-        ),
-        (
-            "iam",
-            "keycloak-service",
-            vec![("username", "kc-admin"), ("password", "fake-kc-pw")],
-            Some("kc-admin"),
-            "fake-kc-pw",
         ),
         (
             "registry",
