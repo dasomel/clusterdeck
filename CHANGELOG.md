@@ -6,6 +6,10 @@ The format follows the principles of Keep a Changelog and uses semantic versioni
 
 ## [Unreleased]
 
+### Fixed
+
+- Ignore floating VIPs (`deprecated` or `/32` addresses) when probing a VM's private-network IP, so a kube-vip/keepalived address on the VMware host-only NIC can never be stored instead of the node's own host-only IP, while the VMware NAT DHCP address stays a last-resort fallback (#164)
+
 ## [0.8.0] - 2026-11-16
 
 ### Added
