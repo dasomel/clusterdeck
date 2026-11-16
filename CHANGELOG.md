@@ -6,6 +6,8 @@ The format follows the principles of Keep a Changelog and uses semantic versioni
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-11-16
+
 ### Changed
 
 - Reveal login no longer offers Keycloak: its bootstrap admin is temporary and usually deleted, so the revealed login returned 401 (#167)
