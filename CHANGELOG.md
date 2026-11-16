@@ -6,6 +6,10 @@ The format follows the principles of Keep a Changelog and uses semantic versioni
 
 ## [Unreleased]
 
+### Fixed
+
+- Detect k3s installed inside a running Colima guest (Colima's own Kubernetes disabled, runtime `containerd`/`docker`): Discovery now probes the guest for `/etc/rancher/k3s/k3s.yaml` over the Colima SSH endpoint so the profile gets a kubeconfig source (#168)
+
 ## [0.8.0] - 2026-11-16
 
 ### Added
