@@ -6,8 +6,14 @@ The format follows the principles of Keep a Changelog and uses semantic versioni
 
 ## [Unreleased]
 
+### Changed
+
+- Reveal login no longer offers Keycloak: its bootstrap admin is temporary and usually deleted, so the revealed login returned 401 (#167)
+
 ### Fixed
 
+- Reveal login now resolves the admin Secret from the backend workload's env `secretKeyRef` (Grafana `admin.existingSecret`, Gitea admin username from `GITEA_ADMIN_USERNAME`), falling back to the static convention, so revealed Grafana and Gitea credentials actually log in (#167, ADR-0014 D2 amendment)
+- Ignore floating VIPs (`deprecated` or `/32` addresses) when probing a VM's private-network IP, so a kube-vip/keepalived address on the VMware host-only NIC can never be stored instead of the node's own host-only IP, while the VMware NAT DHCP address stays a last-resort fallback (#164)
 - Detect k3s installed inside a running Colima guest (Colima's own Kubernetes disabled, runtime `containerd`/`docker`): Discovery now probes the guest for `/etc/rancher/k3s/k3s.yaml` over the Colima SSH endpoint so the profile gets a kubeconfig source (#168)
 
 ## [0.8.0] - 2026-11-16

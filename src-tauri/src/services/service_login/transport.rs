@@ -2,7 +2,7 @@ use std::path::Path;
 
 use super::{LoginErrorCode, KUBECTL_LOGIN_LIMITS};
 use crate::services::k8s_endpoints::{curl_k8s_api_value, stderr_says_unauthorized, CurlOptions};
-use crate::services::process::{CommandOutput, CommandRunner};
+use crate::services::process::{CommandLimits, CommandOutput, CommandRunner};
 use crate::services::validate::is_safe_k8s_dns_label;
 
 // D1 (amended): kubectl first; system curl only when kubectl failed at the transport level,
@@ -82,11 +82,12 @@ async fn curl_json(
     context: &str,
     api_path: &str,
     post_json: Option<&str>,
+    limits: CommandLimits,
 ) -> Result<serde_json::Value, LoginErrorCode> {
     let config = pinned_config(kubeconfig, context).ok_or(LoginErrorCode::KubectlFailed)?;
     let options = CurlOptions {
         post_json,
-        limits: Some(KUBECTL_LOGIN_LIMITS),
+        limits: Some(limits),
     };
     let stdout = curl_k8s_api_value(runner, &config, api_path, options)
         .await
@@ -122,6 +123,27 @@ pub(super) async fn get_json(
     kubectl_get_args: &[&str],
     api_path: &str,
 ) -> Result<serde_json::Value, LoginErrorCode> {
+    get_json_limited(
+        runner,
+        kubeconfig,
+        context,
+        kubectl_get_args,
+        api_path,
+        KUBECTL_LOGIN_LIMITS,
+    )
+    .await
+}
+
+/// `get_json` with a caller-chosen output bound, for reads that cannot carry secret data and
+/// may be larger than a single object (pod lists).
+pub(super) async fn get_json_limited(
+    runner: &dyn CommandRunner,
+    kubeconfig: &Path,
+    context: &str,
+    kubectl_get_args: &[&str],
+    api_path: &str,
+    limits: CommandLimits,
+) -> Result<serde_json::Value, LoginErrorCode> {
     let mut args = vec![
         "--kubeconfig",
         kubeconfig.to_str().ok_or(LoginErrorCode::KubectlFailed)?,
@@ -130,12 +152,12 @@ pub(super) async fn get_json(
         "get",
     ];
     args.extend_from_slice(kubectl_get_args);
-    args.extend(["-o", "json"]);
+    // `get --raw` already prints the API body and rejects `-o`.
+    if kubectl_get_args.first() != Some(&"--raw") {
+        args.extend(["-o", "json"]);
+    }
     let args: Vec<String> = args.into_iter().map(str::to_string).collect();
-    let failure = match runner
-        .run_bounded("kubectl", &args, KUBECTL_LOGIN_LIMITS)
-        .await
-    {
+    let failure = match runner.run_bounded("kubectl", &args, limits.clone()).await {
         Ok(out) if out.success => {
             return serde_json::from_str(&out.stdout).map_err(|_| LoginErrorCode::KubectlFailed)
         }
@@ -148,7 +170,7 @@ pub(super) async fn get_json(
         Err(error) => kubectl_error(&error),
     };
     after_kubectl_failure(
-        curl_json(runner, kubeconfig, context, api_path, None).await,
+        curl_json(runner, kubeconfig, context, api_path, None, limits).await,
         failure,
     )
 }
@@ -200,6 +222,7 @@ pub(super) async fn can_i_get_secret(
             context,
             "/apis/authorization.k8s.io/v1/selfsubjectaccessreviews",
             Some(&body),
+            KUBECTL_LOGIN_LIMITS,
         )
         .await,
         failure,

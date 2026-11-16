@@ -493,6 +493,11 @@ pub fn extract_private_network_ip(ip_output: &str, current_address: &str) -> Opt
         };
 
         let ip_str = cidr.split('/').next().unwrap_or("");
+        // A deprecated address or a /32 on a NIC is a floating VIP (keepalived, kube-vip, CNI host
+        // IP), not the node's stable address; it scores like one and would tie the real NIC.
+        if trimmed.contains("deprecated") || cidr.ends_with("/32") {
+            continue;
+        }
         let ipv4: std::net::Ipv4Addr = match ip_str.parse() {
             Ok(ip) => ip,
             Err(_) => continue,
@@ -1193,6 +1198,19 @@ HAS_K3S
 "#;
         let priv_ip = extract_private_network_ip(sample_output, "172.16.221.133");
         assert_eq!(priv_ip.as_deref(), Some("192.168.77.10"));
+    }
+
+    #[test]
+    fn extract_private_network_ip_ignores_vip_on_vmware_host_only_nic() {
+        let out = "1: lo    inet 127.0.0.1/8 scope host lo\\       valid_lft forever preferred_lft forever\n\
+2: enp2s0    inet 172.16.221.135/24 metric 100 brd 172.16.221.255 scope global dynamic enp2s0\\       valid_lft 1324sec preferred_lft 1324sec\n\
+3: enp26s0    inet 192.168.56.100/32 scope global deprecated enp26s0\\       valid_lft forever preferred_lft forever\n\
+3: enp26s0    inet 192.168.56.10/24 brd 192.168.56.255 scope global enp26s0\\       valid_lft forever preferred_lft forever\n\
+5: cilium_host    inet 10.244.0.107/32 scope global cilium_host\\       valid_lft forever preferred_lft forever\n";
+        assert_eq!(
+            extract_private_network_ip(out, "172.16.221.135").as_deref(),
+            Some("192.168.56.10")
+        );
     }
 
     struct FakeRunnerWithSsh {

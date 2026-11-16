@@ -34,7 +34,7 @@ pub(super) async fn validate_live_backend(
     endpoint: &DiscoveredEndpoint,
     namespace: &str,
     service: &str,
-) -> Result<(), LoginErrorCode> {
+) -> Result<serde_json::Value, LoginErrorCode> {
     // D2: cached DNS targets can drift. Re-read only their source and target with the
     // same credentials. Cost: two bounded reads; escape: rescan after a mismatch.
     if let Some(reference) = &endpoint.backend_upstream {
@@ -87,7 +87,7 @@ pub(super) async fn validate_live_backend(
         .and_then(|value| value.as_str())
     {
         Some("ExternalName") => Err(LoginErrorCode::BackendMismatch),
-        Some("ClusterIP" | "NodePort" | "LoadBalancer") => Ok(()),
+        Some("ClusterIP" | "NodePort" | "LoadBalancer") => Ok(target),
         _ => Err(LoginErrorCode::BackendMismatch),
     }
 }
