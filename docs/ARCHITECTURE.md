@@ -396,7 +396,7 @@ During endpoint discovery, Ingress, APISIX (`ApisixRoute`), Gateway API (`HTTPRo
 parsers also record the resolved `backend_service` (`<ns>/<service>`) and a stable
 `endpoint_id`. APISIX upstreams may resolve an exact in-cluster Service DNS target across
 namespaces; login Secrets belong to that Service's namespace (ADR-0014 D2). For services matching the static convention registry in `services/service_login.rs`
-(`argocd-server`, `<release>-grafana` / `grafana`, `keycloak`, `harbor-core` / `harbor`,
+(`argocd-server`, `<release>-grafana` / `grafana`, `harbor-core` / `harbor`,
 `gitea-http`, `superset`), the Endpoints tab offers an on-demand **Reveal login** action gated by
 the user's own Kubernetes RBAC (`kubectl auth can-i get secret/<name> -n <ns>`, refusing
 kubeconfig impersonation fields). Revealed credentials are held only in local component state for

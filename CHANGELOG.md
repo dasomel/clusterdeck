@@ -6,6 +6,14 @@ The format follows the principles of Keep a Changelog and uses semantic versioni
 
 ## [Unreleased]
 
+### Changed
+
+- Reveal login no longer offers Keycloak: its bootstrap admin is temporary and usually deleted, so the revealed login returned 401.
+
+### Fixed
+
+- Reveal login now resolves the admin Secret from the backend workload's env `secretKeyRef` (Grafana `admin.existingSecret`, Gitea admin username from `GITEA_ADMIN_USERNAME`), falling back to the static convention, so revealed Grafana and Gitea credentials actually log in (ADR-0014 D2 amendment).
+
 ## [0.8.0] - 2026-11-16
 
 ### Added

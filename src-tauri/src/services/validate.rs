@@ -334,6 +334,17 @@ pub fn is_safe_k8s_dns_label(s: &str) -> bool {
         .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-')
 }
 
+/// Sink validator for a Secret `data` key (`secretKeyRef.key` read from a workload spec, so
+/// untrusted): 1..=253 characters of `[-._a-zA-Z0-9]`, and not `.`/`..`.
+pub fn is_safe_k8s_secret_key(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 253
+        && s != "."
+        && s != ".."
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -732,5 +743,31 @@ mod tests {
         assert!(!is_safe_k8s_dns_label("ns/name"));
         assert!(!is_safe_k8s_dns_label("--context=evil"));
         assert!(!is_safe_k8s_dns_label("bad\nlabel"));
+    }
+
+    #[test]
+    fn is_safe_k8s_secret_key_boundary_cases() {
+        for ok in [
+            "password",
+            "admin-password",
+            "HARBOR_ADMIN_PASSWORD",
+            "a.b_c-1",
+            ".dockercfg",
+        ] {
+            assert!(is_safe_k8s_secret_key(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            ".",
+            "..",
+            "a/b",
+            "a b",
+            "a\nb",
+            "a;b",
+            "ü",
+            &"a".repeat(254),
+        ] {
+            assert!(!is_safe_k8s_secret_key(bad), "{bad:?}");
+        }
     }
 }

@@ -90,6 +90,8 @@ pub struct ServiceLoginSpec {
     pub username: UsernameSource,
     pub password_key: &'static str,
     pub chart_source: &'static str,
+    /// Env var names on the backend workload that reference the real admin Secret.
+    pub workload_env: Option<WorkloadEnv>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -137,7 +139,9 @@ impl fmt::Debug for RevealedEndpointLogin {
 mod backend;
 mod snapshot;
 mod transport;
+mod workload;
 use snapshot::KubeconfigSnapshot;
+use workload::{UserSource, WorkloadEnv};
 
 /// D2 static registry mapping a Kubernetes Service name to its initial-admin Secret convention.
 /// Widening this table or adding user-defined mappings requires a follow-up ADR (ADR-0014 D2).
@@ -152,6 +156,7 @@ pub fn lookup_service_login(service_name: &str) -> Option<ServiceLoginSpec> {
             username: UsernameSource::Fixed("admin"),
             password_key: "password",
             chart_source: "argo/argo-cd",
+            workload_env: None,
         }),
         // grafana/grafana & kube-prometheus-stack: Service `<release>-grafana` or `grafana` -> same-named Secret
         "grafana" => Some(ServiceLoginSpec {
@@ -159,20 +164,19 @@ pub fn lookup_service_login(service_name: &str) -> Option<ServiceLoginSpec> {
             username: UsernameSource::SecretKey("admin-user"),
             password_key: "admin-password",
             chart_source: "grafana/grafana, kube-prometheus-stack",
-        }),
-        // Keycloak operator / bitnami/keycloak: both measured Service aliases share this Secret.
-        "keycloak" | "keycloak-service" => Some(ServiceLoginSpec {
-            secret_name: "keycloak-initial-admin".to_string(),
-            username: UsernameSource::SecretKey("username"),
-            password_key: "password",
-            chart_source: "Keycloak operator / bitnami/keycloak",
+            workload_env: Some(WorkloadEnv {
+                username: "GF_SECURITY_ADMIN_USER",
+                password: "GF_SECURITY_ADMIN_PASSWORD",
+            }),
         }),
         // goharbor/harbor: Service `harbor-core` or `harbor` -> Secret `harbor-secrets`
+        // (no workload_env: the measured static Secret already logs in)
         "harbor-core" | "harbor" => Some(ServiceLoginSpec {
             secret_name: "harbor-secrets".to_string(),
             username: UsernameSource::Fixed("admin"),
             password_key: "HARBOR_ADMIN_PASSWORD",
             chart_source: "goharbor/harbor",
+            workload_env: None,
         }),
         // gitea-charts/gitea: Service `gitea-http` -> Secret `gitea-admin`
         "gitea-http" => Some(ServiceLoginSpec {
@@ -180,6 +184,10 @@ pub fn lookup_service_login(service_name: &str) -> Option<ServiceLoginSpec> {
             username: UsernameSource::SecretKey("username"),
             password_key: "admin-password",
             chart_source: "gitea-charts/gitea",
+            workload_env: Some(WorkloadEnv {
+                username: "GITEA_ADMIN_USERNAME",
+                password: "GITEA_ADMIN_PASSWORD",
+            }),
         }),
         // apache/superset: Service `superset` -> Secret `superset-credential`
         "superset" => Some(ServiceLoginSpec {
@@ -187,6 +195,7 @@ pub fn lookup_service_login(service_name: &str) -> Option<ServiceLoginSpec> {
             username: UsernameSource::Fixed("admin"),
             password_key: "admin-password",
             chart_source: "apache/superset",
+            workload_env: None,
         }),
         other => {
             if let Some(release) = other.strip_suffix("-grafana") {
@@ -196,6 +205,10 @@ pub fn lookup_service_login(service_name: &str) -> Option<ServiceLoginSpec> {
                         username: UsernameSource::SecretKey("admin-user"),
                         password_key: "admin-password",
                         chart_source: "grafana/grafana, kube-prometheus-stack",
+                        workload_env: Some(WorkloadEnv {
+                            username: "GF_SECURITY_ADMIN_USER",
+                            password: "GF_SECURITY_ADMIN_PASSWORD",
+                        }),
                     });
                 }
             }
@@ -358,7 +371,7 @@ pub async fn check_endpoint_login_with_deps(
         .find(|e| e.endpoint_id() == endpoint_id)
         .ok_or(LoginErrorCode::NotFound)?;
     let (namespace, service_name, spec) = resolve_endpoint_target(ep)?;
-    backend::validate_live_backend(
+    let service = backend::validate_live_backend(
         runner,
         kubeconfig_path,
         &context,
@@ -367,12 +380,21 @@ pub async fn check_endpoint_login_with_deps(
         &service_name,
     )
     .await?;
+    let login = workload::resolve(
+        runner,
+        kubeconfig_path,
+        &context,
+        &namespace,
+        &service,
+        &spec,
+    )
+    .await;
     transport::can_i_get_secret(
         runner,
         kubeconfig_path,
         &context,
         &namespace,
-        &spec.secret_name,
+        &login.secret_name,
     )
     .await?;
     Ok(EndpointLoginOption {
@@ -382,7 +404,7 @@ pub async fn check_endpoint_login_with_deps(
         host: ep.host.clone(),
         namespace,
         service_name,
-        secret_name: spec.secret_name,
+        secret_name: login.secret_name,
     })
 }
 
@@ -408,7 +430,7 @@ pub async fn reveal_endpoint_login_with_deps(
         .ok_or(LoginErrorCode::NotFound)?;
     let (namespace, service_name, spec) = resolve_endpoint_target(ep)?;
 
-    backend::validate_live_backend(
+    let service = backend::validate_live_backend(
         runner,
         kubeconfig_path,
         &context,
@@ -417,24 +439,33 @@ pub async fn reveal_endpoint_login_with_deps(
         &service_name,
     )
     .await?;
+    let login = workload::resolve(
+        runner,
+        kubeconfig_path,
+        &context,
+        &namespace,
+        &service,
+        &spec,
+    )
+    .await;
     transport::can_i_get_secret(
         runner,
         kubeconfig_path,
         &context,
         &namespace,
-        &spec.secret_name,
+        &login.secret_name,
     )
     .await?;
 
     let api_path = format!(
         "/api/v1/namespaces/{namespace}/secrets/{}",
-        spec.secret_name
+        login.secret_name
     );
     let val = transport::get_json(
         runner,
         kubeconfig_path,
         &context,
-        &["secret", &spec.secret_name, "-n", &namespace],
+        &["secret", &login.secret_name, "-n", &namespace],
         &api_path,
     )
     .await?;
@@ -444,16 +475,16 @@ pub async fn reveal_endpoint_login_with_deps(
         .ok_or(LoginErrorCode::NotFound)?;
 
     let raw_pw_b64 = data
-        .get(spec.password_key)
+        .get(login.password_key.as_str())
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .ok_or(LoginErrorCode::NotFound)?;
     let pw_bytes = decode_base64(raw_pw_b64).ok_or(LoginErrorCode::KubectlFailed)?;
     let pw_str = String::from_utf8(pw_bytes).map_err(|_| LoginErrorCode::KubectlFailed)?;
 
-    let username = match spec.username {
-        UsernameSource::Fixed(u) => Some(u.to_string()),
-        UsernameSource::SecretKey(k) => match data.get(k).and_then(|v| v.as_str()) {
+    let username = match &login.username {
+        UserSource::Fixed(u) => Some(u.clone()),
+        UserSource::SecretKey(k) => match data.get(k.as_str()).and_then(|v| v.as_str()) {
             Some(b64) if !b64.is_empty() => {
                 let bytes = decode_base64(b64).ok_or(LoginErrorCode::KubectlFailed)?;
                 Some(String::from_utf8(bytes).map_err(|_| LoginErrorCode::KubectlFailed)?)
@@ -469,7 +500,7 @@ pub async fn reveal_endpoint_login_with_deps(
         host: ep.host.clone(),
         namespace,
         service_name,
-        secret_name: spec.secret_name,
+        secret_name: login.secret_name,
         username,
         password: SecretValue::new(pw_str),
     })
@@ -479,3 +510,5 @@ pub async fn reveal_endpoint_login_with_deps(
 mod tests;
 #[cfg(test)]
 mod transport_tests;
+#[cfg(test)]
+mod workload_tests;
