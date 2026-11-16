@@ -6,9 +6,17 @@ The format follows the principles of Keep a Changelog and uses semantic versioni
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-11-16
+
 ### Added
 
-- Reveal initial-admin login credentials on demand for discovered cluster endpoints backed by known services (`argocd-server`, `<release>-grafana` / `grafana`, `keycloak`, `harbor-core` / `harbor`, `gitea-http`, `superset`), gated by the user's own Kubernetes RBAC (`kubectl auth can-i`) with kubeconfig impersonation refused and a 60-second in-memory/clipboard lifetime (#161, [ADR-0014](docs/adr/0014-service-login-credentials.md))
+- Reveal initial-admin login credentials on demand for discovered cluster endpoints backed by known services (`argocd-server`, `<release>-grafana` / `grafana`, `keycloak`, `harbor-core` / `harbor`, `gitea-http`, `superset`), gated by the user's own Kubernetes RBAC (`kubectl auth can-i`) with kubeconfig impersonation refused. Values are masked until Reveal, never persisted or logged, and cleared from the panel and (if unchanged) the clipboard after 60 s. APISIX routes that forward to a Service in another namespace are supported and flagged with a cross-namespace warning (#161, #162, [ADR-0014](docs/adr/0014-service-login-credentials.md))
+
+### Fixed
+
+- Reach LAN API servers from the app when macOS Local Network Privacy blocks Homebrew `kubectl`: service-login and APISIX upstream lookups retry once through `/usr/bin/curl` with the same pinned credential. The shared curl path is hardened for every caller: `-q` ignores `~/.curlrc`, the bearer token moves from argv to an owner-only header file, an unusable CA or unresolvable context fails closed, `tokenFile` wins over an inline token, and authoritative 401/403/404 answers are not retried (#161, #162)
+- Show status messages (scan results, warnings, errors) on the Clusters screen; previously they were only visible on Overview (#157, #159)
+- Name generated profiles consistently as `<name> (<Provider>)`, e.g. `beluga (Colima)` instead of `Colima beluga`; profile ids and existing saved names are unchanged (#158)
 
 ## [0.7.1] - 2026-11-16
 
