@@ -6,6 +6,8 @@ The format follows the principles of Keep a Changelog and uses semantic versioni
 
 ## [Unreleased]
 
+## [0.8.2] - 2026-11-18
+
 ### Added
 
 - Reveal login for SSO-protected apps: the Keycloak endpoint now lists its permanent admin (`keycloak-admin` / `keycloak-admin-credential`, never the bootstrap admin) and the realm users (`keycloak-user-passwords`), and endpoints that sign in via Keycloak (APISIX `openid-connect` route or a literal issuer env on the backend pod) show the same realm users next to their own admin login, with per-source error codes so one forbidden Secret does not hide the rest
