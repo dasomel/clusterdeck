@@ -25,6 +25,10 @@ pub struct DiscoveredEndpoint {
     pub backend_service: Option<String>, // "<ns>/<service>", resolved Service namespace (ADR-0014 D2)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend_upstream: Option<String>, // "<route namespace>/<ApisixUpstream name>"
+    /// APISIX route rule for this host enables the `openid-connect` plugin (gateway-level SSO).
+    /// Non-secret SSO evidence for the Keycloak login group (ADR-0014 SSO amendment).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sso_oidc: bool,
 }
 
 impl DiscoveredEndpoint {
@@ -617,6 +621,7 @@ pub fn parse_services(val: &serde_json::Value) -> ServiceDiscoveryInfo {
                                                     resource_name: resource_name.clone(),
                                                     backend_service: backend_service.clone(),
                                                     backend_upstream: None,
+                                                    sso_oidc: false,
                                                 });
                                             }
                                         }
@@ -727,6 +732,7 @@ pub fn parse_ingresses(
                             resource_name: resource_name.clone(),
                             backend_service: select_backend_service(ns, &rule_services),
                             backend_upstream: None,
+                            sso_oidc: false,
                         });
                     }
                 }
@@ -792,6 +798,18 @@ pub(crate) fn apisix_upstream_service(upstream: &serde_json::Value) -> Option<St
 }
 
 type ApisixBackend = (String, Option<String>);
+
+/// True when a rule enables APISIX's `openid-connect` plugin (`enable` defaults to true).
+fn apisix_rule_uses_oidc(rule: &serde_json::Value) -> bool {
+    rule.get("plugins")
+        .and_then(|p| p.as_array())
+        .is_some_and(|plugins| {
+            plugins.iter().any(|plugin| {
+                plugin.get("name").and_then(|n| n.as_str()) == Some("openid-connect")
+                    && plugin.get("enable").and_then(|e| e.as_bool()) != Some(false)
+            })
+        })
+}
 
 fn apisix_rule_backend(
     rule: &serde_json::Value,
@@ -868,13 +886,14 @@ pub fn parse_apisix_routes(
             .unwrap_or_default();
         let resource_name = format!("{ns}/{name}");
 
-        let mut hosts: Vec<(String, Vec<Option<ApisixBackend>>)> = Vec::new();
+        let mut hosts: Vec<(String, Vec<Option<ApisixBackend>>, bool)> = Vec::new();
 
         if let Some(spec) = item.get("spec") {
             for section in ["http", "stream", "tcp"] {
                 if let Some(rules) = spec.get(section).and_then(|r| r.as_array()) {
                     for rule in rules {
                         let rule_svcs = vec![apisix_rule_backend(rule, ns, upstreams)];
+                        let rule_oidc = apisix_rule_uses_oidc(rule);
                         if let Some(h_list) = rule
                             .get("match")
                             .and_then(|m| m.get("hosts"))
@@ -882,12 +901,17 @@ pub fn parse_apisix_routes(
                         {
                             for h in h_list {
                                 if let Some(host_str) = h.as_str() {
-                                    if let Some((_, existing_svcs)) =
-                                        hosts.iter_mut().find(|(eh, _)| eh == host_str)
+                                    if let Some((_, existing_svcs, oidc)) =
+                                        hosts.iter_mut().find(|(eh, _, _)| eh == host_str)
                                     {
                                         existing_svcs.extend(rule_svcs.clone());
+                                        *oidc |= rule_oidc;
                                     } else {
-                                        hosts.push((host_str.to_string(), rule_svcs.clone()));
+                                        hosts.push((
+                                            host_str.to_string(),
+                                            rule_svcs.clone(),
+                                            rule_oidc,
+                                        ));
                                     }
                                 }
                             }
@@ -897,7 +921,7 @@ pub fn parse_apisix_routes(
             }
         }
 
-        for (host, host_svcs) in hosts {
+        for (host, host_svcs, sso_oidc) in hosts {
             if is_safe_host_domain(&host) {
                 let backend_service = host_svcs
                     .iter()
@@ -943,6 +967,7 @@ pub fn parse_apisix_routes(
                     resource_name: resource_name.clone(),
                     backend_service,
                     backend_upstream,
+                    sso_oidc,
                 });
             }
         }
@@ -1005,6 +1030,7 @@ pub fn parse_istio_virtual_services(
                             resource_name: resource_name.clone(),
                             backend_service: None,
                             backend_upstream: None,
+                            sso_oidc: false,
                         });
                     }
                 }
@@ -1067,6 +1093,7 @@ pub fn parse_gateway_httproutes(
                             resource_name: resource_name.clone(),
                             backend_service: backend_service.clone(),
                             backend_upstream: None,
+                            sso_oidc: false,
                         });
                     }
                 }
@@ -1599,6 +1626,30 @@ mod tests {
         assert_eq!(endpoints[0].source, "apisix");
         assert_eq!(endpoints[1].host, "s3.local.beluga.internal");
         assert_eq!(endpoints[1].ip, "192.168.77.200");
+    }
+
+    #[test]
+    fn apisix_routes_flag_the_openid_connect_plugin_per_host() {
+        let val = serde_json::json!({"items": [{
+            "metadata": {"name": "r", "namespace": "apps"},
+            "spec": {"http": [
+                {"match": {"hosts": ["sso.example.internal"]},
+                 "backends": [{"serviceName": "portal"}],
+                 "plugins": [{"name": "openid-connect", "enable": true, "config": {}}]},
+                {"match": {"hosts": ["off.example.internal"]},
+                 "backends": [{"serviceName": "a"}],
+                 "plugins": [{"name": "openid-connect", "enable": false}]},
+                {"match": {"hosts": ["plain.example.internal"]},
+                 "backends": [{"serviceName": "b"}],
+                 "plugins": [{"name": "limit-count"}]}]}}]});
+        let mut svc_ips = HashMap::new();
+        svc_ips.insert(
+            "platform-system/apisix-gateway".into(),
+            "192.0.2.200".into(),
+        );
+        let eps = parse_apisix_routes(&val, &serde_json::json!({"items": []}), &svc_ips, None);
+        let flags: Vec<bool> = eps.iter().map(|e| e.sso_oidc).collect();
+        assert_eq!(flags, [true, false, false]);
     }
 
     #[test]

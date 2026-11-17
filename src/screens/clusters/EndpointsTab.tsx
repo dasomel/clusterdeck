@@ -617,14 +617,11 @@ export default function EndpointsTab({
                     <EndpointLoginPanel
                       revealed={isRevealed ? loginState.revealed : null}
                       errorMessage={errorMsg}
-                      passwordVisible={loginState.passwordVisible}
-                      copiedPassword={loginState.copiedPassword}
+                      visibleKeys={loginState.visibleKeys}
+                      copiedKey={loginState.copiedKey}
                       clipboardNote={loginState.clipboardNote}
-                      onTogglePassword={() =>
-                        loginState.setPasswordVisible(!loginState.passwordVisible)
-                      }
-                      onCopyPassword={loginState.handleCopyPassword}
-                      onCopyUsername={loginState.handleCopyUsername}
+                      onToggleVisible={loginState.toggleVisible}
+                      onCopy={loginState.handleCopyCredential}
                       onClose={loginState.clearRevealedState}
                     />
                   )}

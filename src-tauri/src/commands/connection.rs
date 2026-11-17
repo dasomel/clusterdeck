@@ -974,6 +974,7 @@ pub fn merge_discovered_endpoints(
                         resource_name: String::new(),
                         backend_service: None,
                         backend_upstream: None,
+                        sso_oidc: false,
                     });
                 }
             }
@@ -1355,6 +1356,7 @@ mod tests {
             host_mapping: crate::services::config::HostMapping::Off,
             approved_dns_zones: Vec::new(),
             gateway_address: None,
+            sso_username_template: None,
             trusted_cas: Vec::new(),
             local_runtime: None,
         }
@@ -1375,6 +1377,7 @@ mod tests {
             resource_name: "ns/service".into(),
             backend_service: None,
             backend_upstream: None,
+            sso_oidc: false,
         };
         let old = endpoint("ingress", "old.example.test");
         let retained = endpoint("service", "retained.example.test");

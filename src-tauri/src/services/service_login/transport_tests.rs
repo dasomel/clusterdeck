@@ -152,6 +152,7 @@ fn endpoint() -> DiscoveredEndpoint {
         resource_name: "monitoring/route".into(),
         backend_service: Some("monitoring/grafana".into()),
         backend_upstream: None,
+        sso_oidc: false,
     }
 }
 
@@ -172,8 +173,8 @@ async fn kubectl_transport_failure_reveals_through_pinned_curl() {
     let login = reveal_endpoint_login_with_deps(&runner, &paths, "lab", &ep.id)
         .await
         .unwrap();
-    assert_eq!(login.username.as_deref(), Some("graf-admin"));
-    assert_eq!(login.password.expose_for_test(), "fake-graf-pw");
+    assert_eq!(login.account().username.as_deref(), Some("graf-admin"));
+    assert_eq!(login.account().password.expose_for_test(), "fake-graf-pw");
 
     let curls = runner.calls("curl");
     assert_eq!(curls.len(), 3, "service, SSAR, secret");
