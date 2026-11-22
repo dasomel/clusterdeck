@@ -397,3 +397,13 @@ export type SuggestedDnsZones = {
   zones: string[];
   by_host: Record<string, string[]>;
 };
+
+export type AppSettings = {
+  /** Bundle id; null = system default. */
+  browser: string | null;
+  terminal: string | null;
+};
+
+export type AppChoice = { bundle_id: string; name: string; path: string };
+
+export type InstalledApps = { browsers: AppChoice[]; terminals: AppChoice[] };

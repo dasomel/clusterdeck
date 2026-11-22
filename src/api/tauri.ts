@@ -1,5 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import type {
+  AppSettings,
+  InstalledApps,
   BackupKubeconfigResult,
   ConnectionResult,
   DnsApplyView,
@@ -55,7 +57,7 @@ export const api = {
   getProfileStatus: (profileId: string) => invoke<VerificationResult | null>('get_profile_status', { profileId }),
   connectProfile: (profileId: string, bootstrapPassword?: string, password?: string) =>
     invoke<ConnectionResult>('connect_profile', { profileId, bootstrapPassword, password }),
-  openSshSession: (profileId: string, hostName: string) => invoke<void>('open_ssh_session', { profileId, hostName }),
+  openSshSession: (profileId: string, hostName: string) => invoke<string | null>('open_ssh_session', { profileId, hostName }),
   backupKubeconfig: (moveFile?: boolean) =>
     invoke<BackupKubeconfigResult>('backup_kubeconfig', { moveFile }),
   mergeKubeconfigToSystem: (profileId: string, backupFirst?: boolean) =>
@@ -83,9 +85,9 @@ export const api = {
   restartLocalRuntime: (provider: LocalRuntimeLifecycleProvider, instanceName: string) =>
     invoke<LifecycleActionResult>('restart_local_runtime', { provider, instanceName }),
   openLocalRuntimeShell: (provider: LocalRuntimeLifecycleProvider, instanceName: string) =>
-    invoke<void>('open_local_runtime_shell', { provider, instanceName }),
+    invoke<string | null>('open_local_runtime_shell', { provider, instanceName }),
   openLocalRuntimeContext: (provider: LocalRuntimeLifecycleProvider, instanceName: string) =>
-    invoke<void>('open_local_runtime_context', { provider, instanceName }),
+    invoke<string | null>('open_local_runtime_context', { provider, instanceName }),
   discoverClusterEndpoints: (profileId: string) =>
     invoke<ScanEndpointsResult>('discover_cluster_endpoints_cmd', { profileId }),
   syncHostsFile: (profileId: string) =>
@@ -99,8 +101,11 @@ export const api = {
     invoke<SuggestedDnsZones>('suggest_dns_zones', { hosts }),
   approveDnsZone: (profileId: string, zone: string) =>
     invoke<DnsApplyView>('approve_dns_zone', { profileId, zone }),
+  getAppSettings: () => invoke<AppSettings>('get_app_settings'),
+  setAppSettings: (settings: AppSettings) => invoke<void>('set_app_settings', { settings }),
+  listInstalledApps: () => invoke<InstalledApps>('list_installed_apps'),
   openUrlInBrowser: (url: string) =>
-    invoke<void>('open_url_in_browser', { url }),
+    invoke<string | null>('open_url_in_browser', { url }),
   discoverClusterCas: (profileId: string, endpoints: DiscoveredEndpoint[]) =>
     invoke<DiscoveredCaView[]>('discover_cluster_cas_cmd', { profileId, endpoints }),
   trustCa: (profileId: string, secretRef: string) =>

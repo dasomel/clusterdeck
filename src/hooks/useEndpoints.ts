@@ -344,7 +344,8 @@ export function useEndpoints(
   const openSshSession = useCallback(async (hostName: string) => {
     if (!profile) return;
     try {
-      await api.openSshSession(profile.id, hostName);
+      const note = await api.openSshSession(profile.id, hostName);
+      if (note) pushStatus('warning', note);
     } catch (err) {
       pushStatus('error', 'Failed to open SSH session', [String(err)]);
     }
@@ -352,7 +353,8 @@ export function useEndpoints(
 
   const openUrl = useCallback(async (url: string) => {
     try {
-      await api.openUrlInBrowser(url);
+      const note = await api.openUrlInBrowser(url);
+      if (note) pushStatus('warning', note);
     } catch (err) {
       pushStatus('error', 'Failed to open browser', [String(err)]);
     }

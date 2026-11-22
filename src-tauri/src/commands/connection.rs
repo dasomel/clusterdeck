@@ -3,11 +3,12 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::services::app_settings::{self, AppKind};
 use crate::services::config::{AuthMode, Profile};
 use crate::services::k8s_endpoints::DiscoveredEndpoint;
 use crate::services::kubeconfig::{CurrentContext, KubeconfigSummary};
 use crate::services::paths::ClusterDeckPaths;
-use crate::services::process::{CommandRunner, SystemRunner};
+use crate::services::process::{CommandRunner, SystemRunner, TerminalCommand};
 use crate::services::ssh::{self, BootstrapResult};
 use crate::services::ssh_config;
 use crate::services::state;
@@ -1172,7 +1173,10 @@ pub async fn remove_hosts_file_cmd(profile_id: String) -> Result<SyncHostsResult
 }
 
 #[tauri::command]
-pub async fn open_ssh_session(profile_id: String, host_name: String) -> Result<(), String> {
+pub async fn open_ssh_session(
+    profile_id: String,
+    host_name: String,
+) -> Result<Option<String>, String> {
     let paths = ClusterDeckPaths::resolve()?;
     let runner = SystemRunner;
     let profile = load_profile_fresh(&runner, &paths, &profile_id).await?;
@@ -1194,12 +1198,54 @@ pub async fn open_ssh_session(profile_id: String, host_name: String) -> Result<(
     let _ = ssh::probe_key_auth(&runner, target_host, profile.bastion.as_ref()).await;
 
     let alias = ssh_config::ssh_alias(&profile.id, &host_name);
-    crate::services::process::open_with_system(
-        &runner,
-        &[format!("ssh://{alias}")],
-        "failed to open ssh session",
+    // Settings are read here (not passed from the frontend) so the UI cannot inject a terminal id.
+    let saved = app_settings::load_settings(&paths).terminal;
+    launch_ssh_session(&runner, saved.as_deref(), alias).await
+}
+
+/// Opens `ssh <alias>` in the chosen terminal. Returns a status note when the saved terminal
+/// is gone and the default was used. The alias resolves through the
+/// `Include ~/.clusterdeck/ssh/*.conf` block ensured by the caller.
+async fn launch_ssh_session(
+    runner: &dyn CommandRunner,
+    saved_terminal: Option<&str>,
+    alias: String,
+) -> Result<Option<String>, String> {
+    // The alias becomes a shell/AppleScript token (Terminal, iTerm2), and host names are only
+    // loosely validated at persistence, so re-check a strict charset at this sink.
+    if !alias
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        || alias.starts_with('-')
+    {
+        return Err(format!("unsafe ssh alias: {alias}"));
+    }
+    let (terminal, note) = app_settings::resolve_choice(
+        runner,
+        AppKind::Terminal,
+        saved_terminal,
+        "the default SSH handler",
     )
-    .await
+    .await?;
+    match terminal {
+        Some(id) => {
+            crate::services::process::open_terminal(
+                runner,
+                Some(&id),
+                &TerminalCommand::Argv(vec!["ssh".to_string(), alias]),
+            )
+            .await?
+        }
+        None => {
+            crate::services::process::open_with_system(
+                runner,
+                &[format!("ssh://{alias}")],
+                "failed to open ssh session",
+            )
+            .await?
+        }
+    }
+    Ok(note)
 }
 
 #[tauri::command]
@@ -1282,16 +1328,40 @@ pub async fn open_path_in_finder(path: String) -> Result<(), String> {
     crate::services::kubeconfig::open_path_in_finder(&runner, &path).await
 }
 
+/// Returns a status note when the saved browser is gone and the system default was used.
 #[tauri::command]
-pub async fn open_url_in_browser(url: String) -> Result<(), String> {
+pub async fn open_url_in_browser(url: String) -> Result<Option<String>, String> {
     if !crate::services::validate::is_safe_open_url(&url) {
         return Err(
             "invalid URL: must start with http:// or https:// and must not contain spaces or control characters"
                 .to_string(),
         );
     }
-    let runner = SystemRunner;
-    crate::services::process::open_with_system(&runner, &[url.trim().to_string()], "").await
+    let saved = app_settings::load_settings(&ClusterDeckPaths::resolve()?).browser;
+    open_url(&SystemRunner, saved.as_deref(), url.trim().to_string()).await
+}
+
+/// `open <url>` for the system default browser, `open -b <bundle id> <url>` for a chosen one.
+/// The bundle id is re-checked against the catalog here, not only at save time, because it
+/// comes from a user-editable file and goes straight into argv.
+async fn open_url(
+    runner: &dyn CommandRunner,
+    saved_browser: Option<&str>,
+    url: String,
+) -> Result<Option<String>, String> {
+    let (browser, note) = app_settings::resolve_choice(
+        runner,
+        AppKind::Browser,
+        saved_browser,
+        "the system default browser",
+    )
+    .await?;
+    let args = match browser {
+        Some(id) => vec!["-b".to_string(), id, url],
+        None => vec![url],
+    };
+    crate::services::process::open_with_system(runner, &args, "failed to open browser").await?;
+    Ok(note)
 }
 
 #[cfg(test)]
@@ -1316,6 +1386,149 @@ mod tests {
                 success: true,
             })
         }
+    }
+
+    /// Records every call; `mdfind` finds nothing, everything else succeeds.
+    #[derive(Default)]
+    struct RecordingRunner {
+        calls: std::sync::Mutex<Vec<(String, Vec<String>)>>,
+    }
+
+    #[async_trait]
+    impl CommandRunner for RecordingRunner {
+        async fn run(&self, bin: &str, args: &[String]) -> Result<CommandOutput, String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((bin.to_string(), args.to_vec()));
+            Ok(CommandOutput {
+                stdout: String::new(),
+                stderr: String::new(),
+                success: true,
+            })
+        }
+    }
+
+    fn recorded(r: &RecordingRunner, bin: &str) -> Vec<Vec<String>> {
+        r.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(b, _)| b == bin)
+            .map(|(_, a)| a.clone())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn open_url_unset_uses_plain_open() {
+        let r = RecordingRunner::default();
+        let note = open_url(&r, None, "https://a.example".into())
+            .await
+            .unwrap();
+        assert_eq!(note, None);
+        assert_eq!(recorded(&r, "open"), vec![vec!["https://a.example"]]);
+    }
+
+    #[tokio::test]
+    async fn open_url_chosen_browser_uses_bundle_id() {
+        let r = RecordingRunner::default();
+        // Safari is bundled, so no installed-app lookup is needed.
+        open_url(&r, Some("com.apple.Safari"), "https://a.example".into())
+            .await
+            .unwrap();
+        assert_eq!(
+            recorded(&r, "open"),
+            vec![vec!["-b", "com.apple.Safari", "https://a.example"]]
+        );
+    }
+
+    #[tokio::test]
+    async fn open_url_falls_back_to_default_with_note_when_app_missing() {
+        let r = RecordingRunner::default();
+        // `exists` is injected so the real filesystem (an installed Zen) cannot affect the result.
+        let (app, note) = app_settings::resolve_choice_with(
+            &r,
+            AppKind::Browser,
+            Some("app.zen-browser.zen"),
+            "the system default browser",
+            &|_| false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(app, None);
+        assert!(note.unwrap().contains("not installed"));
+    }
+
+    #[tokio::test]
+    async fn open_url_tampered_settings_id_falls_back_with_note_and_plain_open() {
+        let r = RecordingRunner::default();
+        let note = open_url(&r, Some("-a/evil"), "https://a.example".into())
+            .await
+            .unwrap();
+        assert!(note
+            .unwrap()
+            .contains("ignored; using the system default browser"));
+        assert_eq!(recorded(&r, "open"), vec![vec!["https://a.example"]]);
+    }
+
+    #[tokio::test]
+    async fn tampered_settings_json_falls_back_for_ssh_and_url() {
+        let dir = std::env::temp_dir().join(format!("clusterdeck-tamper-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let paths = ClusterDeckPaths::at(dir.clone());
+        std::fs::create_dir_all(&paths.base).unwrap();
+        std::fs::write(
+            paths.settings_file(),
+            r#"{"browser":"com.evil.App","terminal":"-a/evil"}"#,
+        )
+        .unwrap();
+        let s = app_settings::load_settings(&paths);
+        let r = RecordingRunner::default();
+        let note = launch_ssh_session(&r, s.terminal.as_deref(), "cd-p-h".into())
+            .await
+            .unwrap();
+        assert!(note.unwrap().contains("default SSH handler"));
+        assert_eq!(recorded(&r, "open"), vec![vec!["ssh://cd-p-h"]]);
+        assert!(
+            open_url(&r, s.browser.as_deref(), "https://a.example".into())
+                .await
+                .unwrap()
+                .is_some()
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn launch_ssh_session_default_uses_ssh_scheme() {
+        let r = RecordingRunner::default();
+        launch_ssh_session(&r, None, "cd-p-h".into()).await.unwrap();
+        assert_eq!(recorded(&r, "open"), vec![vec!["ssh://cd-p-h"]]);
+        assert!(recorded(&r, "osascript").is_empty());
+    }
+
+    #[tokio::test]
+    async fn launch_ssh_session_terminals_get_expected_launch_shape() {
+        let r = RecordingRunner::default();
+        launch_ssh_session(&r, Some("com.apple.Terminal"), "cd-p-h".into())
+            .await
+            .unwrap();
+        let scripts = recorded(&r, "osascript");
+        assert!(scripts[0][1].contains("do script \"'ssh' 'cd-p-h'\""));
+    }
+
+    #[tokio::test]
+    async fn launch_ssh_session_rejects_unsafe_alias_and_unknown_terminal() {
+        let r = RecordingRunner::default();
+        for alias in ["-oProxyCommand=x", "a\"b", "a b", "a;b"] {
+            assert!(launch_ssh_session(&r, None, alias.into()).await.is_err());
+        }
+        // An unknown saved terminal never reaches a launch recipe: default handler + note.
+        let note = launch_ssh_session(&r, Some("com.evil.App"), "ok".into())
+            .await
+            .unwrap();
+        assert!(note.is_some());
+        assert_eq!(recorded(&r, "open"), vec![vec!["ssh://ok"]]);
+        assert!(recorded(&r, "osascript").is_empty());
     }
 
     struct NeverCalledRunner;

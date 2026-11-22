@@ -98,6 +98,15 @@ IP가 있는 머신의 Kubernetes 상태는 kubeconfig server 호스트와 6443 
 
 > **독립형 CLI 관련 안내:** 기존 `infradeck` 독립형 CLI는 ClusterDeck 백엔드로 흡수되면서 공개 Rust 라이브러리 크레이트 API가 불필요하게 확장되는 것을 방지하기 위해 별도 바이너리로는 제공되지 않는다. 예제 인벤토리 확인은 데스크톱 앱 내의 **Demo 모드**를 통해 직접 이용할 수 있다.
 
+## 설정: 브라우저와 터미널
+
+**Settings** 화면(사이드바 또는 `⌘,`)에서 URL을 열 **브라우저**와 SSH 세션·VM 셸을 열 **터미널**을 설치된 앱 중에서 고를 수 있다. 이 Mac에 실제로 설치된 앱만 표시되며(새로 설치했다면 재검색 버튼 사용), "System default" / "Terminal (default)"는 기존 동작을 유지하며, 설치되지 않은 앱을 골라 둔 경우 알림과 함께 기본값으로 대체된다. 릴리스 페이지와 Finder 열기는 항상 시스템 기본값을 쓴다.
+
+- 브라우저: Safari, Chrome, Firefox, Edge, Brave, Arc, Vivaldi, Opera, Whale, Orion, Zen.
+- 터미널: Terminal, iTerm2, Ghostty, WezTerm, kitty, Alacritty, Tabby. 기본이 아닌 터미널에서는 `Include ~/.clusterdeck/ssh/*.conf` 블록을 통해 `ssh <alias>`를 실행한다.
+- `~/.clusterdeck/settings.json`(권한 `0600`)에 앱 번들 ID로 저장된다.
+- VM "context shell"의 `kubectl` alias는 Terminal과 iTerm2에서만 유지되며, 다른 터미널에서는 `DOCKER_CONTEXT` export만 적용된다.
+
 ## 첫 성공 기준 (First Verified Success)
 
 앱이 실행되는 것만으로는 성공으로 보지 않는다. 하나의 Profile이 아래 세 단계를 모두 통과했을 때 **첫 성공**으로 본다.
