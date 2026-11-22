@@ -60,6 +60,8 @@ pub struct HostsFileStatus {
     pub conflicts: Vec<crate::services::hosts_file::HostnameConflict>,
 }
 
+const REFRESH_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Loads a profile and, if it was created from a detected Colima/Lima instance
 /// (`Profile.local_runtime`), re-resolves its SSH endpoint against a fresh discovery pass before
 /// any SSH-using command relies on it (D4) -- Colima/Lima forward a new SSH port on every VM
@@ -71,23 +73,66 @@ async fn load_profile_fresh(
     paths: &ClusterDeckPaths,
     profile_id: &str,
 ) -> Result<Profile, String> {
+    load_profile_refreshed(runner, paths, profile_id)
+        .await
+        .map(|(profile, _)| profile)
+}
+
+/// `load_profile_fresh` for commands whose next step is SSH to the VM: a `local_runtime` VM that
+/// is not Running fails fast with a start hint instead of connecting to its stale port (#165).
+/// A refresh that merely failed or timed out keeps the previous behavior.
+async fn load_profile_running(
+    runner: &dyn CommandRunner,
+    paths: &ClusterDeckPaths,
+    profile_id: &str,
+) -> Result<Profile, String> {
+    match load_profile_refreshed(runner, paths, profile_id).await? {
+        (_, Some(not_running)) => Err(not_running),
+        (profile, None) => Ok(profile),
+    }
+}
+
+async fn load_profile_refreshed(
+    runner: &dyn CommandRunner,
+    paths: &ClusterDeckPaths,
+    profile_id: &str,
+) -> Result<(Profile, Option<String>), String> {
+    use crate::services::local_runtime::EndpointRefresh;
+
     let mut profile = store::get_profile(paths, profile_id)?;
     if profile.local_runtime.is_none() {
-        return Ok(profile);
+        return Ok((profile, None));
     }
 
     let snapshot = profile.clone();
-    if crate::services::local_runtime::refresh_local_runtime_endpoint(runner, &mut profile).await {
-        // Re-acquire the write lock and reload fresh from disk before saving, so concurrent
-        // editor saves / CA trust updates are preserved, and deleted profiles are not resurrected.
-        let _lock = crate::services::store::ProfileWriteGuard::lock_process().await;
-        let mut fresh = store::get_profile(paths, profile_id)?;
-        if merge_refreshed_endpoints(&mut fresh, &snapshot, &profile) {
-            store::upsert_profile(paths, fresh.clone())?;
+    // Bounded like Discovery itself: a hung colima/limactl must not stall every SSH-using command.
+    let outcome = tokio::time::timeout(
+        REFRESH_TIMEOUT,
+        crate::services::local_runtime::refresh_local_runtime_endpoint_detailed(
+            runner,
+            &mut profile,
+        ),
+    )
+    .await
+    .unwrap_or(EndpointRefresh::Unchanged);
+    match outcome {
+        EndpointRefresh::Updated => {
+            // Re-acquire the write lock and reload fresh from disk before saving, so concurrent
+            // editor saves / CA trust updates are preserved, and deleted profiles are not resurrected.
+            let _lock = crate::services::store::ProfileWriteGuard::lock_process().await;
+            let mut fresh = store::get_profile(paths, profile_id)?;
+            if merge_refreshed_endpoints(&mut fresh, &snapshot, &profile) {
+                store::upsert_profile(paths, fresh.clone())?;
+                // `ssh <alias>` reads the generated conf, not profiles.yaml; rewrite only the
+                // ClusterDeck-owned file so it never keeps the pre-restart port (#165). Non-fatal:
+                // the callers that need the conf rewrite it themselves and report the error.
+                let _ = ssh_config::write_profile_config(paths, &fresh);
+            }
+            Ok((fresh, None))
         }
-        return Ok(fresh);
+        EndpointRefresh::NotRunning(msg) => Ok((profile, Some(msg))),
+        EndpointRefresh::Unchanged => Ok((profile, None)),
     }
-    Ok(profile)
 }
 
 /// Copies onto `fresh` (re-read under the write lock) only the endpoint fields (address/port/
@@ -137,7 +182,7 @@ pub async fn probe_profile_hosts(
 ) -> Result<Vec<HostStageResult>, String> {
     let paths = ClusterDeckPaths::resolve()?;
     let runner = SystemRunner;
-    let profile = load_profile_fresh(&runner, &paths, &profile_id).await?;
+    let profile = load_profile_running(&runner, &paths, &profile_id).await?;
     let pwd = password.as_deref();
 
     let host_futures = profile.hosts.iter().map(|host| async {
@@ -532,7 +577,7 @@ pub async fn connect_profile(
 ) -> Result<ConnectionResult, String> {
     let paths = ClusterDeckPaths::resolve()?;
     let runner = SystemRunner;
-    let profile = load_profile_fresh(&runner, &paths, &profile_id).await?;
+    let profile = load_profile_running(&runner, &paths, &profile_id).await?;
     let pwd = password.as_deref();
 
     let host_futures = profile.hosts.iter().map(|host| async {
@@ -1179,7 +1224,7 @@ pub async fn open_ssh_session(
 ) -> Result<Option<String>, String> {
     let paths = ClusterDeckPaths::resolve()?;
     let runner = SystemRunner;
-    let profile = load_profile_fresh(&runner, &paths, &profile_id).await?;
+    let profile = load_profile_running(&runner, &paths, &profile_id).await?;
 
     let target_host = profile
         .hosts
@@ -1371,6 +1416,7 @@ mod tests {
     use crate::services::process::CommandOutput;
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
 
     struct AlwaysSucceedsRunner {
         calls: AtomicUsize,
@@ -1860,6 +1906,175 @@ mod tests {
         let stored = store::get_profile(&paths, "colima-default").unwrap();
         assert!(stored.local_runtime.is_none());
         assert_eq!(stored.hosts[0].port, 22);
+    }
+
+    #[tokio::test]
+    async fn load_profile_fresh_persists_new_port_and_rewrites_ssh_conf() {
+        let paths = temp_paths("port");
+        let mut p = runtime_profile();
+        p.sso_username_template = Some("t-{key}".to_string());
+        store::upsert_profile(&paths, p).unwrap();
+        let runner = MidFlightRunner { mutate: || {} };
+
+        let res = load_profile_fresh(&runner, &paths, "colima-default")
+            .await
+            .unwrap();
+
+        assert_eq!(res.hosts[0].port, 58096);
+        let stored = store::get_profile(&paths, "colima-default").unwrap();
+        assert_eq!(stored.hosts[0].port, 58096);
+        assert_eq!(stored.sso_username_template.as_deref(), Some("t-{key}"));
+        let conf = std::fs::read_to_string(paths.ssh_conf("colima-default")).unwrap();
+        assert!(conf.contains("Port 58096"), "{conf}");
+    }
+
+    #[tokio::test]
+    async fn load_profile_fresh_unchanged_port_writes_no_conf() {
+        let paths = temp_paths("same");
+        let mut p = runtime_profile();
+        p.hosts[0].port = 58096;
+        p.hosts[0].address = "127.0.0.1".to_string();
+        p.hosts[0].identity_file = Some("/k".to_string());
+        store::upsert_profile(&paths, p).unwrap();
+        let runner = MidFlightRunner { mutate: || {} };
+
+        load_profile_fresh(&runner, &paths, "colima-default")
+            .await
+            .unwrap();
+
+        assert!(!paths.ssh_conf("colima-default").exists());
+    }
+
+    #[tokio::test]
+    async fn load_profile_fresh_leaves_non_local_runtime_profile_untouched() {
+        let paths = temp_paths("plain");
+        let mut p = runtime_profile();
+        p.local_runtime = None;
+        store::upsert_profile(&paths, p).unwrap();
+        let runner = MidFlightRunner { mutate: || {} };
+
+        let res = load_profile_fresh(&runner, &paths, "colima-default")
+            .await
+            .unwrap();
+
+        assert_eq!(res.hosts[0].port, 22);
+        assert!(!paths.ssh_conf("colima-default").exists());
+    }
+
+    /// Stored shape from a real Add-cluster profile (#165): host `colima-beluga`, instance
+    /// `beluga` (a non-default Colima profile, so `ssh-config --profile beluga`).
+    #[tokio::test]
+    async fn load_profile_fresh_refreshes_named_colima_instance_host() {
+        struct Beluga;
+        #[async_trait]
+        impl CommandRunner for Beluga {
+            async fn run(&self, bin: &str, args: &[String]) -> Result<CommandOutput, String> {
+                let stdout = match (bin, args.first().map(String::as_str)) {
+                    ("colima", Some("list")) => {
+                        r#"{"name":"beluga","status":"Running","runtime":"containerd"}"#
+                    }
+                    ("colima", Some("ssh-config")) => {
+                        "Host colima-beluga\n  IdentityFile \"/k\"\n  User m\n  Hostname 127.0.0.1\n  Port 51930\n"
+                    }
+                    _ => "",
+                };
+                Ok(CommandOutput {
+                    stdout: stdout.into(),
+                    stderr: String::new(),
+                    success: true,
+                })
+            }
+        }
+        let paths = temp_paths("beluga");
+        let mut p = profile_with_hosts(vec![key_host("colima-beluga")]);
+        p.id = "colima-beluga".to_string();
+        p.hosts[0].address = "127.0.0.1".to_string();
+        p.hosts[0].port = 61305;
+        p.hosts[0].user = "m".to_string();
+        p.local_runtime = Some(crate::services::config::LocalRuntimeSource {
+            provider: crate::services::local_runtime_lifecycle::LocalRuntimeProvider::Colima,
+            instance: "beluga".to_string(),
+        });
+        store::upsert_profile(&paths, p).unwrap();
+
+        load_profile_fresh(&Beluga, &paths, "colima-beluga")
+            .await
+            .unwrap();
+
+        let stored = store::get_profile(&paths, "colima-beluga").unwrap();
+        assert_eq!(stored.hosts[0].port, 51930);
+        let conf = std::fs::read_to_string(paths.ssh_conf("colima-beluga")).unwrap();
+        assert!(conf.contains("Port 51930"), "{conf}");
+    }
+
+    struct StateRunner {
+        status: &'static str,
+        calls: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl CommandRunner for StateRunner {
+        async fn run(&self, bin: &str, args: &[String]) -> Result<CommandOutput, String> {
+            self.calls.lock().unwrap().push(bin.to_string());
+            let stdout = match (bin, args.first().map(String::as_str)) {
+                ("colima", Some("list")) => format!(
+                    r#"{{"name":"default","status":"{}","runtime":"docker"}}"#,
+                    self.status
+                ),
+                ("colima", Some("ssh-config")) => {
+                    "Host colima\n  IdentityFile \"/k\"\n  User u\n  Hostname 127.0.0.1\n  Port 58096\n"
+                        .to_string()
+                }
+                _ => String::new(),
+            };
+            Ok(CommandOutput {
+                stdout,
+                stderr: String::new(),
+                success: true,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn load_profile_running_fails_fast_with_start_hint_when_vm_stopped() {
+        let paths = temp_paths("stopped");
+        store::upsert_profile(&paths, runtime_profile()).unwrap();
+        let runner = StateRunner {
+            status: "Stopped",
+            calls: Mutex::new(Vec::new()),
+        };
+
+        let err = load_profile_running(&runner, &paths, "colima-default")
+            .await
+            .unwrap_err();
+
+        assert!(err.contains("Colima VM 'default' is Stopped"), "{err}");
+        assert!(err.contains("colima start -p default"), "{err}");
+        // Nothing but discovery ran: no ssh, no terminal/open launch.
+        let calls = runner.calls.lock().unwrap();
+        assert!(calls.iter().all(|b| b == "colima"), "{calls:?}");
+        // Stale endpoint is left alone and no conf is written.
+        assert_eq!(
+            store::get_profile(&paths, "colima-default").unwrap().hosts[0].port,
+            22
+        );
+        assert!(!paths.ssh_conf("colima-default").exists());
+    }
+
+    #[tokio::test]
+    async fn load_profile_running_passes_through_when_vm_running() {
+        let paths = temp_paths("running");
+        store::upsert_profile(&paths, runtime_profile()).unwrap();
+        let runner = StateRunner {
+            status: "Running",
+            calls: Mutex::new(Vec::new()),
+        };
+
+        let p = load_profile_running(&runner, &paths, "colima-default")
+            .await
+            .unwrap();
+
+        assert_eq!(p.hosts[0].port, 58096);
     }
 
     fn bastion_profile() -> Profile {
