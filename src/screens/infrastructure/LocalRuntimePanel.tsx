@@ -76,7 +76,8 @@ export default function LocalRuntimePanel({ isVisible = true }: { isVisible?: bo
     const provider = toLifecycleProvider(host.provider);
     if (!provider) return;
     try {
-      await api.openLocalRuntimeShell(provider, host.instance_name);
+      const note = await api.openLocalRuntimeShell(provider, host.instance_name);
+      if (note) pushStatus('warning', note);
     } catch (err) {
       pushStatus('error', `Failed to open shell for ${host.instance_name}`, [String(err)]);
     }
@@ -86,7 +87,8 @@ export default function LocalRuntimePanel({ isVisible = true }: { isVisible?: bo
     const provider = toLifecycleProvider(host.provider);
     if (!provider) return;
     try {
-      await api.openLocalRuntimeContext(provider, host.instance_name);
+      const note = await api.openLocalRuntimeContext(provider, host.instance_name);
+      if (note) pushStatus('warning', note);
     } catch (err) {
       pushStatus('error', `Failed to open runtime context for ${host.instance_name}`, [String(err)]);
     }

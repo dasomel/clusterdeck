@@ -17,7 +17,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use crate::services::local_runtime::{self, DiscoveredLocalHost};
-use crate::services::process::{self, CommandOutput, CommandRunner};
+use crate::services::process::{self, CommandOutput, CommandRunner, TerminalCommand};
 use crate::services::validate;
 
 /// Lifecycle calls can take minutes for `start` (VM boot, container runtime init), so the
@@ -338,13 +338,21 @@ pub async fn open_shell(
     runner: &dyn CommandRunner,
     provider: LocalRuntimeProvider,
     instance_name: &str,
+    terminal: Option<&str>,
 ) -> Result<(), String> {
     find_fresh_instance(runner, provider, instance_name).await?;
-    let command_line = match provider {
-        LocalRuntimeProvider::Colima => format!("colima ssh --profile {instance_name}"),
-        LocalRuntimeProvider::Lima => format!("limactl shell {instance_name}"),
-    };
-    process::open_terminal_with_command(runner, &command_line).await
+    process::open_terminal(runner, terminal, &shell_command(provider, instance_name)).await
+}
+
+fn shell_command(provider: LocalRuntimeProvider, instance_name: &str) -> TerminalCommand {
+    let argv: Vec<String> = match provider {
+        LocalRuntimeProvider::Colima => vec!["colima", "ssh", "--profile", instance_name],
+        LocalRuntimeProvider::Lima => vec!["limactl", "shell", instance_name],
+    }
+    .into_iter()
+    .map(String::from)
+    .collect();
+    TerminalCommand::Argv(argv)
 }
 
 /// Builds the D3 Terminal script (`export DOCKER_CONTEXT=...` / `alias kubectl=...`) from an
@@ -385,10 +393,14 @@ pub async fn open_context_shell(
     runner: &dyn CommandRunner,
     provider: LocalRuntimeProvider,
     instance_name: &str,
+    terminal: Option<&str>,
 ) -> Result<(), String> {
     let instance = find_fresh_instance(runner, provider, instance_name).await?;
     let script = build_context_script(&instance)?;
-    process::open_terminal_with_command(runner, &script).await
+    // Several shell statements: `open_terminal` runs them natively in AppleScript terminals and
+    // wraps them in `sh -c` for argv terminals. Limitation: on argv terminals the `kubectl` alias
+    // (shell-local) does not survive into the exec'd shell; the exported DOCKER_CONTEXT does.
+    process::open_terminal(runner, terminal, &TerminalCommand::Script(script)).await
 }
 
 #[cfg(test)]
@@ -457,7 +469,7 @@ mod tests {
                     stderr: String::new(),
                     success: true,
                 }),
-                "osascript" => Ok(CommandOutput {
+                "osascript" | "open" => Ok(CommandOutput {
                     stdout: String::new(),
                     stderr: String::new(),
                     success: true,
@@ -609,27 +621,69 @@ mod tests {
     #[tokio::test]
     async fn open_shell_builds_terminal_script_for_colima() {
         let runner = FakeRunner::new(COLIMA_LIST, "");
-        open_shell(&runner, LocalRuntimeProvider::Colima, "default")
+        open_shell(&runner, LocalRuntimeProvider::Colima, "default", None)
             .await
             .unwrap();
 
         let calls = runner.calls.lock().unwrap();
         let osascript_calls = args_for(&calls, "osascript");
         assert_eq!(osascript_calls.len(), 1);
-        assert!(osascript_calls[0][1].contains("colima ssh --profile default"));
+        assert!(
+            osascript_calls[0][1].contains("do script \"'colima' 'ssh' '--profile' 'default'\"")
+        );
     }
 
     #[tokio::test]
     async fn open_shell_builds_terminal_script_for_lima() {
         let runner = FakeRunner::new("", LIMA_LIST);
-        open_shell(&runner, LocalRuntimeProvider::Lima, "work")
+        open_shell(&runner, LocalRuntimeProvider::Lima, "work", None)
             .await
             .unwrap();
 
         let calls = runner.calls.lock().unwrap();
         let osascript_calls = args_for(&calls, "osascript");
         assert_eq!(osascript_calls.len(), 1);
-        assert!(osascript_calls[0][1].contains("limactl shell work"));
+        assert!(osascript_calls[0][1].contains("do script \"'limactl' 'shell' 'work'\""));
+    }
+
+    #[test]
+    fn shell_command_is_argv_per_provider() {
+        let cmd = |p, n| match shell_command(p, n) {
+            TerminalCommand::Argv(v) => v,
+            TerminalCommand::Script(_) => panic!("expected argv"),
+        };
+        assert_eq!(
+            cmd(LocalRuntimeProvider::Colima, "default"),
+            ["colima", "ssh", "--profile", "default"]
+        );
+        assert_eq!(
+            cmd(LocalRuntimeProvider::Lima, "work"),
+            ["limactl", "shell", "work"]
+        );
+    }
+
+    #[tokio::test]
+    async fn open_context_shell_wraps_script_in_sh_for_argv_terminals() {
+        let colima_list = r#"{"name":"default","status":"Running","runtime":"docker+k3s"}"#;
+        let runner = FakeRunner::new(colima_list, "");
+        open_context_shell(
+            &runner,
+            LocalRuntimeProvider::Colima,
+            "default",
+            Some("org.alacritty"),
+        )
+        .await
+        .unwrap();
+
+        let calls = runner.calls.lock().unwrap();
+        let open_calls = args_for(&calls, "open");
+        let args = &open_calls[0];
+        assert_eq!(
+            args[..7],
+            ["-n", "-b", "org.alacritty", "--args", "-e", "/bin/sh", "-c"]
+        );
+        assert!(args[7].contains("alias kubectl='kubectl --context colima'"));
+        assert!(args[7].ends_with("; exec \"$SHELL\" -l"));
     }
 
     #[tokio::test]
@@ -640,7 +694,7 @@ mod tests {
         let docker_contexts = r#"{"Name":"colima"}"#;
         let runner = FakeRunner::new(colima_list, "").with_docker_contexts(docker_contexts);
 
-        open_context_shell(&runner, LocalRuntimeProvider::Colima, "default")
+        open_context_shell(&runner, LocalRuntimeProvider::Colima, "default", None)
             .await
             .unwrap();
 
@@ -658,7 +712,7 @@ mod tests {
         // derived from the `runtime` field's k3s marker, so only the kubectl alias is emitted.
         let runner = FakeRunner::new(colima_list, "");
 
-        open_context_shell(&runner, LocalRuntimeProvider::Colima, "default")
+        open_context_shell(&runner, LocalRuntimeProvider::Colima, "default", None)
             .await
             .unwrap();
 
@@ -673,7 +727,7 @@ mod tests {
     async fn open_context_shell_errors_when_no_context_available() {
         let colima_list = r#"{"name":"default","status":"Running","runtime":"docker"}"#;
         let runner = FakeRunner::new(colima_list, "");
-        let err = open_context_shell(&runner, LocalRuntimeProvider::Colima, "default")
+        let err = open_context_shell(&runner, LocalRuntimeProvider::Colima, "default", None)
             .await
             .unwrap_err();
         assert!(err.contains("no docker/kube context available"));

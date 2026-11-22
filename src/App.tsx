@@ -9,6 +9,7 @@ import NavRail from './components/layout/NavRail';
 import ClustersScreen from './screens/clusters/ClustersScreen';
 import KubeconfigScreen from './screens/kubeconfig/KubeconfigScreen';
 import InfrastructureScreen from './screens/infrastructure/InfrastructureScreen';
+import SettingsScreen from './screens/settings/SettingsScreen';
 import OverviewScreen from './screens/overview/OverviewScreen';
 
 function AppShell() {
@@ -107,6 +108,12 @@ function AppShell() {
         {visited.has('kubeconfig') && (
           <div className="screen" hidden={section !== 'kubeconfig'}>
             <KubeconfigScreen isVisible={section === 'kubeconfig'} />
+          </div>
+        )}
+
+        {visited.has('settings') && (
+          <div className="screen" hidden={section !== 'settings'}>
+            <SettingsScreen isVisible={section === 'settings'} />
           </div>
         )}
       </div>

@@ -9,3 +9,4 @@ pub mod local_dns;
 pub mod local_runtime;
 pub mod profiles;
 pub mod service_login;
+pub mod settings;

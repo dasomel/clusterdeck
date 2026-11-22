@@ -37,9 +37,7 @@ pub fn is_safe_gateway_address(s: &str) -> bool {
 pub fn is_safe_open_url(url: &str) -> bool {
     let trimmed = url.trim();
     (trimmed.starts_with("http://") || trimmed.starts_with("https://"))
-        && !trimmed.contains('\n')
-        && !trimmed.contains('\r')
-        && !trimmed.contains(' ')
+        && !trimmed.chars().any(|c| c.is_control() || c == ' ')
 }
 
 /// Sink validator for the known_hosts path OpenSSH reports in its "Offending key"/"Add correct
@@ -75,7 +73,7 @@ pub fn is_safe_host_domain(s: &str) -> bool {
 
 /// Sink validator for Colima/Lima local-runtime instance names before they reach lifecycle argv
 /// (`colima start|stop|restart --profile <name>`, `limactl start|stop|shell <name>`) or an
-/// osascript Terminal-launch string (`services/process.rs::open_terminal_with_command`).
+/// osascript Terminal-launch string (`services/process.rs::open_terminal`).
 /// Stricter than `is_safe_ssh_identifier`: anchors the whole charset instead of only excluding a
 /// leading dash/newlines, since these names are provider-discovered (untrusted) and are embedded
 /// both in argv and in an AppleScript string literal.
@@ -549,6 +547,11 @@ mod tests {
         assert!(!is_safe_open_url("https://example.com/a b"));
         assert!(!is_safe_open_url("https://example.com\nHost: evil"));
         assert!(!is_safe_open_url("https://example.com\revil"));
+        assert!(!is_safe_open_url("https://example.com/\ta"));
+        assert!(!is_safe_open_url("https://example.com/\0a"));
+        assert!(!is_safe_open_url("https://example.com/\x1b[0m"));
+        // trim() strips only edge whitespace; an embedded control char still rejects.
+        assert!(!is_safe_open_url("https://exa\x07mple.com"));
     }
 
     #[test]

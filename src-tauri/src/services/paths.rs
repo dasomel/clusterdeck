@@ -45,6 +45,10 @@ impl ClusterDeckPaths {
         self.base.join("state.json")
     }
 
+    pub fn settings_file(&self) -> PathBuf {
+        self.base.join("settings.json")
+    }
+
     pub fn endpoints_cache_file(&self) -> PathBuf {
         self.base.join("dns").join("endpoints.json")
     }
