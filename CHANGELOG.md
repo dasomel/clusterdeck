@@ -6,6 +6,11 @@ The format follows the principles of Keep a Changelog and uses semantic versioni
 
 ## [Unreleased]
 
+### Added
+
+- Delete a single machine from its row in the Infrastructure inventory table (Colima profiles and Vagrant machines, running or stopped), with the same two-step typed confirmation and lifecycle lock as the local runtime and environment-group delete. The dialog lists the exact targets; if the state changes before you confirm, nothing is deleted. Vagrant machines are destroyed by project directory, not by id, and only when the machine's local `.vagrant` identity matches the confirmed plan and its name is not a prefix of another Vagrant machine id; the destroy runs with a fully pinned Vagrant environment, and a group delete re-checks each machine right before destroying it and stops at the first mismatch. Removing a stale Vagrant entry runs `vagrant global-status --prune`, which removes every stale cache entry, and the dialog lists them all (ADR-0012)
+- Delete local runtime instances (Colima/Lima/Vagrant) and whole environment groups from the Infrastructure screen (ADR-0012)
+
 ## [0.8.3] - 2026-11-22
 
 ### Added

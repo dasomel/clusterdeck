@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::Path;
 
+use crate::services::local_runtime_lifecycle::LocalRuntimeProvider;
 use crate::services::process::{CommandLimits, CommandRunner};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -696,30 +697,40 @@ pub fn find_static_vagrant_info(vagrant_dir: &Path, machine_name: &str) -> (Opti
     (detected_ip, has_k3s)
 }
 
+fn vagrant_project_name(directory: &str) -> String {
+    Path::new(directory)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("vagrant")
+        .to_string()
+}
+
+/// The `project/machine` display name of a Vagrant machine. Shared with
+/// `local_runtime_lifecycle` and group delete, which must recompute it byte-for-byte from fresh
+/// `global-status` output / inventory rows (ADR-0012).
+pub(crate) fn vagrant_instance_name(directory: &str, machine: &str) -> String {
+    format!("{}/{}", vagrant_project_name(directory), machine)
+}
+
 async fn detect_vagrant(runner: &dyn CommandRunner) -> Vec<DiscoveredLocalHost> {
     let mut out = Vec::new();
-    let status_output = match runner.run("vagrant", &["global-status".to_string()]).await {
-        Ok(res) if res.success => res.stdout,
-        _ => return out,
+    // Vagrant absent, failing or hung (DISCOVERY_TIMEOUT) simply means no Vagrant entries.
+    let Ok(entries) = crate::services::local_runtime_lifecycle::fetch_vagrant_entries(runner).await
+    else {
+        return out;
     };
-
-    let entries = parse_vagrant_global_status(&status_output);
     let local_contexts =
         crate::services::kube_import::list_local_kube_contexts().unwrap_or_default();
 
     for entry in entries {
-        // entry.id is untrusted `vagrant global-status` output; a leading `-` would be parsed as
-        // a CLI option.
-        if !crate::services::validate::is_safe_ssh_identifier(&entry.id) {
+        // entry.id is untrusted `vagrant global-status` output and reaches `vagrant ssh-config`
+        // argv; same rule as the delete path.
+        if !crate::services::validate::is_safe_vagrant_id(&entry.id) {
             continue;
         }
 
         let is_running = entry.state.eq_ignore_ascii_case("running");
-        let project_name = Path::new(&entry.directory)
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("vagrant")
-            .to_string();
+        let project_name = vagrant_project_name(&entry.directory);
 
         let (static_ip, static_has_k3s) =
             find_static_vagrant_info(Path::new(&entry.directory), &entry.name);
@@ -856,7 +867,7 @@ async fn detect_vagrant(runner: &dyn CommandRunner) -> Vec<DiscoveredLocalHost> 
 
         out.push(DiscoveredLocalHost {
             provider: "Vagrant".to_string(),
-            instance_name: format!("{}/{}", project_name, entry.name),
+            instance_name: vagrant_instance_name(&entry.directory, &entry.name),
             status,
             host_name: entry.name,
             address,
@@ -891,6 +902,20 @@ pub async fn detect_local_hosts(
     results.extend(lima);
     results.extend(vagrant);
     Ok(results)
+}
+
+/// Fresh listing of one provider only (lifecycle re-checks need the target, not a full sweep).
+pub(crate) async fn detect_provider_hosts(
+    runner: &dyn CommandRunner,
+    provider: LocalRuntimeProvider,
+) -> Vec<DiscoveredLocalHost> {
+    match provider {
+        LocalRuntimeProvider::Colima => {
+            let docker_contexts = detect_docker_contexts(runner).await;
+            detect_colima(runner, &docker_contexts).await
+        }
+        LocalRuntimeProvider::Lima => detect_lima(runner).await,
+    }
 }
 
 /// Re-resolves a Colima/Lima-sourced profile's stored SSH endpoint against a fresh

@@ -358,6 +358,20 @@ pub fn is_safe_k8s_secret_key(s: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
 }
 
+/// Project directory handed to Vagrant as `VAGRANT_CWD` (ADR-0012 D12): absolute and free of
+/// control characters. Existence, canonicalization and the `Vagrantfile` check are filesystem
+/// work done by `local_runtime_delete_plan`.
+pub fn is_safe_vagrant_project_dir(dir: &str) -> bool {
+    dir.starts_with('/') && dir.len() <= 1024 && !dir.chars().any(char::is_control)
+}
+
+/// Vagrant machine ids are short lowercase hex strings; anything beyond ASCII alphanumerics is
+/// refused before reaching `vagrant destroy`/`ssh-config` argv. Deliberately stricter than
+/// `is_safe_ssh_identifier` since ids come from untrusted `global-status` output.
+pub fn is_safe_vagrant_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 64 && id.chars().all(|c| c.is_ascii_alphanumeric())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -597,6 +611,26 @@ mod tests {
         assert!(!is_safe_local_runtime_instance_name("-oProxyCommand=evil"));
         assert!(!is_safe_local_runtime_instance_name(".leading-dot"));
         assert!(!is_safe_local_runtime_instance_name(&"a".repeat(65)));
+    }
+
+    #[test]
+    fn vagrant_validators_boundary_cases() {
+        assert!(is_safe_vagrant_id("f4f4176"));
+        assert!(is_safe_vagrant_id("abc123DEF"));
+        assert!(!is_safe_vagrant_id(""));
+        assert!(!is_safe_vagrant_id("--help"));
+        assert!(!is_safe_vagrant_id("ab;c1"));
+        assert!(!is_safe_vagrant_id("a b"));
+        assert!(!is_safe_vagrant_id(&"a".repeat(65)));
+        assert!(is_safe_vagrant_project_dir("/home/u/proj"));
+        assert!(!is_safe_vagrant_project_dir(""));
+        assert!(!is_safe_vagrant_project_dir("proj"));
+        assert!(!is_safe_vagrant_project_dir("./proj"));
+        assert!(!is_safe_vagrant_project_dir("/a\nb"));
+        assert!(!is_safe_vagrant_project_dir(&format!(
+            "/{}",
+            "a".repeat(1024)
+        )));
     }
 
     #[test]

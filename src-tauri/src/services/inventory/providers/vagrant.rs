@@ -100,31 +100,40 @@ pub async fn vagrant_ssh_config(
 
 const SUPPORTED: [&str; 3] = ["virtualbox", "vmware_desktop", "vmware_fusion"];
 
+/// Inventory row for one `global-status` entry before any on-disk detail is read. `None` for
+/// providers we do not handle or ids/names that fail validation.
+pub fn machine_from_entry(entry: &crate::services::local_runtime::VagrantEntry) -> Option<Machine> {
+    if !SUPPORTED.contains(&entry.provider.as_str()) {
+        return None;
+    }
+    // R5: Validate machine name, provider, and id before joining into filesystem paths
+    if !validate::is_safe_path_segment(&entry.name)
+        || !validate::is_safe_path_segment(&entry.provider)
+        || !validate::is_safe_path_segment(&entry.id)
+    {
+        return None;
+    }
+    let runtime = if entry.provider == "virtualbox" {
+        "virtualbox"
+    } else {
+        "vmware"
+    };
+    let mut m = Machine::new(runtime, &entry.id, &entry.name);
+    m.id = format!("vagrant:{}", entry.id);
+    m.orchestrator = Some("vagrant".into());
+    m.environment = entry.directory.clone();
+    m.state = entry.state.clone();
+    Some(m)
+}
+
 pub(super) async fn discover(runner: &dyn CommandRunner) -> Result<Vec<Machine>, String> {
     let listing = run_command(runner, "vagrant", &["global-status"]).await?;
     let entries = crate::services::local_runtime::parse_vagrant_global_status(&listing);
     let mut result = vec![];
-    for entry in entries {
-        if !SUPPORTED.contains(&entry.provider.as_str()) {
+    for entry in &entries {
+        let Some(mut m) = machine_from_entry(entry) else {
             continue;
-        }
-        // R5: Validate machine name, provider, and id before joining into filesystem paths
-        if !validate::is_safe_path_segment(&entry.name)
-            || !validate::is_safe_path_segment(&entry.provider)
-            || !validate::is_safe_path_segment(&entry.id)
-        {
-            continue;
-        }
-        let runtime = if entry.provider == "virtualbox" {
-            "virtualbox"
-        } else {
-            "vmware"
         };
-        let mut m = Machine::new(runtime, &entry.id, &entry.name);
-        m.id = format!("vagrant:{}", entry.id);
-        m.orchestrator = Some("vagrant".into());
-        m.environment = entry.directory.clone();
-        m.state = entry.state.clone();
 
         // A project that no longer exists (or is not a plain absolute path) keeps its entry
         // with no runtime_id and no file access: reconcile then reports it "stale" instead of
@@ -139,7 +148,7 @@ pub(super) async fn discover(runner: &dyn CommandRunner) -> Result<Vec<Machine>,
             result.push(m);
             continue;
         }
-        fill_from_project(runner, &mut m, &entry, &project_dir).await;
+        fill_from_project(runner, &mut m, entry, &project_dir).await;
         result.push(m);
     }
     Ok(result)

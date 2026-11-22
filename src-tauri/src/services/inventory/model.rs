@@ -2,6 +2,16 @@
 
 use serde::{Deserialize, Serialize};
 
+/// What "delete" means for a machine, decided once in Rust (`inventory::annotate_delete_kinds`)
+/// and rendered by the UI: `Destroy` runs the provider's delete command, `Prune` only clears a
+/// stale Vagrant cache entry whose project directory is gone (ADR-0012 D7).
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum DeleteKind {
+    Destroy,
+    Prune,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Machine {
     pub id: String,
@@ -18,6 +28,9 @@ pub struct Machine {
     pub created_at: Option<u64>,
     pub ips: Vec<String>,
     pub kubernetes: String,
+    /// `None` = ClusterDeck cannot delete this machine (also the demo-mode value).
+    #[serde(default)]
+    pub delete_kind: Option<DeleteKind>,
 }
 
 impl Machine {
@@ -37,6 +50,7 @@ impl Machine {
             created_at: None,
             ips: vec![],
             kubernetes: "unknown".into(),
+            delete_kind: None,
         }
     }
 }

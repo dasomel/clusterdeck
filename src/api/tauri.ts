@@ -10,7 +10,9 @@ import type {
   DiscoveredHost,
   DiscoveredLocalHost,
   EndpointLoginOption,
+  DeletePlan,
   EnvironmentProfileResult,
+  GroupDeleteResult,
   HostStageResult,
   HostsFileStatus,
   Inventory,
@@ -19,6 +21,7 @@ import type {
   LifecycleActionResult,
   LocalDnsStatus,
   LocalKubeContext,
+  LocalRuntimeDeleteProvider,
   LocalRuntimeLifecycleProvider,
   ManagedProfileKubeconfig,
   MergeKubeconfigResult,
@@ -84,6 +87,17 @@ export const api = {
     invoke<LifecycleActionResult>('stop_local_runtime', { provider, instanceName }),
   restartLocalRuntime: (provider: LocalRuntimeLifecycleProvider, instanceName: string) =>
     invoke<LifecycleActionResult>('restart_local_runtime', { provider, instanceName }),
+  planLocalRuntimeDelete: (
+    provider: LocalRuntimeDeleteProvider,
+    instanceName: string,
+    projectDir: string | null,
+  ) => invoke<DeletePlan>('plan_local_runtime_delete', { provider, instanceName, projectDir }),
+  planEnvironmentDelete: (environment: string) =>
+    invoke<DeletePlan>('plan_environment_delete', { environment }),
+  deleteLocalRuntime: (plan: DeletePlan) =>
+    invoke<LifecycleActionResult>('delete_local_runtime', { plan }),
+  deleteEnvironmentGroup: (environment: string, plan: DeletePlan) =>
+    invoke<GroupDeleteResult>('delete_environment_group', { environment, plan }),
   openLocalRuntimeShell: (provider: LocalRuntimeLifecycleProvider, instanceName: string) =>
     invoke<string | null>('open_local_runtime_shell', { provider, instanceName }),
   openLocalRuntimeContext: (provider: LocalRuntimeLifecycleProvider, instanceName: string) =>

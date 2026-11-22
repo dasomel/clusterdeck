@@ -13,8 +13,11 @@ use std::time::UNIX_EPOCH;
 
 use serde::{Deserialize, Serialize};
 
+use crate::services::local_runtime::VagrantEntry;
+use crate::services::local_runtime_lifecycle::vagrant_delete_kind;
 use crate::services::process::{CommandLimits, CommandRunner};
-pub use model::{Inventory, Machine, ProviderStatus};
+use crate::services::validate;
+pub use model::{DeleteKind, Inventory, Machine, ProviderStatus};
 pub use profile_sync::create_profile_from_environment;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -111,6 +114,44 @@ pub fn demo_inventory() -> Inventory {
     inv
 }
 
+/// Sets `Machine.delete_kind` for every machine. The single source of the delete rule: Vagrant
+/// machines are deletable (prune when their project directory is gone, see
+/// `vagrant_delete_kind`), Colima profiles with a safe name are deletable, nothing else is.
+pub(crate) async fn annotate_delete_kinds(machines: &mut [Machine]) {
+    for m in machines {
+        m.delete_kind = if m.orchestrator.as_deref() == Some("vagrant") {
+            Some(vagrant_delete_kind(&m.environment).await)
+        } else if m.runtime == "colima"
+            && validate::is_safe_local_runtime_instance_name(
+                m.runtime_id.as_deref().unwrap_or_default(),
+            )
+        {
+            Some(DeleteKind::Destroy)
+        } else {
+            None
+        };
+    }
+}
+
+/// Fresh candidates for group delete: only the two deletable sources (Vagrant rows built from
+/// the caller's already-fetched `global-status` entries, and Colima), without the VirtualBox /
+/// VMware probes, per-machine detail reads or k8s detection of a full `discover`. A failing
+/// Colima listing yields no Colima rows (same as a provider error in `discover`).
+pub(crate) async fn discover_delete_candidates(
+    runner: &dyn CommandRunner,
+    entries: &[VagrantEntry],
+) -> Vec<Machine> {
+    let mut machines: Vec<Machine> = entries
+        .iter()
+        .filter_map(providers::vagrant_machine_from_entry)
+        .collect();
+    if let Ok(colima) = providers::discover(runner, "colima").await {
+        machines.extend(colima);
+    }
+    annotate_delete_kinds(&mut machines).await;
+    machines
+}
+
 pub async fn discover(runner: &dyn CommandRunner, demo: bool) -> Inventory {
     if demo {
         return demo_inventory();
@@ -148,6 +189,7 @@ pub async fn discover(runner: &dyn CommandRunner, demo: bool) -> Inventory {
     if !demo {
         k8s::detect(&mut inv.machines).await;
     }
+    annotate_delete_kinds(&mut inv.machines).await;
     inv.summarize();
     inv
 }
@@ -211,6 +253,31 @@ mod tests {
         assert_eq!(detect_host_memory_gib(&SysctlRunner("junk")).await, None);
     }
 
+    #[tokio::test]
+    async fn delete_kind_rule_is_computed_once_in_rust() {
+        let mut vagrant_gone = Machine::new("virtualbox", "a1", "master");
+        vagrant_gone.orchestrator = Some("vagrant".into());
+        vagrant_gone.environment = "/nonexistent-clusterdeck-test/proj".into();
+        let mut vagrant_live = vagrant_gone.clone();
+        vagrant_live.environment = std::env::temp_dir().to_string_lossy().into_owned();
+        let colima = Machine::new("colima", "default", "default");
+        let colima_bad = Machine::new("colima", "-bad", "-bad");
+        let standalone = Machine::new("virtualbox", "u1", "solo");
+        let mut all = vec![vagrant_gone, vagrant_live, colima, colima_bad, standalone];
+        annotate_delete_kinds(&mut all).await;
+        let kinds: Vec<_> = all.iter().map(|m| m.delete_kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                Some(DeleteKind::Prune),
+                Some(DeleteKind::Destroy),
+                Some(DeleteKind::Destroy),
+                None,
+                None
+            ]
+        );
+    }
+
     #[test]
     fn reconcile_and_summary_counts() {
         let mut m1 = Machine::new("virtualbox", "uuid-1", "m1");
@@ -258,6 +325,7 @@ mod tests {
             vec![
                 "cpu",
                 "created_at",
+                "delete_kind",
                 "disk_gib",
                 "disk_used_gib",
                 "environment",
