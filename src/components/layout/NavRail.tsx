@@ -1,4 +1,4 @@
-import { Boxes, LayoutDashboard, Server, Network, FileCog, Sun, Moon } from 'lucide-react';
+import { Boxes, LayoutDashboard, Server, Network, FileCog, Settings, Sun, Moon } from 'lucide-react';
 import type { Section } from '../../hooks/useSection';
 
 type NavRailProps = {
@@ -17,6 +17,8 @@ const NAV_ITEMS: { id: Section; label: string; icon: typeof LayoutDashboard; sho
   { id: 'kubeconfig', label: 'Kubeconfig', icon: FileCog, shortcut: '⌘4' },
 ];
 
+const SETTINGS_ITEM = { id: 'settings' as Section, label: 'Settings', icon: Settings, shortcut: '⌘,' };
+
 export default function NavRail({
   section,
   onSelect,
@@ -25,6 +27,26 @@ export default function NavRail({
   onToggleTheme,
   version,
 }: NavRailProps) {
+  const renderItem = (item: (typeof NAV_ITEMS)[number]) => {
+    const Icon = item.icon;
+    const isActive = section === item.id;
+    const badgeCount = badges[item.id];
+    return (
+      <button
+        key={item.id}
+        type="button"
+        className={`nav-rail-item ${isActive ? 'active' : ''}`}
+        aria-current={isActive ? 'page' : undefined}
+        title={`${item.label} (${item.shortcut})`}
+        onClick={() => onSelect(item.id)}
+      >
+        <Icon size={16} strokeWidth={isActive ? 2 : 1.75} />
+        <span>{item.label}</span>
+        {badgeCount != null && badgeCount > 0 && <span className="nav-rail-badge">{badgeCount}</span>}
+      </button>
+    );
+  };
+
   return (
     <nav className="nav-rail" aria-label="Primary">
       <div className="nav-rail-brand">
@@ -38,27 +60,11 @@ export default function NavRail({
       </div>
 
       <div className="nav-rail-items">
-        {NAV_ITEMS.map((item) => {
-          const Icon = item.icon;
-          const isActive = section === item.id;
-          const badgeCount = badges[item.id];
-          return (
-            <button
-              key={item.id}
-              type="button"
-              className={`nav-rail-item ${isActive ? 'active' : ''}`}
-              aria-current={isActive ? 'page' : undefined}
-              title={`${item.label} (${item.shortcut})`}
-              onClick={() => onSelect(item.id)}
-            >
-              <Icon size={16} strokeWidth={isActive ? 2 : 1.75} />
-              <span>{item.label}</span>
-              {badgeCount != null && badgeCount > 0 && (
-                <span className="nav-rail-badge">{badgeCount}</span>
-              )}
-            </button>
-          );
-        })}
+        {NAV_ITEMS.map(renderItem)}
+      </div>
+
+      <div className="nav-rail-items" style={{ flex: 'none', marginBottom: 'var(--space-2)' }}>
+        {renderItem(SETTINGS_ITEM)}
       </div>
 
       <div className="nav-rail-footer">

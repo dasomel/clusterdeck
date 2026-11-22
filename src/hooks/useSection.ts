@@ -1,6 +1,8 @@
 import { useState, useEffect, useCallback } from 'react';
 
-export type Section = 'overview' | 'infrastructure' | 'clusters' | 'kubeconfig';
+export type Section = 'overview' | 'infrastructure' | 'clusters' | 'kubeconfig' | 'settings';
+
+const SECTIONS: Section[] = ['overview', 'infrastructure', 'clusters', 'kubeconfig', 'settings'];
 
 const STORAGE_KEY = 'clusterdeck.section';
 
@@ -8,11 +10,11 @@ export function useSection(initialSection: Section = 'clusters', onRefreshCurren
   const [section, setSectionState] = useState<Section>(() => {
     try {
       const urlParam = new URLSearchParams(window.location.search).get('section') as Section | null;
-      if (urlParam && ['overview', 'infrastructure', 'clusters', 'kubeconfig'].includes(urlParam)) {
+      if (urlParam && SECTIONS.includes(urlParam)) {
         return urlParam;
       }
       const stored = localStorage.getItem(STORAGE_KEY) as Section | null;
-      if (stored && ['overview', 'infrastructure', 'clusters', 'kubeconfig'].includes(stored)) {
+      if (stored && SECTIONS.includes(stored)) {
         return stored;
       }
     } catch {
@@ -33,7 +35,7 @@ export function useSection(initialSection: Section = 'clusters', onRefreshCurren
     }
   }, []);
 
-  // Global keyboard shortcuts (Cmd+1..4, Cmd+R)
+  // Global keyboard shortcuts (Cmd+1..4, Cmd+, for Settings, Cmd+R)
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (!e.metaKey && !e.ctrlKey) return;
@@ -50,6 +52,9 @@ export function useSection(initialSection: Section = 'clusters', onRefreshCurren
       } else if (e.key === '4') {
         e.preventDefault();
         setSection('kubeconfig');
+      } else if (e.key === ',') {
+        e.preventDefault();
+        setSection('settings');
       } else if (e.key === 'r' || e.key === 'R') {
         // Intercept webview reload and refresh in-app state instead
         e.preventDefault();

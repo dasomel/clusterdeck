@@ -98,6 +98,15 @@ Kubernetes status for any machine with an IP is derived from kubeconfig server h
 
 > **Note on Standalone CLI:** The standalone `infradeck` CLI was folded into ClusterDeck's backend and deliberately omitted as an independent binary to avoid widening the public Rust library crate API; synthetic inventory exploration is available directly in the desktop app via **Demo mode**.
 
+## Settings: Browser and Terminal
+
+The **Settings** screen (sidebar, or `⌘,`) lets you pick which installed **browser** opens URLs and which installed **terminal** opens SSH sessions and VM shells. Only apps actually installed on your Mac are offered (use the rescan button after installing one); "System default" / "Terminal (default)" keeps the previous behavior, and a choice that is no longer installed falls back to it with a notice. The release page and Finder reveals always use the system default.
+
+- Browsers: Safari, Chrome, Firefox, Edge, Brave, Arc, Vivaldi, Opera, Whale, Orion, Zen.
+- Terminals: Terminal, iTerm2, Ghostty, WezTerm, kitty, Alacritty, Tabby. With a non-default terminal, SSH sessions run `ssh <alias>` through the `Include ~/.clusterdeck/ssh/*.conf` block.
+- Stored in `~/.clusterdeck/settings.json` (mode `0600`) as app bundle ids.
+- The VM "context shell" keeps its `kubectl` alias only in Terminal and iTerm2; other terminals get the exported `DOCKER_CONTEXT` only.
+
 ## First Verified Success
 
 For a new environment, the product outcome is not merely that the desktop app starts. A Profile has reached **first verified success** when the same workflow proves all three layers:

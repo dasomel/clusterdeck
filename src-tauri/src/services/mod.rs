@@ -1,3 +1,4 @@
+pub mod app_settings;
 pub mod ca_trust;
 pub mod clipboard;
 pub mod config;
