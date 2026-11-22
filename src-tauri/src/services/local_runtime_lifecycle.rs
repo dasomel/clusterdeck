@@ -4,9 +4,9 @@
 //! `services/local_runtime.rs`. See `docs/adr/0007-local-runtime-lifecycle-actions.md` for the
 //! design decisions this module implements.
 //!
-//! Every action here re-runs `local_runtime::detect_local_hosts` and requires the
-//! `(provider, instance_name)` pair to still be present in that fresh listing before doing
-//! anything else — the instance name and any docker/kube context string used below is always
+//! Every action here re-lists the target provider (`local_runtime::detect_provider_hosts`) and
+//! requires the `(provider, instance_name)` pair to still be present in that fresh listing before
+//! doing anything else — the instance name and any docker/kube context string used below is always
 //! read off that fresh row, never trusted from a caller-supplied value, closing off a class of
 //! sink-trusts-unvalidated-input bug AGENTS.md calls out as a repeat offender in this codebase.
 
@@ -16,7 +16,8 @@ use std::str::FromStr;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use crate::services::local_runtime::{self, DiscoveredLocalHost};
+use crate::services::inventory::DeleteKind;
+use crate::services::local_runtime::{self, DiscoveredLocalHost, VagrantEntry};
 use crate::services::process::{self, CommandOutput, CommandRunner, TerminalCommand};
 use crate::services::validate;
 
@@ -24,14 +25,13 @@ use crate::services::validate;
 /// timeout is generous, per AGENTS.md's "keep external command execution asynchronous and
 /// cancellable where practical" — this is the cancellable-by-timeout half of that; true
 /// mid-flight user cancellation is deferred (ADR-0007 D7).
-const LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(600);
+pub(super) const LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(600);
 
-/// `find_fresh_instance`'s re-discovery re-runs the full `detect_local_hosts` sweep (Colima +
-/// Lima + Vagrant + `docker context ls`), which is a handful of local CLI calls, not a
-/// minutes-long VM operation — bounded separately from `LIFECYCLE_TIMEOUT` so a hung `vagrant`
+/// Re-discovery (`find_fresh_instance`, `fetch_vagrant_entries`, `detect_vagrant`) is a few local
+/// CLI calls, not a minutes-long VM operation — bounded separately from `LIFECYCLE_TIMEOUT` so a hung `vagrant`
 /// (the heaviest of the three, per ADR-0005) can't stall a Start/Stop/Restart/Shell/Context call
 /// indefinitely while `LifecycleGuard`'s per-instance lock is held.
-const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
+pub(super) const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The provider dispatch for lifecycle actions. Deliberately narrower than
 /// `DiscoveredLocalHost.provider: String` (which also carries "Vagrant") — Phase 2 only builds
@@ -59,6 +59,10 @@ impl LocalRuntimeProvider {
             LocalRuntimeProvider::Lima => "Lima",
         }
     }
+
+    pub fn key(self, instance_name: &str) -> InstanceKey {
+        InstanceKey::new(self.display_name(), instance_name)
+    }
 }
 
 impl FromStr for LocalRuntimeProvider {
@@ -73,6 +77,45 @@ impl FromStr for LocalRuntimeProvider {
     }
 }
 
+/// Provider dispatch for delete only (ADR-0012). Kept separate from `LocalRuntimeProvider`
+/// because that enum is persisted in `profiles.yaml` and gates start/stop/shell, none of which
+/// Vagrant supports; widening it would leak "vagrant" into both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DeletableRuntimeProvider {
+    Colima,
+    Lima,
+    Vagrant,
+}
+
+impl DeletableRuntimeProvider {
+    /// Matches `DiscoveredLocalHost.provider`.
+    fn display_name(self) -> &'static str {
+        match self {
+            DeletableRuntimeProvider::Colima => "Colima",
+            DeletableRuntimeProvider::Lima => "Lima",
+            DeletableRuntimeProvider::Vagrant => "Vagrant",
+        }
+    }
+
+    pub fn key(self, instance_name: &str) -> InstanceKey {
+        InstanceKey::new(self.display_name(), instance_name)
+    }
+}
+
+impl FromStr for DeletableRuntimeProvider {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "colima" => Ok(DeletableRuntimeProvider::Colima),
+            "lima" => Ok(DeletableRuntimeProvider::Lima),
+            "vagrant" => Ok(DeletableRuntimeProvider::Vagrant),
+            other => Err(format!("unknown local runtime provider: {other}")),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct LifecycleActionResult {
     pub success: bool,
@@ -82,32 +125,45 @@ pub struct LifecycleActionResult {
     pub message: String,
 }
 
+/// Lock identity: the provider's display name plus the instance name. Both provider enums map to
+/// the same strings ("Colima"/"Lima"), so a start/stop and a delete on one instance share a key.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct InstanceKey {
+    provider: &'static str,
+    name: String,
+}
+
+impl InstanceKey {
+    fn new(provider: &'static str, name: &str) -> Self {
+        Self {
+            provider,
+            name: name.to_string(),
+        }
+    }
+}
+
 /// Per-(provider, instance) in-flight marker, so a second Start/Stop/Restart on the same
 /// instance while one is already running is rejected instead of racing two CLI invocations
 /// against the same VM. Managed as Tauri app state (`lib.rs`'s `.manage(...)`).
 #[derive(Debug, Default)]
-pub struct LifecycleGuard(Mutex<HashSet<(LocalRuntimeProvider, String)>>);
+pub struct LifecycleGuard(Mutex<HashSet<InstanceKey>>);
 
 #[derive(Debug)]
-pub struct LifecycleLock<'a> {
+pub(crate) struct LifecycleLock<'a> {
     guard: &'a LifecycleGuard,
-    key: (LocalRuntimeProvider, String),
+    key: InstanceKey,
 }
 
 impl LifecycleGuard {
-    pub fn try_acquire(
-        &self,
-        provider: LocalRuntimeProvider,
-        instance_name: &str,
-    ) -> Result<LifecycleLock<'_>, String> {
+    pub fn try_acquire(&self, key: InstanceKey) -> Result<LifecycleLock<'_>, String> {
         let mut set = self
             .0
             .lock()
             .map_err(|_| "lifecycle guard lock poisoned".to_string())?;
-        let key = (provider, instance_name.to_string());
         if !set.insert(key.clone()) {
             return Err(format!(
-                "another operation is already in progress for {instance_name}"
+                "another operation is already in progress for {}",
+                key.name
             ));
         }
         Ok(LifecycleLock { guard: self, key })
@@ -123,9 +179,9 @@ impl Drop for LifecycleLock<'_> {
 }
 
 /// Validates `instance_name`'s charset, then confirms the `(provider, instance_name)` pair is
-/// present in a fresh discovery listing, returning the freshly discovered row. This is the
-/// re-check ADR-0007 D6 requires before any lifecycle/shell/context action.
-async fn find_fresh_instance(
+/// present in a fresh listing of that one provider, returning the freshly discovered row. This is
+/// the re-check ADR-0007 D6 requires before any lifecycle/shell/context/delete action.
+pub(super) async fn find_fresh_instance(
     runner: &dyn CommandRunner,
     provider: LocalRuntimeProvider,
     instance_name: &str,
@@ -133,18 +189,17 @@ async fn find_fresh_instance(
     if !validate::is_safe_local_runtime_instance_name(instance_name) {
         return Err(format!("invalid instance name: {instance_name}"));
     }
-    let hosts =
-        match tokio::time::timeout(DISCOVERY_TIMEOUT, local_runtime::detect_local_hosts(runner))
-            .await
-        {
-            Ok(res) => res?,
-            Err(_) => {
-                return Err(format!(
-                    "local runtime discovery timed out after {}s",
-                    DISCOVERY_TIMEOUT.as_secs()
-                ))
-            }
-        };
+    let hosts = tokio::time::timeout(
+        DISCOVERY_TIMEOUT,
+        local_runtime::detect_provider_hosts(runner, provider),
+    )
+    .await
+    .map_err(|_| {
+        format!(
+            "local runtime discovery timed out after {}s",
+            DISCOVERY_TIMEOUT.as_secs()
+        )
+    })?;
     hosts
         .into_iter()
         .find(|h| h.provider == provider.display_name() && h.instance_name == instance_name)
@@ -156,7 +211,7 @@ async fn find_fresh_instance(
         })
 }
 
-async fn run_with_timeout(
+pub(super) async fn run_with_timeout(
     runner: &dyn CommandRunner,
     bin: &str,
     args: &[String],
@@ -172,7 +227,7 @@ async fn run_with_timeout(
 
 /// Last 20 lines of stdout (success) or stderr (failure) — enough to show the user what
 /// happened without dumping a full VM boot log into the UI.
-fn tail_message(output: &CommandOutput) -> String {
+pub(super) fn tail_message(output: &CommandOutput) -> String {
     let text = if output.success {
         &output.stdout
     } else {
@@ -403,6 +458,113 @@ pub async fn open_context_shell(
     process::open_terminal(runner, terminal, &TerminalCommand::Script(script)).await
 }
 
+/// Fresh `vagrant global-status` listing; the only source of Vagrant ids that may reach argv.
+pub(super) async fn fetch_vagrant_entries(
+    runner: &dyn CommandRunner,
+) -> Result<Vec<VagrantEntry>, String> {
+    let args = ["global-status".to_string()];
+    let output = match tokio::time::timeout(DISCOVERY_TIMEOUT, runner.run("vagrant", &args)).await {
+        Ok(res) => res?,
+        Err(_) => {
+            return Err(format!(
+                "vagrant global-status timed out after {}s",
+                DISCOVERY_TIMEOUT.as_secs()
+            ))
+        }
+    };
+    if !output.success {
+        return Err(format!(
+            "vagrant global-status failed: {}",
+            tail_message(&output)
+        ));
+    }
+    Ok(local_runtime::parse_vagrant_global_status(&output.stdout))
+}
+
+/// Exactly one match is required: two projects whose directories share a basename produce
+/// identical names, and destroying the wrong one is irreversible (ADR-0012 D4). The returned
+/// entry's id has passed `is_safe_vagrant_id`.
+pub(super) fn unique_safe_vagrant_entry<'a>(
+    mut matches: impl Iterator<Item = &'a VagrantEntry>,
+    label: &str,
+) -> Result<&'a VagrantEntry, String> {
+    let entry = matches
+        .next()
+        .ok_or_else(|| format!("Vagrant instance not found in current listing: {label}"))?;
+    if matches.next().is_some() {
+        return Err(format!(
+            "ambiguous Vagrant instance: more than one machine is named {label}"
+        ));
+    }
+    if !validate::is_safe_vagrant_id(&entry.id) {
+        return Err(format!("unsafe Vagrant machine id for {label}"));
+    }
+    Ok(entry)
+}
+
+/// The one place that decides how a Vagrant machine is deleted, shared by single delete, group
+/// delete and the inventory's `Machine.delete_kind`: `vagrant destroy` cannot even start when the
+/// project directory is gone ("working directory doesn't exist"), so such a stale cache entry is
+/// only cleared by `global-status --prune` (ADR-0012 D7).
+pub(crate) async fn vagrant_delete_kind(directory: &str) -> DeleteKind {
+    if tokio::fs::metadata(directory)
+        .await
+        .is_ok_and(|md| md.is_dir())
+    {
+        DeleteKind::Destroy
+    } else {
+        DeleteKind::Prune
+    }
+}
+
+pub(super) const STALE_REMOVED_MESSAGE: &str =
+    "stale entry removed (project directory no longer exists)";
+
+/// `vagrant global-status --prune`: drops every cache entry whose project is gone. It is the
+/// "delete" of a stale entry, so its outcome is that entry's outcome.
+pub(super) async fn prune_vagrant_cache(runner: &dyn CommandRunner) -> LifecycleActionResult {
+    let args = ["global-status".to_string(), "--prune".to_string()];
+    match run_with_timeout(runner, "vagrant", &args).await {
+        Ok(out) => LifecycleActionResult {
+            success: out.success,
+            message: if out.success {
+                STALE_REMOVED_MESSAGE.to_string()
+            } else {
+                tail_message(&out)
+            },
+        },
+        Err(e) => LifecycleActionResult {
+            success: false,
+            message: e,
+        },
+    }
+}
+
+/// `run_with_timeout` plus environment variables (`VAGRANT_CWD`), through the bounded runner.
+pub(super) async fn run_with_timeout_env(
+    runner: &dyn CommandRunner,
+    bin: &str,
+    args: &[String],
+    env: &[(String, String)],
+) -> Result<CommandOutput, String> {
+    let limits = process::CommandLimits {
+        timeout: LIFECYCLE_TIMEOUT,
+        ..Default::default()
+    };
+    match tokio::time::timeout(
+        LIFECYCLE_TIMEOUT,
+        runner.run_bounded_with_env(bin, args, env, limits),
+    )
+    .await
+    {
+        Ok(res) => res,
+        Err(_) => Err(format!(
+            "{bin} timed out after {}s",
+            LIFECYCLE_TIMEOUT.as_secs()
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -413,6 +575,7 @@ mod tests {
         colima_list: &'static str,
         lima_list: &'static str,
         docker_contexts: &'static str,
+        vagrant_status: &'static str,
         calls: StdMutex<Vec<(String, Vec<String>)>>,
     }
 
@@ -422,8 +585,14 @@ mod tests {
                 colima_list,
                 lima_list,
                 docker_contexts: "",
+                vagrant_status: "",
                 calls: StdMutex::new(Vec::new()),
             }
+        }
+
+        fn with_vagrant_status(mut self, vagrant_status: &'static str) -> Self {
+            self.vagrant_status = vagrant_status;
+            self
         }
 
         fn with_docker_contexts(mut self, docker_contexts: &'static str) -> Self {
@@ -471,6 +640,18 @@ mod tests {
                 }),
                 "osascript" | "open" => Ok(CommandOutput {
                     stdout: String::new(),
+                    stderr: String::new(),
+                    success: true,
+                }),
+                "vagrant" if args.first().map(String::as_str) == Some("global-status") => {
+                    Ok(CommandOutput {
+                        stdout: self.vagrant_status.to_string(),
+                        stderr: String::new(),
+                        success: true,
+                    })
+                }
+                "vagrant" => Ok(CommandOutput {
+                    stdout: "vagrant ok".to_string(),
                     stderr: String::new(),
                     success: true,
                 }),
@@ -779,25 +960,55 @@ mod tests {
     }
 
     #[test]
+    fn deletable_provider_from_str_is_exact() {
+        assert_eq!(
+            DeletableRuntimeProvider::from_str("colima"),
+            Ok(DeletableRuntimeProvider::Colima)
+        );
+        assert_eq!(
+            DeletableRuntimeProvider::from_str("lima"),
+            Ok(DeletableRuntimeProvider::Lima)
+        );
+        assert_eq!(
+            DeletableRuntimeProvider::from_str("vagrant"),
+            Ok(DeletableRuntimeProvider::Vagrant)
+        );
+        assert!(DeletableRuntimeProvider::from_str("Vagrant").is_err());
+        assert!(DeletableRuntimeProvider::from_str("docker").is_err());
+    }
+
+    #[test]
+    fn delete_blocked_while_stop_holds_lock_on_same_instance() {
+        let guard = LifecycleGuard::default();
+        let _stop = guard
+            .try_acquire(LocalRuntimeProvider::Colima.key("default"))
+            .unwrap();
+        let err = guard
+            .try_acquire(DeletableRuntimeProvider::Colima.key("default"))
+            .unwrap_err();
+        assert!(err.contains("already in progress"));
+    }
+
+    #[test]
     fn lifecycle_guard_rejects_concurrent_op_on_same_instance() {
         let guard = LifecycleGuard::default();
         let lock1 = guard
-            .try_acquire(LocalRuntimeProvider::Colima, "default")
+            .try_acquire(LocalRuntimeProvider::Colima.key("default"))
             .unwrap();
         let err = guard
-            .try_acquire(LocalRuntimeProvider::Colima, "default")
+            .try_acquire(LocalRuntimeProvider::Colima.key("default"))
             .unwrap_err();
         assert!(err.contains("already in progress"));
 
         // A different instance is unaffected.
         assert!(guard
-            .try_acquire(LocalRuntimeProvider::Colima, "other")
+            .try_acquire(LocalRuntimeProvider::Colima.key("other"))
             .is_ok());
 
         drop(lock1);
         // Released after drop, so the same key can be acquired again.
         assert!(guard
-            .try_acquire(LocalRuntimeProvider::Colima, "default")
+            .try_acquire(LocalRuntimeProvider::Colima.key("default"))
             .is_ok());
     }
 

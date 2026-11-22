@@ -8,7 +8,7 @@ mod vmware;
 use crate::services::inventory::model::Machine;
 use crate::services::process::CommandRunner;
 
-pub use vagrant::vagrant_ssh_config;
+pub use vagrant::{machine_from_entry as vagrant_machine_from_entry, vagrant_ssh_config};
 
 pub async fn discover(runner: &dyn CommandRunner, id: &str) -> Result<Vec<Machine>, String> {
     match id {

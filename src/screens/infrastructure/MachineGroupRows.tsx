@@ -1,4 +1,5 @@
 import { ChevronDown, ChevronRight } from 'lucide-react';
+import type { Machine } from '../../api/types';
 import type { MachineGroup } from '../../lib/groupMachines';
 import Tag from '../../components/ui/Tag';
 import MachineRow from './MachineRow';
@@ -8,18 +9,33 @@ type MachineGroupRowsProps = {
   group: MachineGroup;
   open: boolean;
   onToggle: () => void;
+  onDeleteMachine?: (machine: Machine) => void;
+  busyKeys: Set<string>;
+  /** The whole environment is being deleted or set up. */
+  groupBusy: boolean;
 };
 
 const SUMMARY_NAMES = 2;
 
-export default function MachineGroupRows({ group, open, onToggle }: MachineGroupRowsProps) {
+export default function MachineGroupRows({
+  group,
+  open,
+  onToggle,
+  onDeleteMachine,
+  busyKeys,
+  groupBusy,
+}: MachineGroupRowsProps) {
+  const deleteProps = (m: Machine) => ({
+    onDelete: onDeleteMachine,
+    deleteBusy: groupBusy || busyKeys.has(m.id),
+  });
   const { machines, representative: rep } = group;
   const stale = rep.state === 'stale';
 
   if (machines.length === 1) {
     return (
       <>
-        <MachineRow machine={rep} />
+        <MachineRow machine={rep} {...deleteProps(rep)} />
         {stale && <StaleHint machineName={rep.name} />}
       </>
     );
@@ -65,17 +81,25 @@ export default function MachineGroupRows({ group, open, onToggle }: MachineGroup
       <MachineRow machine={rep} nameCell={toggle} createdAt={earliest} />
       {open
         ? machines.map((m) => (
-            <MachineRowWithHint key={m.id} machine={m} />
+            <MachineRowWithHint key={m.id} machine={m} {...deleteProps(m)} />
           ))
         : stale && <StaleHint machineName={`${machines.length} machines`} />}
     </>
   );
 }
 
-function MachineRowWithHint({ machine }: { machine: MachineGroup['representative'] }) {
+function MachineRowWithHint({
+  machine,
+  onDelete,
+  deleteBusy,
+}: {
+  machine: Machine;
+  onDelete?: (machine: Machine) => void;
+  deleteBusy: boolean;
+}) {
   return (
     <>
-      <MachineRow machine={machine} nested />
+      <MachineRow machine={machine} nested onDelete={onDelete} deleteBusy={deleteBusy} />
       {machine.state === 'stale' && <StaleHint machineName={machine.name} />}
     </>
   );

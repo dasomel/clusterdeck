@@ -2,6 +2,7 @@ import type { ReactNode } from 'react';
 import type { Machine } from '../../api/types';
 import { machineStatePill, k8sPill } from '../../lib/status';
 import { formatNum, formatDisk, formatDateMs, formatDateTimeTooltip } from '../../lib/format';
+import { Trash2 } from 'lucide-react';
 import Pill from '../../components/ui/Pill';
 
 type MachineRowProps = {
@@ -11,6 +12,9 @@ type MachineRowProps = {
   /** Overrides created_at; null renders as an em dash. */
   createdAt?: number | null;
   nested?: boolean;
+  /** Opens the delete confirmation; the button shows only when the backend allows deleting. */
+  onDelete?: (machine: Machine) => void;
+  deleteBusy?: boolean;
 };
 
 export default function MachineRow({
@@ -18,6 +22,8 @@ export default function MachineRow({
   nameCell,
   createdAt = m.created_at,
   nested = false,
+  onDelete,
+  deleteBusy = false,
 }: MachineRowProps) {
   const statePill = machineStatePill(m.state);
   const kPill = k8sPill(m.kubernetes);
@@ -28,7 +34,23 @@ export default function MachineRow({
   return (
     <tr style={{ height: 'var(--row-h)' }}>
       <td>
-        <Pill variant={statePill.variant}>{statePill.label}</Pill>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-2)' }}>
+          <Pill variant={statePill.variant}>{statePill.label}</Pill>
+          {/* A group row stands for several machines; only concrete machines get a button. */}
+          {onDelete && !nameCell && m.delete_kind != null && (
+            <button
+              type="button"
+              className="icon-button"
+              style={{ width: '22px', height: '22px', color: 'var(--danger)' }}
+              onClick={() => onDelete(m)}
+              disabled={deleteBusy}
+              aria-label={`Delete ${m.name}`}
+              title={m.delete_kind === 'prune' ? 'Remove stale entry' : 'Delete machine'}
+            >
+              <Trash2 size={12} />
+            </button>
+          )}
+        </div>
       </td>
 
       <td style={nested ? { paddingLeft: 'var(--space-6)' } : undefined}>

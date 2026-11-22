@@ -320,9 +320,47 @@ export type HostsFileStatus = {
 
 export type LocalRuntimeLifecycleProvider = 'colima' | 'lima';
 
+export type LocalRuntimeDeleteProvider = 'colima' | 'lima' | 'vagrant';
+
 export type LifecycleActionResult = {
   success: boolean;
   message: string;
+};
+
+/** One thing a delete removes, as the backend planned it (ADR-0012 D11). `name` is the Colima/Lima
+ * instance or the Vagrant machine name; the project dir and id are Vagrant only. */
+export type DeleteTarget = {
+  provider: LocalRuntimeDeleteProvider;
+  name: string;
+  project_dir: string | null;
+  vagrant_id: string | null;
+  /** Vagrant destroy only: `index_uuid:provider:provider_id` of the local machine state (D15). */
+  machine_identity: string | null;
+  delete_kind: DeleteKind;
+};
+
+/** A Vagrant cache entry that `global-status --prune` drops. */
+export type StaleEntry = {
+  vagrant_id: string;
+  machine_name: string;
+  project_dir: string;
+};
+
+/** The exact delete the user confirmed; the backend re-derives it and aborts on any difference. */
+export type DeletePlan = {
+  targets: DeleteTarget[];
+  stale_entries: StaleEntry[];
+};
+
+export type MachineDeleteResult = {
+  name: string;
+  success: boolean;
+  message: string;
+};
+
+export type GroupDeleteResult = {
+  environment: string;
+  results: MachineDeleteResult[];
 };
 
 // Inventory domain types matching backend serde contracts (D8: snake_case)
@@ -348,7 +386,11 @@ export type Machine = {
   created_at: number | null;
   ips: string[];
   kubernetes: string;
+  /** Decided by the backend: how "delete" works for this machine, or null when it cannot be deleted. */
+  delete_kind: DeleteKind | null;
 };
+
+export type DeleteKind = 'destroy' | 'prune';
 
 export type ProviderStatus = {
   id: string;

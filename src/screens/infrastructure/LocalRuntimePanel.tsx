@@ -1,22 +1,46 @@
 import { useState, useEffect, useCallback } from 'react';
-import { Server, Play, Square, RotateCw, Terminal, Link2, Copy, RefreshCw } from 'lucide-react';
-import { api, type DiscoveredLocalHost, type LocalRuntimeLifecycleProvider } from '../../api/tauri';
+import { Server, Play, Square, RotateCw, Terminal, Link2, Copy, RefreshCw, Trash2 } from 'lucide-react';
+import { api, type DeletePlan, type DiscoveredLocalHost, type LocalRuntimeDeleteProvider, type LocalRuntimeLifecycleProvider } from '../../api/tauri';
 import { useStatus } from '../../state/StatusContext';
 import { gib } from '../../lib/format';
+import { describeDeletePlan } from '../../lib/deletePlan';
 import CollapsibleCard from '../../components/ui/CollapsibleCard';
 import Pill from '../../components/ui/Pill';
 import Tag from '../../components/ui/Tag';
 import ConfirmModal from '../../components/ConfirmModal';
+import TypedDeleteConfirm from '../../components/TypedDeleteConfirm';
+import { useBusy } from '../../hooks/useBusy';
 
-export default function LocalRuntimePanel({ isVisible = true }: { isVisible?: boolean }) {
+const normalizeProvider = (provider: string): LocalRuntimeDeleteProvider | null => {
+  const lower = provider.toLowerCase();
+  return lower === 'colima' || lower === 'lima' || lower === 'vagrant' ? lower : null;
+};
+
+const toLifecycleProvider = (provider: string): LocalRuntimeLifecycleProvider | null => {
+  const p = normalizeProvider(provider);
+  return p === 'vagrant' ? null : p;
+};
+
+export default function LocalRuntimePanel({
+  isVisible = true,
+  reloadToken = 0,
+  onChanged,
+}: {
+  isVisible?: boolean;
+  /** Bumped by the parent after it deletes or changes VMs, so this list re-reads. */
+  reloadToken?: number;
+  /** Called after this panel deletes an instance, so the inventory re-reads too. */
+  onChanged?: () => void;
+}) {
   const { pushStatus } = useStatus();
   const [localHosts, setLocalHosts] = useState<DiscoveredLocalHost[]>([]);
   const [loading, setLoading] = useState(false);
-  const [busyInstanceKeys, setBusyInstanceKeys] = useState<Set<string>>(new Set());
+  const { busyKeys: busyInstanceKeys, run: runBusy } = useBusy();
   const [lifecycleConfirm, setLifecycleConfirm] = useState<{
     action: 'stop' | 'restart';
     host: DiscoveredLocalHost;
   } | null>(null);
+  const [deleteHost, setDeleteHost] = useState<{ host: DiscoveredLocalHost; plan: DeletePlan } | null>(null);
 
   const reload = useCallback(async () => {
     setLoading(true);
@@ -33,43 +57,64 @@ export default function LocalRuntimePanel({ isVisible = true }: { isVisible?: bo
   useEffect(() => {
     if (!isVisible) return;
     reload();
-  }, [isVisible, reload]);
+  }, [isVisible, reload, reloadToken]);
 
   const instanceKey = (host: DiscoveredLocalHost) => `${host.provider}-${host.instance_name}`;
 
-  const toLifecycleProvider = (provider: string): LocalRuntimeLifecycleProvider | null => {
-    const lower = provider.toLowerCase();
-    return lower === 'colima' || lower === 'lima' ? lower : null;
+  // Colima/Lima only: a Vagrant machine is identified by its project directory, so Vagrant is
+  // deleted from the Infrastructure inventory (ADR-0012 D11).
+  const planDelete = (host: DiscoveredLocalHost) => {
+    const provider = toLifecycleProvider(host.provider);
+    if (!provider) return Promise.resolve();
+    return runBusy(instanceKey(host), async () => {
+      try {
+        setDeleteHost({ host, plan: await api.planLocalRuntimeDelete(provider, host.instance_name, null) });
+      } catch (err) {
+        pushStatus('error', `Cannot delete ${host.instance_name}`, [String(err)]);
+      }
+    });
   };
 
-  const runLifecycleAction = async (host: DiscoveredLocalHost, action: 'start' | 'stop' | 'restart') => {
+  const runDelete = (host: DiscoveredLocalHost, plan: DeletePlan) =>
+    runBusy(instanceKey(host), async () => {
+      try {
+        const result = await api.deleteLocalRuntime(plan);
+        setDeleteHost(null);
+        pushStatus(
+          result.success ? 'success' : 'error',
+          `${host.instance_name}: delete ${result.success ? 'succeeded' : 'failed'}`,
+          result.success ? undefined : [result.message],
+        );
+      } catch (err) {
+        setDeleteHost(null);
+        pushStatus('error', `Failed to delete ${host.instance_name}`, [String(err)]);
+      }
+      void reload();
+      onChanged?.();
+    });
+
+  const runLifecycleAction = (host: DiscoveredLocalHost, action: 'start' | 'stop' | 'restart') => {
     const provider = toLifecycleProvider(host.provider);
-    if (!provider) return;
-    const key = instanceKey(host);
-    setBusyInstanceKeys((prev) => new Set(prev).add(key));
-    try {
-      const call =
-        action === 'start'
-          ? api.startLocalRuntime
-          : action === 'stop'
-            ? api.stopLocalRuntime
-            : api.restartLocalRuntime;
-      const result = await call(provider, host.instance_name);
-      pushStatus(
-        result.success ? 'success' : 'error',
-        `${host.instance_name}: ${action} ${result.success ? 'succeeded' : 'failed'}`,
-        result.success ? undefined : [result.message],
-      );
-      await reload();
-    } catch (err) {
-      pushStatus('error', `Failed to ${action} ${host.instance_name}`, [String(err)]);
-    } finally {
-      setBusyInstanceKeys((prev) => {
-        const next = new Set(prev);
-        next.delete(key);
-        return next;
-      });
-    }
+    if (!provider) return Promise.resolve();
+    return runBusy(instanceKey(host), async () => {
+      try {
+        const call =
+          action === 'start'
+            ? api.startLocalRuntime
+            : action === 'stop'
+              ? api.stopLocalRuntime
+              : api.restartLocalRuntime;
+        const result = await call(provider, host.instance_name);
+        pushStatus(
+          result.success ? 'success' : 'error',
+          `${host.instance_name}: ${action} ${result.success ? 'succeeded' : 'failed'}`,
+          result.success ? undefined : [result.message],
+        );
+        await reload();
+      } catch (err) {
+        pushStatus('error', `Failed to ${action} ${host.instance_name}`, [String(err)]);
+      }
+    });
   };
 
   const openLocalRuntimeShell = async (host: DiscoveredLocalHost) => {
@@ -143,7 +188,7 @@ export default function LocalRuntimePanel({ isVisible = true }: { isVisible?: bo
       >
         <div>
           <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginBottom: '10px' }}>
-            Discovery for Colima, Lima, and Vagrant. Colima/Lima instances support Start/Stop/Restart, VM shell, and Docker/kube context access.
+            Discovery for Colima, Lima, and Vagrant. Colima/Lima instances support Start/Stop/Restart, VM shell, and Docker/kube context access. Colima/Lima instances can be deleted here; Vagrant machines are deleted from the Infrastructure inventory.
           </div>
 
           {localHosts.length > 0 ? (
@@ -237,6 +282,20 @@ export default function LocalRuntimePanel({ isVisible = true }: { isVisible?: bo
                         </>
                       )}
 
+                      {toLifecycleProvider(host.provider) && (
+                        <button
+                          type="button"
+                          className="icon-button"
+                          style={{ width: '26px', height: '26px', color: 'var(--danger)' }}
+                          title="Delete instance"
+                          aria-label="Delete instance"
+                          onClick={() => void planDelete(host)}
+                          disabled={isBusy}
+                        >
+                          <Trash2 size={13} />
+                        </button>
+                      )}
+
                       <button
                         type="button"
                         className="icon-button"
@@ -278,6 +337,19 @@ export default function LocalRuntimePanel({ isVisible = true }: { isVisible?: bo
             setLifecycleConfirm(null);
           }}
           onCancel={() => setLifecycleConfirm(null)}
+        />
+      )}
+
+      {deleteHost && (
+        <TypedDeleteConfirm
+          title={`Delete "${deleteHost.host.instance_name}"?`}
+          explain={`This permanently deletes the ${deleteHost.host.provider} VM and its disk. It will be stopped first if it is running. ClusterDeck profiles that reference it are not removed. If anything changes before you confirm, nothing is deleted.\n\n${describeDeletePlan(deleteHost.plan)}`}
+          typeMessage="Type the instance name to confirm. This cannot be undone."
+          confirmText={deleteHost.host.instance_name}
+          confirmLabel="Delete"
+          busy={busyInstanceKeys.has(instanceKey(deleteHost.host))}
+          onConfirm={() => void runDelete(deleteHost.host, deleteHost.plan)}
+          onCancel={() => setDeleteHost(null)}
         />
       )}
     </>

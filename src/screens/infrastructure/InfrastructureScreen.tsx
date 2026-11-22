@@ -7,8 +7,12 @@ import Skeleton from '../../components/ui/Skeleton';
 import { useInventory } from '../../state/InventoryContext';
 import { useProfiles } from '../../state/ProfilesContext';
 import { useStatus } from '../../state/StatusContext';
+import { api } from '../../api/tauri';
+import TypedDeleteConfirm from '../../components/TypedDeleteConfirm';
+import { useBusy } from '../../hooks/useBusy';
+import { describeDeletePlan } from '../../lib/deletePlan';
 import { formatTimeOnly } from '../../lib/format';
-import type { Machine } from '../../api/types';
+import type { DeletePlan, Machine } from '../../api/types';
 import DemoBand from './DemoBand';
 import ProviderStrip from './ProviderStrip';
 import ResourceSummary from './ResourceSummary';
@@ -20,6 +24,8 @@ type InfrastructureScreenProps = {
   isVisible?: boolean;
 };
 
+const machineCount = (n: number) => `${n} machine${n === 1 ? '' : 's'}`;
+
 export default function InfrastructureScreen({
   onClusterReady,
   isVisible = true,
@@ -30,7 +36,12 @@ export default function InfrastructureScreen({
 
   const [filter, setFilter] = useState('');
   const [collapsedEnvs, setCollapsedEnvs] = useState<Set<string>>(new Set());
-  const [busyEnvs, setBusyEnvs] = useState<Set<string>>(new Set());
+  const { busyKeys: busyEnvs, run: runBusy } = useBusy();
+  // Environment awaiting the two-step delete confirmation, with the backend plan it confirms.
+  const [deleteEnv, setDeleteEnv] = useState<{ environment: string; plan: DeletePlan } | null>(null);
+  // Single machine awaiting the same two-step confirmation (per-row Delete).
+  const [deleteMachine, setDeleteMachine] = useState<{ machine: Machine; plan: DeletePlan } | null>(null);
+  const [runtimeReloadToken, setRuntimeReloadToken] = useState(0);
   const filterInputRef = useRef<HTMLInputElement>(null);
 
   // Focus filter on '/' shortcut only when visible
@@ -55,30 +66,91 @@ export default function InfrastructureScreen({
     });
   };
 
-  const handleSetUpCluster = async (environment: string) => {
-    setBusyEnvs((prev) => new Set(prev).add(environment));
-    try {
-      const result = await createFromEnvironment(environment);
-      if (result.created) {
-        pushStatus('success', `Cluster ${result.profile_id} created`);
-      } else if (result.updated_hosts.length > 0) {
-        pushStatus('success', `Cluster ${result.profile_id} updated (${result.updated_hosts.join(', ')} refreshed)`);
-      } else {
-        pushStatus('success', `Cluster ${result.profile_id} already up to date`);
+  // The dialog shows what the backend planned; execution sends that plan back and the backend
+  // aborts if the fresh state differs (ADR-0012 D11).
+  const planDeleteGroup = (environment: string) =>
+    runBusy(environment, async () => {
+      try {
+        setDeleteEnv({ environment, plan: await api.planEnvironmentDelete(environment) });
+      } catch (err) {
+        pushStatus('error', `Cannot delete group "${environment}"`, [String(err)]);
       }
-      await reloadProfiles();
-      select(result.profile_id);
-      onClusterReady?.(result.profile_id);
-    } catch (err) {
-      pushStatus('error', 'Failed to create cluster profile', [String(err)]);
-    } finally {
-      setBusyEnvs((prev) => {
-        const next = new Set(prev);
-        next.delete(environment);
-        return next;
-      });
-    }
-  };
+    });
+
+  const runDeleteGroup = (environment: string, plan: DeletePlan) =>
+    runBusy(environment, async () => {
+      try {
+        const { results } = await api.deleteEnvironmentGroup(environment, plan);
+        setDeleteEnv(null);
+        const failed = results.filter((r) => !r.success);
+        if (failed.length === 0) {
+          pushStatus('success', `Deleted group "${environment}" (${machineCount(results.length)})`);
+        } else {
+          pushStatus(
+            'error',
+            `Group "${environment}": ${failed.length} of ${machineCount(results.length)} failed to delete`,
+            failed.map((r) => `${r.name}: ${r.message}`),
+          );
+        }
+      } catch (err) {
+        setDeleteEnv(null);
+        pushStatus('error', `Failed to delete group "${environment}"`, [String(err)]);
+      }
+      void refresh();
+      setRuntimeReloadToken((t) => t + 1);
+    });
+
+  // Vagrant machines are identified by project directory + machine name (never a basename);
+  // Colima by profile name. The backend decides everything else.
+  const planDeleteMachine = (m: Machine) =>
+    runBusy(m.id, async () => {
+      try {
+        const plan =
+          m.orchestrator === 'vagrant'
+            ? await api.planLocalRuntimeDelete('vagrant', m.name, m.environment)
+            : await api.planLocalRuntimeDelete('colima', m.runtime_id ?? '', null);
+        setDeleteMachine({ machine: m, plan });
+      } catch (err) {
+        pushStatus('error', `Cannot delete ${m.name}`, [String(err)]);
+      }
+    });
+
+  const runDeleteMachine = ({ machine: m, plan }: { machine: Machine; plan: DeletePlan }) =>
+    runBusy(m.id, async () => {
+      try {
+        const result = await api.deleteLocalRuntime(plan);
+        setDeleteMachine(null);
+        pushStatus(
+          result.success ? 'success' : 'error',
+          `${m.name}: delete ${result.success ? 'succeeded' : 'failed'}`,
+          result.success ? undefined : [result.message],
+        );
+      } catch (err) {
+        setDeleteMachine(null);
+        pushStatus('error', `Failed to delete ${m.name}`, [String(err)]);
+      }
+      void refresh();
+      setRuntimeReloadToken((t) => t + 1);
+    });
+
+  const handleSetUpCluster = (environment: string) =>
+    runBusy(environment, async () => {
+      try {
+        const result = await createFromEnvironment(environment);
+        if (result.created) {
+          pushStatus('success', `Cluster ${result.profile_id} created`);
+        } else if (result.updated_hosts.length > 0) {
+          pushStatus('success', `Cluster ${result.profile_id} updated (${result.updated_hosts.join(', ')} refreshed)`);
+        } else {
+          pushStatus('success', `Cluster ${result.profile_id} already up to date`);
+        }
+        await reloadProfiles();
+        select(result.profile_id);
+        onClusterReady?.(result.profile_id);
+      } catch (err) {
+        pushStatus('error', 'Failed to create cluster profile', [String(err)]);
+      }
+    });
 
   const filteredGroups = useMemo(() => {
     if (!inventory?.machines) return [];
@@ -279,6 +351,9 @@ export default function InfrastructureScreen({
                       expanded={!collapsedEnvs.has(env)}
                       onToggle={() => toggleEnv(env)}
                       onSetUp={handleSetUpCluster}
+                      onDelete={(env) => void planDeleteGroup(env)}
+                      onDeleteMachine={(m) => void planDeleteMachine(m)}
+                      busyKeys={busyEnvs}
                       busy={busyEnvs.has(env)}
                     />
                   ))}
@@ -289,9 +364,39 @@ export default function InfrastructureScreen({
         ) : null}
 
         <div style={{ marginTop: 'var(--space-2)' }}>
-          <LocalRuntimePanel isVisible={isVisible} />
+          <LocalRuntimePanel
+            isVisible={isVisible}
+            reloadToken={runtimeReloadToken}
+            onChanged={() => void refresh()}
+          />
         </div>
       </div>
+
+      {deleteEnv && (
+        <TypedDeleteConfirm
+          title={`Delete group "${deleteEnv.environment}"?`}
+          explain={`This permanently deletes ${machineCount(deleteEnv.plan.targets.length)} and every VM disk in this group. ClusterDeck profiles that reference them are not removed. If anything changes before you confirm, nothing is deleted.\n\n${describeDeletePlan(deleteEnv.plan)}`}
+          typeMessage="Type the group name to confirm. This cannot be undone."
+          confirmText={deleteEnv.environment}
+          confirmLabel="Delete group"
+          busy={busyEnvs.has(deleteEnv.environment)}
+          onConfirm={() => void runDeleteGroup(deleteEnv.environment, deleteEnv.plan)}
+          onCancel={() => setDeleteEnv(null)}
+        />
+      )}
+
+      {deleteMachine && (
+        <TypedDeleteConfirm
+          title={`Delete "${deleteMachine.machine.name}"?`}
+          explain={`This permanently deletes the machine and its disk. It will be stopped first if it is running. ClusterDeck profiles that reference it are not removed. If anything changes before you confirm, nothing is deleted.\n\n${describeDeletePlan(deleteMachine.plan)}`}
+          typeMessage="Type the machine name to confirm. This cannot be undone."
+          confirmText={deleteMachine.machine.name}
+          confirmLabel="Delete"
+          busy={busyEnvs.has(deleteMachine.machine.id)}
+          onConfirm={() => void runDeleteMachine(deleteMachine)}
+          onCancel={() => setDeleteMachine(null)}
+        />
+      )}
     </div>
   );
 }

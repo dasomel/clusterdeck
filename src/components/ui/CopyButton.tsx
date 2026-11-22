@@ -21,14 +21,19 @@ export default function CopyButton({ text, title = 'Copy to clipboard', classNam
   }, [text]);
 
   return (
-    <button
-      type="button"
-      className={`icon-button ${className}`}
-      title={copied ? 'Copied!' : title}
-      aria-label={copied ? 'Copied' : title}
-      onClick={handleCopy}
-    >
-      {copied ? <Check size={13} className="status-ok" /> : <Copy size={13} />}
-    </button>
+    <>
+      <button
+        type="button"
+        className={`icon-button ${className}`}
+        title={copied ? 'Copied!' : title}
+        aria-label={copied ? 'Copied' : title}
+        onClick={handleCopy}
+      >
+        {copied ? <Check size={13} className="status-ok" /> : <Copy size={13} />}
+      </button>
+      <span role="status" className="sr-only">
+        {copied ? 'Copied' : ''}
+      </span>
+    </>
   );
 }

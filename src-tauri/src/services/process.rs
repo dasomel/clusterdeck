@@ -334,6 +334,16 @@ impl CommandRunner for SystemRunner {
         if let Some(child_path) = child_path_env() {
             cmd.env("PATH", child_path);
         }
+        // A caller that pins any `VAGRANT_*` variable gets a fully controlled Vagrant environment:
+        // inherited ones (VAGRANT_DOTFILE_PATH, VAGRANT_HOME, ...) could redirect which state dir
+        // or machine index the child uses (ADR-0012 D17).
+        if env.iter().any(|(k, _)| k.starts_with("VAGRANT_")) {
+            for (k, _) in std::env::vars_os() {
+                if k.to_string_lossy().starts_with("VAGRANT_") {
+                    cmd.env_remove(k);
+                }
+            }
+        }
         for (k, v) in env {
             cmd.env(k, v);
         }
@@ -850,6 +860,29 @@ mod tests {
         assert_eq!(proc.try_exit_status(), None);
         proc.kill().await;
         assert!(proc.try_exit_status().is_some());
+    }
+
+    #[tokio::test]
+    async fn run_bounded_with_env_drops_inherited_vagrant_vars_only_when_one_is_pinned() {
+        std::env::set_var("VAGRANT_CD_TEST_LEAK", "leaked");
+        std::env::set_var("CD_TEST_KEEP", "kept");
+        let print = vec![
+            "-c".to_string(),
+            "echo \"${VAGRANT_CD_TEST_LEAK:-none}/${CD_TEST_KEEP:-none}/${VAGRANT_CWD:-none}\""
+                .to_string(),
+        ];
+        let limits = CommandLimits::default;
+        let pinned = vec![("VAGRANT_CWD".to_string(), "/p".to_string())];
+        let out = SystemRunner
+            .run_bounded_with_env("sh", &print, &pinned, limits())
+            .await
+            .unwrap();
+        assert_eq!(out.stdout, "none/kept//p");
+        let out = SystemRunner
+            .run_bounded_with_env("sh", &print, &[], limits())
+            .await
+            .unwrap();
+        assert_eq!(out.stdout, "leaked/kept/none");
     }
 
     #[tokio::test]

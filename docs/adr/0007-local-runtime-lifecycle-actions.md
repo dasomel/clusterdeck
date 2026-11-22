@@ -147,7 +147,7 @@ check the lock.
 
 Every lifecycle/shell/context action in `services/local_runtime_lifecycle.rs` calls a shared
 `find_fresh_instance` helper before doing anything else: it validates the instance name's charset,
-then re-runs `local_runtime::detect_local_hosts` and requires the `(provider, instance_name)` pair to
+then re-lists **only the target provider** (`local_runtime::detect_provider_hosts`: Colima incl. `docker context ls`, or Lima) and requires the `(provider, instance_name)` pair to
 still be present in that fresh listing, returning the freshly discovered row. Any docker/kube context
 string used in D3 is read off that fresh row — never a caller-supplied value — closing off the
 class of sink-trusts-unvalidated-input bug AGENTS.md calls out as a repeat offender in this codebase
@@ -162,7 +162,7 @@ class of sink-trusts-unvalidated-input bug AGENTS.md calls out as a repeat offen
   future timeout or app-shutdown drop does at least terminate the child process rather than leaking
   it.
 - **Create/delete/reconfigure.** Unchanged from ADR-0003's scope; still out of bounds for this
-  feature.
+  feature. Delete superseded by ADR-0012.
 - **Vagrant lifecycle actions.** Not requested by issue #14's Phase 2 checklist for this
   increment; would need its own decision if wanted later (Vagrant's `up`/`halt`/`reload`/`ssh`
   equivalents are not currently wired into `LocalRuntimeProvider`).
@@ -197,8 +197,8 @@ Positive:
 
 Trade-offs:
 
-- Every lifecycle/shell/context action pays the cost of a full `detect_local_hosts` re-run
-  (Colima + Lima + Vagrant + `docker context ls`) before doing its own single CLI call, which is
+- Every lifecycle/shell/context action pays the cost of a fresh listing of its own provider
+  (Colima + `docker context ls`, or Lima; bounded by `DISCOVERY_TIMEOUT` = 30s) before doing its own single CLI call, which is
   slower than trusting the frontend's last-fetched row would be. This was an explicit product-owner
   requirement (D6), not an oversight.
 - `osascript`'s AppleScript string embedding is a less structured interface than passing argv

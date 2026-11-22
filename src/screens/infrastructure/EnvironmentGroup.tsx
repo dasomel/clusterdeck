@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { ChevronDown, ChevronRight, RefreshCw, Sparkles } from 'lucide-react';
+import { ChevronDown, ChevronRight, RefreshCw, Sparkles, Trash2 } from 'lucide-react';
 import type { Machine } from '../../api/types';
 import Tag from '../../components/ui/Tag';
 import { groupIdenticalMachines } from '../../lib/groupMachines';
@@ -13,6 +13,10 @@ type EnvironmentGroupProps = {
   expanded: boolean;
   onToggle: () => void;
   onSetUp: (environment: string) => Promise<void>;
+  onDelete: (environment: string) => void;
+  onDeleteMachine: (machine: Machine) => void;
+  /** Keys of in-flight deletes (environment names and machine ids). */
+  busyKeys: Set<string>;
   busy: boolean;
 };
 
@@ -24,6 +28,9 @@ export default function EnvironmentGroup({
   expanded,
   onToggle,
   onSetUp,
+  onDelete,
+  onDeleteMachine,
+  busyKeys,
   busy,
 }: EnvironmentGroupProps) {
   // Per-group manual toggles; absent means "follow the filter-driven default".
@@ -39,6 +46,9 @@ export default function EnvironmentGroup({
         m.environment.toLowerCase().includes('vagrant') ||
         m.environment.toLowerCase().includes('colima'),
     );
+
+  // One machine the backend cannot delete makes the whole group non-deletable.
+  const isDeletable = isLive && machines.every((m) => m.delete_kind != null);
 
   const k8sDetected = machines.some((m) => {
     const k = m.kubernetes.trim().toLowerCase();
@@ -100,7 +110,7 @@ export default function EnvironmentGroup({
               )}
             </div>
 
-            <div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-2)' }}>
               {isEligible ? (
                 <button
                   type="button"
@@ -123,6 +133,18 @@ export default function EnvironmentGroup({
                   Demo data: nothing to connect
                 </span>
               ) : null}
+              {isDeletable && (
+                <button
+                  type="button"
+                  className="danger-button compact-btn"
+                  onClick={() => onDelete(environment)}
+                  disabled={busy}
+                  style={{ display: 'inline-flex', alignItems: 'center', gap: '6px' }}
+                >
+                  <Trash2 size={12} />
+                  Delete group
+                </button>
+              )}
             </div>
           </div>
         </th>
@@ -139,6 +161,9 @@ export default function EnvironmentGroup({
               key={g.key}
               group={g}
               open={overrides.get(g.key) ?? autoOpen}
+              onDeleteMachine={isLive ? onDeleteMachine : undefined}
+              busyKeys={busyKeys}
+              groupBusy={busy}
               onToggle={() =>
                 setOverrides((prev) => new Map(prev).set(g.key, !(prev.get(g.key) ?? autoOpen)))
               }
