@@ -6,6 +6,8 @@ The format follows the principles of Keep a Changelog and uses semantic versioni
 
 ## [Unreleased]
 
+## [0.8.3] - 2026-11-22
+
 ### Added
 
 - Settings screen (sidebar, `⌘,`) to choose which installed browser opens endpoint URLs and which terminal opens SSH sessions and VM shells (ADR-0015); defaults and an uninstalled choice fall back to the system browser / default SSH handler / Terminal with a notice
