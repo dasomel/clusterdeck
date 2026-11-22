@@ -107,6 +107,8 @@ A local runtime is **discovered state, not user-authored config**, so it is not 
 invalidation problem in an app whose premise is that these environments are recreated
 constantly.
 
+> Amendment (#165): the host endpoint (address/port/identity) of a profile with `local_runtime` is re-resolved before every SSH-using command; when it changed it is persisted and the profile's ClusterDeck-owned ssh conf is rewritten, so `ssh <alias>` follows VM restarts.
+
 **Instance names from provider output are untrusted input.** They originate in external CLI
 JSON, not in ClusterDeck's own store, and `open_local_runtime_shell` routes them into an
 `osascript` AppleScript string and an `ssh`/`colima` argv. `services/validate.rs` therefore

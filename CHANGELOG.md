@@ -6,6 +6,10 @@ The format follows the principles of Keep a Changelog and uses semantic versioni
 
 ## [Unreleased]
 
+### Fixed
+
+- Keep a Colima/Lima profile's SSH endpoint current after a VM restart: when the re-resolved port/address differs, the stored host and the generated `~/.clusterdeck/ssh/<profile>.conf` are both updated (so `ssh <alias>` / Open SSH session no longer hit the old port), the re-resolve is bounded to 30 s, and Connect/Test/Open SSH session now fail fast with "VM '<name>' is Stopped — start it first" when the Colima/Lima VM is not running, instead of connecting to its stale port (#165)
+
 ## [0.8.2] - 2026-11-18
 
 ### Added

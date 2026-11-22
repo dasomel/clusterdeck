@@ -907,8 +907,25 @@ pub async fn refresh_local_runtime_endpoint(
     runner: &dyn CommandRunner,
     profile: &mut crate::services::config::Profile,
 ) -> bool {
+    refresh_local_runtime_endpoint_detailed(runner, profile).await == EndpointRefresh::Updated
+}
+
+/// Outcome of a refresh pass. `NotRunning` is distinct from `Unchanged` (no fresh data / nothing to
+/// update) so callers can fail fast on a stopped VM instead of SSH-ing to its stale port (#165).
+#[derive(Debug, Clone, PartialEq)]
+pub enum EndpointRefresh {
+    Updated,
+    Unchanged,
+    /// The instance was found in discovery but is not `Running`; carries a user-facing message.
+    NotRunning(String),
+}
+
+pub async fn refresh_local_runtime_endpoint_detailed(
+    runner: &dyn CommandRunner,
+    profile: &mut crate::services::config::Profile,
+) -> EndpointRefresh {
     let Some(source) = profile.local_runtime.clone() else {
-        return false;
+        return EndpointRefresh::Unchanged;
     };
 
     let discovered = match source.provider {
@@ -924,10 +941,24 @@ pub async fn refresh_local_runtime_endpoint(
         .into_iter()
         .find(|host| host.instance_name == source.instance)
     else {
-        return false;
+        return EndpointRefresh::Unchanged;
     };
-    if entry.status != "Running" || entry.port == 0 {
-        return false;
+    if entry.status != "Running" {
+        let (name, start_hint) = match source.provider {
+            crate::services::local_runtime_lifecycle::LocalRuntimeProvider::Colima => {
+                ("Colima", format!("`colima start -p {}`", source.instance))
+            }
+            crate::services::local_runtime_lifecycle::LocalRuntimeProvider::Lima => {
+                ("Lima", format!("`limactl start {}`", source.instance))
+            }
+        };
+        return EndpointRefresh::NotRunning(format!(
+            "{name} VM '{}' is {} — start it first (Infrastructure → Start, or {start_hint})",
+            source.instance, entry.status
+        ));
+    }
+    if entry.port == 0 {
+        return EndpointRefresh::Unchanged;
     }
     // detect_colima falls back to 127.0.0.1:22 with no identity when `colima ssh-config` fails;
     // a real ssh-config always carries an IdentityFile, so its absence means "no fresh data" and
@@ -935,7 +966,7 @@ pub async fn refresh_local_runtime_endpoint(
     if source.provider == crate::services::local_runtime_lifecycle::LocalRuntimeProvider::Colima
         && entry.identity_file.is_none()
     {
-        return false;
+        return EndpointRefresh::Unchanged;
     }
 
     // Match by host name; fall back to the profile's only host when there's exactly one, since a
@@ -946,7 +977,7 @@ pub async fn refresh_local_runtime_endpoint(
         .position(|host| host.name == entry.host_name)
         .or_else(|| (profile.hosts.len() == 1).then_some(0));
     let Some(host_index) = host_index else {
-        return false;
+        return EndpointRefresh::Unchanged;
     };
 
     let host = &mut profile.hosts[host_index];
@@ -963,7 +994,11 @@ pub async fn refresh_local_runtime_endpoint(
         host.identity_file = entry.identity_file;
         changed = true;
     }
-    changed
+    if changed {
+        EndpointRefresh::Updated
+    } else {
+        EndpointRefresh::Unchanged
+    }
 }
 
 #[cfg(test)]
