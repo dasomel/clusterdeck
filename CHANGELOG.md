@@ -6,6 +6,8 @@ The format follows the principles of Keep a Changelog and uses semantic versioni
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-11-25
+
 ### Fixed
 
 - Test connection no longer flips a verified cluster's rail to Kubeconfig "not synced" / Verify "failed": a probe-only test updates the SSH step only, and Kubeconfig/Verify keep the last persisted verification (#160)
