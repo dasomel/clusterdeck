@@ -36,6 +36,23 @@ const toLocalRuntimeSource = (host: DiscoveredLocalHost): LocalRuntimeSource | n
   };
 };
 
+const toEditorHost = (detected: DiscoveredLocalHost): Host => ({
+  name: detected.host_name,
+  address: detected.volatile_forward ? '' : detected.address,
+  port: detected.volatile_forward ? 22 : detected.port,
+  user: detected.user,
+  identity_file: detected.identity_file,
+  auth: 'key',
+});
+
+const formatVolatileForwardMessage = (hostNames: string[]) => {
+  const target =
+    hostNames.length === 1
+      ? `VM "${hostNames[0]}"`
+      : `VMs (${hostNames.join(', ')})`;
+  return `The private IP for ${target} could not be determined (only a volatile 127.0.0.1 forwarded port was found). Start the VM / add a private_network, or use Infrastructure → Set up cluster, or type the IP manually.`;
+};
+
 export default function ProfileEditor({ initial, onClose, onSaved, onDeleteRequest }: ProfileEditorProps) {
   const { pushStatus } = useStatus();
   const isEditing = initial !== null;
@@ -154,17 +171,12 @@ export default function ProfileEditor({ initial, onClose, onSaved, onDeleteReque
     }
 
     const existingIndex = hosts.findIndex(
-      (h) => h.name === detected.host_name || (h.address === detected.address && h.port === detected.port)
+      (h) =>
+        h.name === detected.host_name ||
+        (!detected.volatile_forward && h.address === detected.address && h.port === detected.port)
     );
 
-    const newHost: Host = {
-      name: detected.host_name,
-      address: detected.address,
-      port: detected.port,
-      user: detected.user,
-      identity_file: detected.identity_file,
-      auth: 'key',
-    };
+    const newHost = toEditorHost(detected);
 
     let updatedHosts: Host[];
     if (existingIndex >= 0) {
@@ -179,6 +191,9 @@ export default function ProfileEditor({ initial, onClose, onSaved, onDeleteReque
 
     applyKubeconfigIfPresent(detected);
 
+    setDetectError(
+      detected.volatile_forward ? formatVolatileForwardMessage([detected.host_name]) : null
+    );
     setDetectedHosts(null);
   };
 
@@ -195,14 +210,7 @@ export default function ProfileEditor({ initial, onClose, onSaved, onDeleteReque
       setName(deriveFormattedName(first.provider, projectName));
     }
 
-    const newHostList: Host[] = items.map((d) => ({
-      name: d.host_name,
-      address: d.address,
-      port: d.port,
-      user: d.user,
-      identity_file: d.identity_file,
-      auth: 'key',
-    }));
+    const newHostList: Host[] = items.map(toEditorHost);
     setHosts(newHostList);
 
     const masterHost = items.find(
@@ -211,6 +219,10 @@ export default function ProfileEditor({ initial, onClose, onSaved, onDeleteReque
 
     applyKubeconfigIfPresent(masterHost);
 
+    const volatileNames = items.filter((d) => d.volatile_forward).map((d) => d.host_name);
+    setDetectError(
+      volatileNames.length > 0 ? formatVolatileForwardMessage(volatileNames) : null
+    );
     setDetectedHosts(null);
   };
 

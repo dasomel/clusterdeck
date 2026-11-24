@@ -6,6 +6,10 @@ The format follows the principles of Keep a Changelog and uses semantic versioni
 
 ## [Unreleased]
 
+### Fixed
+
+- Add cluster → Detect local VMs no longer fills a Vagrant host with a volatile `127.0.0.1:<forwarded port>` when the VM's private IP cannot be determined. It shows an actionable message instead (start the VM / add a private_network, use Infrastructure → Set up cluster, or type the IP), matching the Infrastructure path that already refused loopback-only results (#164)
+
 ## [0.9.1] - 2026-11-25
 
 ### Fixed

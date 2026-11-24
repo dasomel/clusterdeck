@@ -939,6 +939,7 @@ mod tests {
             memory_bytes: None,
             disk_bytes: None,
             docker_context: docker_context.map(str::to_string),
+            volatile_forward: false,
         }
     }
 
