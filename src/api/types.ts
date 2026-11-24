@@ -267,6 +267,7 @@ export type DiscoveredLocalHost = {
   memory_bytes: number | null;
   disk_bytes: number | null;
   docker_context: string | null;
+  volatile_forward?: boolean;
 };
 
 export type BackupKubeconfigResult = {

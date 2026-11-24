@@ -25,6 +25,8 @@ pub struct DiscoveredLocalHost {
     pub memory_bytes: Option<u64>,
     pub disk_bytes: Option<u64>,
     pub docker_context: Option<String>,
+    #[serde(default)]
+    pub volatile_forward: bool,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -298,6 +300,7 @@ async fn detect_colima(
             memory_bytes: entry.memory,
             disk_bytes: entry.disk,
             docker_context,
+            volatile_forward: false,
         });
     }
     out
@@ -378,6 +381,7 @@ async fn detect_lima(runner: &dyn CommandRunner) -> Vec<DiscoveredLocalHost> {
             memory_bytes: entry.memory,
             disk_bytes: entry.disk,
             docker_context: None,
+            volatile_forward: false,
         });
     }
     out
@@ -839,8 +843,10 @@ async fn detect_vagrant(runner: &dyn CommandRunner) -> Vec<DiscoveredLocalHost> 
         }
 
         // Static fallback if address still appears to be NAT or loopback
-        if let Some(sip) = static_ip {
-            if address == "127.0.0.1"
+        if let Some(sip) =
+            static_ip.filter(|ip| !crate::services::inventory::identity::is_loopback_address(ip))
+        {
+            if crate::services::inventory::identity::is_loopback_address(&address)
                 || address.starts_with("172.16.")
                 || address.starts_with("10.0.2.")
             {
@@ -848,6 +854,11 @@ async fn detect_vagrant(runner: &dyn CommandRunner) -> Vec<DiscoveredLocalHost> 
                 port = 22;
             }
         }
+
+        // D1 (#164): Vagrant forwarded loopback endpoints (127.0.0.1:<port>) are volatile across
+        // halt/up and not refreshed at connect time (unlike Colima/Lima), so mark any Vagrant result
+        // whose final address is still loopback as not directly persistable.
+        let volatile_forward = crate::services::inventory::identity::is_loopback_address(&address);
 
         let kube_remote_path = if is_master {
             if has_k3s {
@@ -882,6 +893,7 @@ async fn detect_vagrant(runner: &dyn CommandRunner) -> Vec<DiscoveredLocalHost> 
             memory_bytes: None,
             disk_bytes: None,
             docker_context: None,
+            volatile_forward,
         });
     }
     out
@@ -1337,10 +1349,59 @@ HAS_K3S
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].address, "192.168.77.10");
         assert_eq!(results[0].port, 22);
+        assert!(!results[0].volatile_forward);
         assert_eq!(
             results[0].kube_remote_path.as_deref(),
             Some("/etc/rancher/k3s/k3s.yaml")
         );
+    }
+
+    #[tokio::test]
+    async fn detect_vagrant_flags_loopback_only_when_probe_fails_and_clears_when_host_only_ip_probed(
+    ) {
+        let vagrant_status = r#"
+id       name     provider       state   directory
+------------------------------------------------------------------
+f4f4176  master-1 virtualbox     running /nonexistent/clusterdeck-issue-164
+"#;
+        let vagrant_ssh_loopback = r#"
+Host master-1
+  HostName 127.0.0.1
+  User vagrant
+  Port 2222
+"#;
+
+        // Probe returns no private IP (e.g. failed/empty output) and directory has no Vagrantfile:
+        // result stays 127.0.0.1:2222 and must be flagged as volatile_forward.
+        let failing_probe_runner = FakeRunner {
+            colima_list: "",
+            colima_ssh: "",
+            lima_list: "",
+            docker_contexts: "",
+            vagrant_status,
+            vagrant_ssh: vagrant_ssh_loopback,
+            calls: Mutex::new(Vec::new()),
+        };
+        let fallback_results = detect_vagrant(&failing_probe_runner).await;
+        assert_eq!(fallback_results.len(), 1);
+        assert_eq!(fallback_results[0].address, "127.0.0.1");
+        assert_eq!(fallback_results[0].port, 2222);
+        assert!(fallback_results[0].volatile_forward);
+
+        // When the SSH probe over 127.0.0.1:2222 returns a host-only private IP, volatile_forward
+        // is cleared and the host-only IP:22 is used.
+        let host_only_probe_runner = FakeRunnerWithSsh {
+            vagrant_status,
+            vagrant_ssh: vagrant_ssh_loopback,
+            ssh_probe_stdout: "1: lo    inet 127.0.0.1/8 scope host lo\n\
+2: eth0    inet 10.0.2.15/24 brd 10.0.2.255 scope global dynamic eth0\n\
+3: eth1    inet 192.168.56.10/24 brd 192.168.56.255 scope global eth1\n",
+        };
+        let resolved_results = detect_vagrant(&host_only_probe_runner).await;
+        assert_eq!(resolved_results.len(), 1);
+        assert_eq!(resolved_results[0].address, "192.168.56.10");
+        assert_eq!(resolved_results[0].port, 22);
+        assert!(!resolved_results[0].volatile_forward);
     }
 
     #[test]
