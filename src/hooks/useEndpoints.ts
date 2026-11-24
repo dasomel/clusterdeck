@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import {
   api,
-  type ConnectionResult,
+  type SessionResult,
   type DiscoveredCaView,
   type DnsConflict,
   type DnsSkippedHost,
@@ -9,7 +9,6 @@ import {
   type LocalDnsStatus,
   type Profile,
 } from '../api/tauri';
-import { EMPTY_VERIFICATION } from './useClusterSession';
 import { useStatus } from '../state/StatusContext';
 import { useProfiles } from '../state/ProfilesContext';
 import {
@@ -21,8 +20,8 @@ import {
 
 export function useEndpoints(
   profile: Profile | null,
-  lastResult: ConnectionResult | null,
-  setLastResult: React.Dispatch<React.SetStateAction<ConnectionResult | null>>,
+  lastResult: SessionResult | null,
+  setLastResult: React.Dispatch<React.SetStateAction<SessionResult | null>>,
   trustVersion?: number,
 ) {
   const { pushStatus } = useStatus();
@@ -111,7 +110,7 @@ export function useEndpoints(
           return {
             aliases_written: false,
             kubeconfig: null,
-            verification: { ...EMPTY_VERIFICATION, kubernetes: true },
+            verification: null,
             endpoints: eps,
             errors: res.warning ? [res.warning] : [],
             hosts: [],

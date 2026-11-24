@@ -2,7 +2,7 @@ import { useState, useEffect, useMemo, useCallback } from 'react';
 import { RefreshCw, FileText, Trash2, ExternalLink } from 'lucide-react';
 import {
   api,
-  type ConnectionResult,
+  type SessionResult,
   type DnsConflict,
   type DnsSkippedHost,
   type HostsFileStatus,
@@ -27,7 +27,7 @@ import {
 type EndpointsTabProps = {
   profile: Profile;
   isVisible: boolean;
-  lastResult: ConnectionResult | null;
+  lastResult: SessionResult | null;
   hostsStatus: HostsFileStatus | null;
   discoveringEndpoints: boolean;
   syncingHosts: boolean;

@@ -1,4 +1,4 @@
-import type { ConnectionResult, Profile, VerificationResult } from '../api/tauri';
+import type { Profile, SessionResult, VerificationResult } from '../api/tauri';
 import { count } from './format';
 
 export type RailStepId = 'discover' | 'bootstrap' | 'ssh' | 'kubeconfig' | 'verify';
@@ -14,7 +14,7 @@ export type RailStep = {
 
 export function deriveRail(
   profile: Profile | null,
-  lastResult: ConnectionResult | null,
+  lastResult: SessionResult | null,
   status: VerificationResult | null,
   busy = false,
 ): RailStep[] {
@@ -28,8 +28,13 @@ export function deriveRail(
     ];
   }
 
-  // Verification result: prefer lastResult.verification if available, otherwise persistent status
+  // Kubeconfig/Verify come from the latest verification measured this session (Connect/merge),
+  // else the persisted status. A probe-only Test leaves lastResult.verification null, so it
+  // never overrides them; SSH/Bootstrap come from lastResult.hosts (the latest probe).
   const verification = lastResult?.verification ?? status;
+
+  // A result with no host rows (endpoint scan before any probe) has not measured SSH.
+  const probed = lastResult !== null && lastResult.hosts.length > 0;
 
   // 1. Discover
   const hostCount = profile.hosts.length;
@@ -48,7 +53,7 @@ export function deriveRail(
   } else if (busy) {
     bootstrapState = 'running';
     bootstrapDetail = 'running';
-  } else if (lastResult) {
+  } else if (lastResult && probed) {
     const unreachableCount = lastResult.hosts.filter((h) => !h.reachable).length;
     if (unreachableCount === 0 && hostCount > 0) {
       bootstrapState = 'ok';
@@ -65,7 +70,7 @@ export function deriveRail(
   if (busy) {
     sshState = 'running';
     sshDetail = 'probing';
-  } else if (lastResult) {
+  } else if (lastResult && probed) {
     const reachable = lastResult.hosts.filter((h) => h.reachable).length;
     sshDetail = `${reachable}/${hostCount}`;
     if (reachable === hostCount && hostCount > 0) {
@@ -92,7 +97,7 @@ export function deriveRail(
   } else if (verification?.kubeconfig) {
     kubeconfigState = 'ok';
     kubeconfigDetail = 'synced';
-  } else if (lastResult) {
+  } else if (verification) {
     kubeconfigState = 'warn';
     kubeconfigDetail = 'not synced';
   }
@@ -109,7 +114,7 @@ export function deriveRail(
   } else if (verification?.kubernetes) {
     verifyState = 'ok';
     verifyDetail = verification.kubernetes_version ?? 'verified';
-  } else if (lastResult) {
+  } else if (verification) {
     verifyState = 'fail';
     verifyDetail = 'failed';
   }
