@@ -1,5 +1,5 @@
 import { Terminal } from 'lucide-react';
-import type { ConnectionResult, HostsFileStatus, Profile } from '../../api/tauri';
+import type { SessionResult, HostsFileStatus, Profile } from '../../api/tauri';
 import DefinitionList, { type DefinitionItem } from '../../components/ui/DefinitionList';
 import CollapsibleCard from '../../components/ui/CollapsibleCard';
 import Pill from '../../components/ui/Pill';
@@ -8,7 +8,7 @@ import CopyButton from '../../components/ui/CopyButton';
 
 type NodesTabProps = {
   profile: Profile;
-  lastResult: ConnectionResult | null;
+  lastResult: SessionResult | null;
   hostsStatus: HostsFileStatus | null;
   onOpenSsh: (hostName: string) => void;
 };

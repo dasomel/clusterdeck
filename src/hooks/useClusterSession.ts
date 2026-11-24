@@ -1,17 +1,7 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
-import { api, type ConnectionResult, type DiscoveredCaView, type Profile, type VerificationResult } from '../api/tauri';
+import { api, type DiscoveredCaView, type Profile, type SessionResult, type VerificationResult } from '../api/tauri';
 import { connectMessage, testMessage } from '../lib/messages';
 import { useStatus } from '../state/StatusContext';
-
-export const EMPTY_VERIFICATION: VerificationResult = {
-  ssh: false,
-  kubeconfig: false,
-  kubernetes: false,
-  node_count: null,
-  kubernetes_version: null,
-  api_endpoint: null,
-  last_verified: null,
-};
 
 export function useClusterSession(
   profile: Profile | null,
@@ -19,7 +9,7 @@ export function useClusterSession(
   onCaViewsUpdated?: (views: DiscoveredCaView[]) => void,
 ) {
   const { pushStatus, setStatusMessage } = useStatus();
-  const [lastResult, setLastResult] = useState<ConnectionResult | null>(null);
+  const [lastResult, setLastResult] = useState<SessionResult | null>(null);
   const [status, setStatus] = useState<VerificationResult | null>(null);
   const [connecting, setConnecting] = useState(false);
   const [testing, setTesting] = useState(false);
@@ -102,7 +92,8 @@ export function useClusterSession(
       setLastResult((prev) => ({
         aliases_written: prev?.aliases_written ?? false,
         kubeconfig: prev?.kubeconfig ?? null,
-        verification: prev?.verification ?? { ...EMPTY_VERIFICATION },
+        // Probe-only: keep whatever verification an earlier Connect measured, else null (rail uses persisted status).
+        verification: prev?.verification ?? null,
         endpoints: prev?.endpoints ?? [],
         errors: prev?.errors ?? [],
         hosts,

@@ -173,6 +173,15 @@ export type ConnectionResult = {
   errors: string[];
 };
 
+/**
+ * Frontend session view of a ConnectionResult. `verification` is null when no
+ * step in this session measured it (e.g. a probe-only Test connection), so the
+ * rail falls back to the persisted status instead of showing a fabricated empty one.
+ */
+export type SessionResult = Omit<ConnectionResult, 'verification'> & {
+  verification: VerificationResult | null;
+};
+
 export type HostnameConflict = {
   hostname: string;
   our_ip: string;
