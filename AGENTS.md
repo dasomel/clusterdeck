@@ -14,6 +14,7 @@ Before substantial work: find the relevant GitHub Issue, read `docs/ARCHITECTURE
 
 ## Security
 
+- Never place real credentials or infrastructure information in source, issues, tests, fixtures, screenshots, or documentation. Never log secrets.
 - Do not expose private-key contents to the frontend. Do not store bootstrap passwords in repository files.
 - Service login credentials (`services/service_login.rs`) are an explicit ADR-0014 exception: read on demand only on explicit user action, gated by the user's own Kubernetes RBAC (`kubectl auth can-i`, impersonation refused), held transiently in memory, never persisted or logged.
 - Never overwrite a user's entire `~/.ssh/config`, `~/.kube/config`, `/etc/hosts`, or another tool's `/etc/resolver/*` file — own only clearly marked content (`Include ~/.clusterdeck/ssh/*.conf` for SSH; a `# >>> ClusterDeck BEGIN (profile: <id>) >>>` / `END` marker pair per profile for `/etc/hosts` when `Profile.host_mapping` is `hosts`; `/etc/resolver/<zone>` files carrying `# managed by ClusterDeck (profile: <id>)` when it is `local_dns`).
